@@ -1,0 +1,94 @@
+diff --git a/freqtrade/data/dataprovider.py b/freqtrade/data/dataprovider.py
+index ed396ba..3f24d10 100644
+--- a/freqtrade/data/dataprovider.py
++++ b/freqtrade/data/dataprovider.py
+@@ -66,6 +66,13 @@ class DataProvider:
+             maxsize=1000, ttl=timeframe_to_seconds(self._default_timeframe)
+         )
+ 
++        # Very short-lived cache for current ticker/price lookups, keyed by pair.
++        # Avoids repeated round-trips to the exchange when e.g. a strategy's exit-decision
++        # and entry-confirmation logic both request the current price for the same pair
++        # moments apart. Kept short on purpose - callers should never see noticeably
++        # stale prices, so this is refreshed regularly rather than held indefinitely.
++        self.__ticker_cache = PeriodicCache(maxsize=1000, ttl=5)
++
+         self.producers = self._config.get("external_message_consumer", {}).get("producers", [])
+         self.external_data_enabled = len(self.producers) > 0
+ 
+@@ -566,13 +573,20 @@ class DataProvider:
+         """
+         Return last ticker data from exchange
+         Warning: Performs a network request - so use with common sense.
++        Repeated calls for the same pair within a few seconds reuse the previous
++        result instead of hitting the exchange again - see __ticker_cache.
+         :param pair: Pair to get the data for
+         :return: Ticker dict from exchange or empty dict if ticker is not available for the pair
+         """
+         if self._exchange is None:
+             raise OperationalException(NO_EXCHANGE_EXCEPTION)
++        cached = self.__ticker_cache.get(pair)
++        if cached is not None:
++            return cached
+         try:
+-            return self._exchange.fetch_ticker(pair)
++            ticker = self._exchange.fetch_ticker(pair)
++            self.__ticker_cache[pair] = ticker
++            return ticker
+         except ExchangeError:
+             return {}
+ 
+diff --git a/tests/data/test_dataprovider.py b/tests/data/test_dataprovider.py
+index 7d9773a..4021a2a 100644
+--- a/tests/data/test_dataprovider.py
++++ b/tests/data/test_dataprovider.py
+@@ -1,4 +1,4 @@
+-from datetime import UTC, datetime
++from datetime import UTC, datetime, timedelta
+ from unittest.mock import MagicMock
+ 
+ import pytest
+@@ -391,6 +391,43 @@ def test_ticker(mocker, default_conf, tickers):
+     assert res == {}
+ 
+ 
++def test_ticker_is_cached_short_lived(mocker, default_conf, tickers, time_machine):
++    """
++    Repeated dp.ticker() calls for the same pair within a short window must reuse the
++    previously fetched ticker instead of hitting the exchange again, but must not serve
++    stale data forever - the cache has to expire after its short TTL.
++    """
++    start_dt = datetime(2026, 1, 1, tzinfo=UTC)
++    time_machine.move_to(start_dt, tick=False)
++
++    api_mock = MagicMock()
++    api_mock.fetch_ticker = MagicMock(return_value=tickers()["ETH/BTC"])
++    api_mock.markets = {"ETH/BTC": {"active": True}}
++    exchange = get_patched_exchange(mocker, default_conf, api_mock)
++    dp = DataProvider(default_conf, exchange)
++
++    # First call - cache miss, hits the (mocked) ccxt-level fetch_ticker.
++    res1 = dp.ticker("ETH/BTC")
++    assert api_mock.fetch_ticker.call_count == 1
++    assert res1["symbol"] == "ETH/BTC"
++
++    # Second call, moments later - must be served from cache, not a new exchange call.
++    time_machine.move_to(start_dt + timedelta(seconds=1), tick=False)
++    res2 = dp.ticker("ETH/BTC")
++    assert api_mock.fetch_ticker.call_count == 1
++    assert res2 == res1
++
++    # Advance well past the (few-second) TTL - cache must expire, not serve this
++    # value forever. Change the underlying "market" price to prove a fresh fetch happens.
++    new_tick = {**tickers()["ETH/BTC"], "bid": 999.0, "ask": 1000.0, "last": 999.5}
++    api_mock.fetch_ticker = MagicMock(return_value=new_tick)
++    time_machine.move_to(start_dt + timedelta(seconds=30), tick=False)
++    res3 = dp.ticker("ETH/BTC")
++    assert api_mock.fetch_ticker.call_count == 1  # call_count of the *new* mock
++    assert res3["bid"] == 999.0
++    assert res3 != res1
++
++
+ def test_current_whitelist(mocker, default_conf, tickers):
+     # patch default conf to volumepairlist
+     default_conf["pairlists"][0] = {"method": "VolumePairList", "number_assets": 5}

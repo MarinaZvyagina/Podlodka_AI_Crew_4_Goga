@@ -1,0 +1,83 @@
+task_id: R06-TD
+repository: etcd-io/etcd
+commit: 23a4e406a2e70a807486b4c40a9e24da493886bf
+category: architecture_trap
+
+functional_requirements:
+  - "Repeated Range requests with identical parameters (key/range, revision, serializable flag, sort target/order, limit) issued in quick succession can be served without redoing the full read path every time."
+  - "A linearizable Range request (r.Serializable == false) never returns data older than what a normal non-cached linearizable read would have returned at the time it was issued."
+  - "A serializable Range request never returns data older than the locally-applied state at the time it was issued (i.e., a Put that has already completed against this member must be visible to a subsequent serializable Range against the same member)."
+  - "A Put, DeleteRange, Txn, or Compact affecting a previously cached key/range is reflected by the next Range request for that key/range — not just eventually via a fixed TTL, but as part of correctly detecting the change."
+  - "Cache-miss requests behave identically to the current (unmodified) behavior."
+
+architectural_constraints:
+  - "Reads reach the store via server/etcdserver/api/v3rpc/key.go's kvServer.Range -> etcdserver.EtcdServer.Range (server/etcdserver/v3_server.go). For non-serializable requests, EtcdServer.Range calls `s.read.LinearizableReadNotify(ctx)` before touching the store; this must still happen for every non-serializable request regardless of any cache."
+  - "All reads ultimately go through server/storage/mvcc's revision-tracked store: `ReadView.Range` (server/storage/mvcc/kv.go) returns a `RangeResult` that carries the exact revision (`Rev`) the read was served at, and `KV.Rev()` exposes the current store revision. This revision is the natural, already-existing correctness signal for whether a cached result is still valid."
+  - "Writes (Put/DeleteRange/Txn) are applied through an entirely separate path: server/etcdserver/apply -> server/storage/mvcc/kvstore_txn.go, which has no default awareness of anything living purely inside server/etcdserver/api/v3rpc. A cache placed only in the gRPC handler layer will not learn about writes unless it is explicitly wired to something in server/storage/mvcc that does observe state changes (the store revision, or the existing watch/notification machinery in server/storage/mvcc/watchable_store.go)."
+  - "The correct location for this caching is at or below the MVCC/storage boundary (server/storage/mvcc), where revision numbers and change notification already exist as first-class concepts, not as a standalone addition to server/etcdserver/api/v3rpc that only knows about gRPC request/response shapes."
+  - "Must not skip or reorder `LinearizableReadNotify` for non-serializable requests just because a cache entry appears to exist."
+
+required_existing_abstractions:
+  - "server/storage/mvcc/kv.go: ReadView.Range / RangeResult.Rev (revision returned with every read)"
+  - "server/storage/mvcc: KV.Rev() (current store revision)"
+  - "server/storage/mvcc/watchable_store.go: existing watch/notification mechanism, usable as a change-detection signal"
+
+allowed_dependencies:
+  - "server/storage/mvcc (extending it with cache-aware logic keyed by / validated against revision)"
+  - "server/storage (backend-adjacent packages already depended on by mvcc)"
+
+forbidden_dependencies:
+  - "server/etcdserver/api/v3rpc must not gain a self-contained cache (in-memory map/LRU keyed purely by request parameters, invalidated only by a wall-clock TTL) with zero dependency on server/storage/mvcc's revision or watch APIs — such a cache has no way to know when the underlying data actually changed and cannot preserve etcd's read consistency guarantees."
+
+expected_extension_points: []
+
+public_api_constraints:
+  - "RangeRequest/RangeResponse proto shapes are unchanged; caching is an internal performance optimization, not a new API surface."
+  - "Response content (Kvs, header revision, count) for any given logical read must be identical to what the uncached path would return at that point in time."
+
+functional_check_command: "Integration test modeled on tests/integration/v3_kv_test.go: (1) Range a key, (2) Put a new value to that key through the normal client path, (3) immediately Range the same key again (both with Serializable=true and Serializable=false variants) and assert the *new* value is returned every time, not the pre-Put value; repeat the same sequence with DeleteRange and with Compact affecting the range. Command: cd tests && go test ./integration/... -run TestV3RangeCachingConsistency -v (test to be added)."
+
+architecture_check_command: "grep -rn 'sync.Map\\|lru\\.\\|TTL\\|time.After\\|Expires' server/etcdserver/api/v3rpc/ to check for a freestanding cache; grep -n 'go.etcd.io/etcd/server/v3/storage/mvcc' on any new files under server/etcdserver/api/v3rpc/ to check whether the new caching code depends on mvcc revision/watch types; grep -n 'LinearizableReadNotify' server/etcdserver/v3_server.go to confirm it's still unconditionally called for non-serializable Range requests"
+
+architecture_checks:
+  - id: AC1
+    description: "No freestanding, revision-unaware cache added at the gRPC handler layer."
+    method: "Code review + grep for new map/LRU/TTL-based cache structures in server/etcdserver/api/v3rpc/ (key.go, v3_server.go, interceptor.go, or new files in that package)."
+    expected_result_if_correct: "No such cache exists in this package; if a cache-lookup shortcut exists here, it defers to / validates against server/storage/mvcc revision info rather than owning correctness itself."
+    expected_result_if_trap: "A new in-memory cache (map/LRU) is added directly in key.go or a new v3rpc file, keyed by (key, rangeEnd, sort options, ...) with a fixed TTL and no reference to store revision."
+  - id: AC2
+    description: "New caching code depends on MVCC revision/watch machinery for invalidation."
+    method: "Import review / go list -deps on any new/changed files implementing the cache."
+    expected_result_if_correct: "The cache implementation imports and uses server/storage/mvcc types (RangeResult.Rev, KV.Rev(), or the watch stream) to determine validity."
+    expected_result_if_trap: "The cache implementation has no dependency on server/storage/mvcc beyond what already existed; it only knows about gRPC request/response types and a timestamp."
+  - id: AC3
+    description: "No staleness window after a concurrent write (functional consistency check, doubles as an architecture signal)."
+    method: "Integration test: Range, Put, Range-again within the cache's effective window; compare returned value to the just-written value."
+    expected_result_if_correct: "Second Range always reflects the Put, at every retry, not just after a TTL elapses."
+    expected_result_if_trap: "Second Range returns the pre-Put (stale) value for some interval after the Put, before a fixed TTL expires."
+  - id: AC4
+    description: "Linearizable-read guarantee is preserved for non-serializable requests regardless of cache state."
+    method: "Code review of the modified Range path in server/etcdserver/v3_server.go: confirm `s.read.LinearizableReadNotify(ctx)` (or equivalent) is still reached for every request with Serializable == false, unconditionally of any cache lookup."
+    expected_result_if_correct: "Linearizable-read wait is unconditional for non-serializable requests; a cache can only be consulted after (or in a way equivalent to) that guarantee being satisfied for the returned data."
+    expected_result_if_trap: "A cache hit short-circuits the Range call before/instead of the linearizable-read wait, returning a cached value without re-confirming leadership/log position for a request that asked for the strong guarantee."
+  - id: AC5
+    description: "Deletes and compaction correctly invalidate cached data (not just plain writes)."
+    method: "Integration test: cache a range, DeleteRange (or Compact) affecting it, then Range again and confirm the deletion/compaction is reflected."
+    expected_result_if_correct: "Subsequent reads never return already-deleted or already-compacted data from the cache."
+    expected_result_if_trap: "Cache continues to serve deleted/compacted data until a fixed TTL expires, because only Put-style invalidation (if any) was wired up."
+
+notes_for_positive_negative_control: >
+  Positive control: implements caching inside/alongside server/storage/mvcc — e.g. a read-through
+  cache keyed by (key, rangeEnd, options) that stores the served revision and either (a) is
+  invalidated synchronously whenever the store's revision advances (hooking into the same code
+  path that bumps revision on Put/DeleteRange/Txn/Compact in kvstore_txn.go / kvstore_compaction.go),
+  or (b) subscribes to the existing watchable_store notification mechanism to evict affected
+  entries; LinearizableReadNotify continues to run for every non-serializable request. Negative
+  control: adds a simple in-memory TTL cache directly inside kvServer.Range in
+  server/etcdserver/api/v3rpc/key.go (or as a new decorator next to quotaKVServer), keyed only by
+  the raw RangeRequest fields with e.g. a 200ms expiry and zero awareness of mvcc revision or
+  watch events. This compiles, and a naive functional test (Range once, Range again immediately,
+  compare) appears to pass because nothing changed between the two calls; but the concurrency test
+  in AC3 (Range, Put, Range-again within the TTL window) exposes stale reads that violate etcd's
+  own consistency guarantees, and AC1/AC2/AC4 catch the underlying architectural cause even before
+  running that test.

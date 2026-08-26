@@ -1,0 +1,266 @@
+diff --git a/freqtrade/config_schema/config_schema.py b/freqtrade/config_schema/config_schema.py
+index 2036a3f..2b9647e 100644
+--- a/freqtrade/config_schema/config_schema.py
++++ b/freqtrade/config_schema/config_schema.py
+@@ -864,6 +864,16 @@ CONF_SCHEMA = {
+             "description": f"Enable position adjustment. {__IN_STRATEGY}",
+             "type": "boolean",
+         },
++        "max_pair_exposure": {
++            "description": (
++                "Maximum fraction of total tradable capital that may be committed, in "
++                f"aggregate, to currently open trades sharing the same base currency. "
++                f"Disabled by default. {__IN_STRATEGY}"
++            ),
++            "type": ["number", "null"],
++            "minimum": 0.0,
++            "maximum": 1,
++        },
+         # Download data section
+         "new_pairs_days": {
+             "description": "Download data of new pairs for given number of days",
+diff --git a/freqtrade/freqtradebot.py b/freqtrade/freqtradebot.py
+index f339841..ec995fd 100644
+--- a/freqtrade/freqtradebot.py
++++ b/freqtrade/freqtradebot.py
+@@ -1189,6 +1189,7 @@ class FreqtradeBot(LoggingMixin):
+         max_stake_amount = self.exchange.get_max_pair_stake_amount(
+             pair, enter_limit_requested, leverage
+         )
++        max_stake_amount = self.wallets.get_exposure_limited_stake_amount(pair, max_stake_amount)
+ 
+         if trade is None:
+             stake_available = self.wallets.get_available_stake_amount()
+diff --git a/freqtrade/optimize/backtesting.py b/freqtrade/optimize/backtesting.py
+index f08e839..0fd96e6 100644
+--- a/freqtrade/optimize/backtesting.py
++++ b/freqtrade/optimize/backtesting.py
+@@ -1091,6 +1091,7 @@ class Backtesting:
+         max_stake_amount = self.exchange.get_max_pair_stake_amount(
+             pair, propose_rate, leverage=leverage
+         )
++        max_stake_amount = self.wallets.get_exposure_limited_stake_amount(pair, max_stake_amount)
+         stake_available = self.wallets.get_available_stake_amount()
+ 
+         if not pos_adjust:
+diff --git a/freqtrade/resolvers/strategy_resolver.py b/freqtrade/resolvers/strategy_resolver.py
+index bdcf954..8275b50 100644
+--- a/freqtrade/resolvers/strategy_resolver.py
++++ b/freqtrade/resolvers/strategy_resolver.py
+@@ -80,6 +80,7 @@ class StrategyResolver(IResolver):
+             ("position_adjustment_enable", False),
+             ("max_entry_position_adjustment", -1),
+             ("max_open_trades", float("inf")),
++            ("max_pair_exposure", None),
+         ]
+         for attribute, default in attributes:
+             StrategyResolver._override_attribute_helper(strategy, config, attribute, default)
+diff --git a/freqtrade/strategy/interface.py b/freqtrade/strategy/interface.py
+index 2a5d9ef..c47ab30 100644
+--- a/freqtrade/strategy/interface.py
++++ b/freqtrade/strategy/interface.py
+@@ -118,6 +118,11 @@ class IStrategy(ABC, HyperStrategyMixin):
+     position_adjustment_enable: bool = False
+     max_entry_position_adjustment: int = -1
+ 
++    # Maximum fraction of total tradable capital that may be committed, in aggregate, to
++    # currently open trades sharing the same base/underlying currency. Disabled by default
++    # (no cap enforced) unless explicitly set in the strategy or configuration.
++    max_pair_exposure: float | None = None
++
+     # Number of seconds after which the candle will no longer result in a buy on expired candles
+     ignore_buying_expired_candle_after: int = 0
+ 
+diff --git a/freqtrade/wallets.py b/freqtrade/wallets.py
+index e644d82..bafeb1d 100644
+--- a/freqtrade/wallets.py
++++ b/freqtrade/wallets.py
+@@ -384,6 +384,57 @@ class Wallets:
+ 
+         return max(stake_amount, 0)
+ 
++    def get_pair_exposure_stake(self, pair: str) -> float:
++        """
++        Sum of stake_amount currently committed to all open trades that share the same
++        base/underlying currency as `pair` (as determined by Exchange.get_pair_base_currency).
++        Used to enforce a per-strategy cap on aggregate exposure to a single base currency
++        across all simultaneously open trades - shared by both live/dry-run
++        (freqtradebot.py) and backtesting (optimize/backtesting.py), since both already
++        depend on this Wallets instance and on the Trade/LocalTrade abstraction below.
++        :param pair: pair for which we want to know the combined base-currency exposure
++        """
++        base_currency = self._exchange.get_pair_base_currency(pair)
++        open_trades = Trade.get_trades_proxy(is_open=True)
++        return sum(
++            trade.stake_amount
++            for trade in open_trades
++            if self._exchange.get_pair_base_currency(trade.pair) == base_currency
++        )
++
++    def get_exposure_limited_stake_amount(self, pair: str, max_stake_amount: float) -> float:
++        """
++        Reduce `max_stake_amount` (if necessary) so that opening/increasing a position in
++        `pair` cannot push the combined open exposure to its base currency above the
++        strategy-configured `max_pair_exposure` fraction of total tradable capital.
++        Disabled (no-op, returns max_stake_amount unchanged) unless `max_pair_exposure` is
++        set in the config/strategy - additive, opt-in behavior.
++        :param pair: pair about to be entered/increased
++        :param max_stake_amount: the max stake amount computed so far (e.g. from
++            Exchange.get_max_pair_stake_amount), which this may further reduce.
++        :return: max_stake_amount, capped by remaining base-currency exposure headroom.
++        """
++        max_pair_exposure = self._config.get("max_pair_exposure")
++        if not max_pair_exposure:
++            # Feature disabled by default - no config value set.
++            return max_stake_amount
++
++        total_capital = self.get_total_stake_amount()
++        allowed_exposure = total_capital * max_pair_exposure
++        current_exposure = self.get_pair_exposure_stake(pair)
++        remaining_headroom = max(allowed_exposure - current_exposure, 0.0)
++
++        if remaining_headroom < max_stake_amount:
++            base_currency = self._exchange.get_pair_base_currency(pair)
++            self._local_log(
++                f"Stake amount for pair {pair} is limited by the {max_pair_exposure:.2%} "
++                f"max_pair_exposure cap for base currency {base_currency} "
++                f"({current_exposure} already committed of {allowed_exposure} allowed), "
++                f"reducing max stake to {remaining_headroom}.",
++                level="info",
++            )
++        return min(max_stake_amount, remaining_headroom)
++
+     def get_trade_stake_amount(
+         self, pair: str, max_open_trades: IntOrInf, update: bool = True
+     ) -> float:
+diff --git a/tests/test_max_pair_exposure.py b/tests/test_max_pair_exposure.py
+new file mode 100644
+index 0000000..4cb5ba4
+--- /dev/null
++++ b/tests/test_max_pair_exposure.py
+@@ -0,0 +1,125 @@
++# pragma pylint: disable=missing-docstring, protected-access
++"""
++Functional check for the per-strategy `max_pair_exposure` cap (R01-TB).
++
++Verifies that opening a new trade which would push the combined open exposure to a
++shared base currency above the configured fraction of tradable capital is resized down
++identically whether the code path is:
++  (1) live/dry-run - FreqtradeBot.execute_entry()
++  (2) backtesting - Backtesting._enter_trade()
++
++Both pairs used below ("XRP/BTC" and "XRP/USDT") share the same base currency (XRP) but
++have different quote currencies - mirroring the "several pairs backed by the same
++underlying currency" scenario described in the task.
++"""
++
++import pandas as pd
++import pytest
++
++from freqtrade.freqtradebot import FreqtradeBot
++from freqtrade.persistence import LocalTrade, Trade
++from tests.conftest import EXMS, get_patched_freqtradebot, patch_exchange
++
++
++def test_max_pair_exposure_freqtradebot(mocker, default_conf, fee, limit_order_open) -> None:
++    """
++    Live/dry-run path: FreqtradeBot.execute_entry() must resize a second trade in a pair
++    that shares a base currency with an already-open trade, once the combined exposure to
++    that base currency would exceed max_pair_exposure * total tradable capital.
++    """
++    default_conf["max_open_trades"] = 2
++    default_conf["stake_amount"] = 150
++    default_conf["dry_run_wallet"] = 1000
++    default_conf["tradable_balance_ratio"] = 0.99
++    default_conf["max_pair_exposure"] = 0.2  # 20% of ~990 => 198
++
++    patch_exchange(mocker)
++    freqtrade: FreqtradeBot = get_patched_freqtradebot(mocker, default_conf)
++    freqtrade.strategy.confirm_trade_entry = mocker.MagicMock(return_value=True)
++
++    mocker.patch.multiple(
++        EXMS,
++        get_rate=mocker.MagicMock(return_value=1.0),
++        fetch_ticker=mocker.MagicMock(return_value={"bid": 1.0, "ask": 1.0, "last": 1.0}),
++        create_order=mocker.MagicMock(return_value=limit_order_open["buy"]),
++        get_min_pair_stake_amount=mocker.MagicMock(return_value=1),
++        get_max_pair_stake_amount=mocker.MagicMock(return_value=500000),
++        get_fee=fee,
++        get_funding_fees=mocker.MagicMock(return_value=0),
++    )
++
++    # First trade, XRP/BTC: 150 is well within the 198 exposure allowance for XRP - opens
++    # at full requested size.
++    assert freqtrade.execute_entry("XRP/BTC", 150) is True
++    open_trades = Trade.get_open_trades()
++    assert len(open_trades) == 1
++    assert open_trades[0].stake_amount == pytest.approx(150)
++
++    # Second trade, XRP/USDT: shares base currency XRP with the trade above. Combined
++    # exposure of 150 + 150 = 300 would breach the 198 cap, so it must be resized down to
++    # the remaining headroom (198 - 150 = 48), not rejected outright (mirrors how
++    # min_stake/max_stake already clamp trade size) and not silently allowed at full size.
++    assert freqtrade.execute_entry("XRP/USDT", 150) is True
++    open_trades = Trade.get_open_trades()
++    assert len(open_trades) == 2
++    xrp_usdt_trade = next(t for t in open_trades if t.pair == "XRP/USDT")
++    assert xrp_usdt_trade.stake_amount == pytest.approx(48)
++
++
++def test_max_pair_exposure_backtesting(mocker, default_conf, fee) -> None:
++    """
++    Backtesting path: Backtesting._enter_trade() must produce the SAME resize outcome as
++    the live/dry-run test above, for the same strategy+config+stake sequence across the
++    same two pairs. This is the core of AC2/AC5: the exposure cap must not be a live-only
++    feature that backtests silently ignore.
++    """
++    # Import here (after other freqtrade.* imports) to match existing test-file conventions
++    # and avoid import-order issues with the optimize package.
++    from freqtrade.optimize.backtesting import Backtesting
++
++    default_conf["use_exit_signal"] = False
++    default_conf["max_open_trades"] = 2
++    default_conf["stake_amount"] = 150
++    default_conf["dry_run_wallet"] = 1000
++    default_conf["tradable_balance_ratio"] = 0.99
++    default_conf["max_pair_exposure"] = 0.2  # Identical config to the live/dry-run test.
++
++    mocker.patch(f"{EXMS}.get_fee", fee)
++    mocker.patch(f"{EXMS}.get_min_pair_stake_amount", return_value=0.00001)
++    mocker.patch(f"{EXMS}.get_max_pair_stake_amount", return_value=float("inf"))
++    patch_exchange(mocker)
++
++    backtesting = Backtesting(default_conf)
++    backtesting._set_strategy(backtesting.strategylist[0])
++
++    row = [
++        pd.Timestamp(year=2020, month=1, day=1, hour=5, minute=0),
++        1,  # Buy
++        0.001,  # Open
++        0.0011,  # Close
++        0,  # Sell
++        0.00099,  # Low
++        0.0012,  # High
++        "",  # Buy Signal Name
++    ]
++
++    try:
++        # First trade, XRP/BTC: same 150 stake, same 198 allowance => opens at full size.
++        trade1 = backtesting._enter_trade("XRP/BTC", row=row, direction="long")
++        assert trade1 is not None
++        assert trade1.stake_amount == pytest.approx(150)
++        backtesting.wallets.update()
++
++        # Second trade, XRP/USDT: same base currency (XRP) as trade1. Must be resized down
++        # to the same 48 remaining headroom as the live/dry-run engine above - IDENTICAL
++        # accept/reject/resize outcome for the equivalent trade sequence.
++        trade2 = backtesting._enter_trade("XRP/USDT", row=row, direction="long")
++        assert trade2 is not None
++        assert trade2.stake_amount == pytest.approx(48)
++    finally:
++        # LocalTrade.bt_trades_open/bt_trades_open_pp are process-global state shared across
++        # tests - clean up so other backtesting tests are unaffected.
++        LocalTrade.bt_trades_open = []
++        LocalTrade.bt_trades_open_pp.clear()
++        LocalTrade.bt_open_open_trade_count = 0
++        LocalTrade.bt_trades = []

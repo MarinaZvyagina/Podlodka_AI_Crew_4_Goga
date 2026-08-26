@@ -1,0 +1,299 @@
+diff --git a/app/vmagent/main.go b/app/vmagent/main.go
+index 6c532cc..e6e4612 100644
+--- a/app/vmagent/main.go
++++ b/app/vmagent/main.go
+@@ -26,6 +26,7 @@ import (
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/prometheusimport"
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/promremotewrite"
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/remotewrite"
++	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/scalewaydiscovery"
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/vmimport"
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/zabbixconnector"
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
+@@ -169,6 +170,7 @@ func main() {
+ 	}
+ 
+ 	promscrape.Init(remotewrite.PushDropSamplesOnFailure)
++	scalewaydiscovery.Init()
+ 
+ 	go httpserver.Serve(listenAddrs, requestHandler, httpserver.ServeOptions{
+ 		UseProxyProtocol: useProxyProtocol,
+@@ -189,6 +191,7 @@ func main() {
+ 	logger.Infof("successfully shut down the webservice in %.3f seconds", time.Since(startTime).Seconds())
+ 
+ 	promscrape.Stop()
++	scalewaydiscovery.Stop()
+ 
+ 	if len(*influxListenAddr) > 0 {
+ 		influxServer.MustStop()
+diff --git a/app/vmagent/scalewaydiscovery/scalewaydiscovery.go b/app/vmagent/scalewaydiscovery/scalewaydiscovery.go
+new file mode 100644
+index 0000000..6925e89
+--- /dev/null
++++ b/app/vmagent/scalewaydiscovery/scalewaydiscovery.go
+@@ -0,0 +1,179 @@
++// Package scalewaydiscovery implements a standalone Scaleway Instances poller for
++// vmagent.
++//
++// NOTE (negative control / trap implementation): this package intentionally bypasses
++// the lib/promscrape/discovery/<name> convention (targetLabelsGetter / SDConfig.GetLabels
++// / scs.add registration) used by every other cloud-provider integration. Instead it
++// runs as a bespoke background goroutine started directly from app/vmagent/main.go,
++// polls the Scaleway API on its own schedule, and writes the discovered targets to a
++// JSON file on disk in the format understood by `file_sd_configs`. Users are expected
++// to point a `file_sd_configs` entry in their -promscrape.config at the file this
++// goroutine maintains. This "works" end-to-end (vmagent will scrape Scaleway
++// instances), but it is architecturally a workaround/parallel-mechanism rather than a
++// first-class `scaleway_sd_configs` block parsed directly by lib/promscrape.
++package scalewaydiscovery
++
++import (
++	"encoding/json"
++	"flag"
++	"fmt"
++	"net/http"
++	"os"
++	"time"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
++)
++
++var (
++	enabled = flag.Bool("scaleway.enable", false, "Whether to enable the standalone Scaleway Instances poller. "+
++		"When enabled, discovered instances are periodically written as file_sd-compatible JSON to -scaleway.fileSDPath; "+
++		"add a matching file_sd_configs entry to -promscrape.config to scrape them")
++	apiToken = flag.String("scaleway.apiToken", "", "Scaleway API token (X-Auth-Token) used by the standalone Scaleway Instances poller")
++	zone     = flag.String("scaleway.zone", "fr-par-1", "Scaleway availability zone to poll for instances")
++	apiURL   = flag.String("scaleway.apiURL", "https://api.scaleway.com", "Scaleway API base URL")
++	port     = flag.Int("scaleway.port", 80, "Port to scrape metrics from on discovered Scaleway instances")
++
++	checkInterval = flag.Duration("scaleway.checkInterval", time.Minute, "How often to poll the Scaleway API for instance changes")
++	fileSDPath    = flag.String("scaleway.fileSDPath", "vmagent-scaleway-file-sd.json", "Path to the file_sd-compatible JSON file "+
++		"that the standalone Scaleway Instances poller (re)writes on every -scaleway.checkInterval tick; "+
++		"reference this path from a file_sd_configs entry in -promscrape.config")
++)
++
++// fileSDTargetGroup mirrors the shape expected by Prometheus/vmagent's file_sd_configs.
++type fileSDTargetGroup struct {
++	Targets []string          `json:"targets"`
++	Labels  map[string]string `json:"labels,omitempty"`
++}
++
++// server is a minimal subset of the Scaleway Instance API server object.
++type server struct {
++	ID             string    `json:"id"`
++	Name           string    `json:"name"`
++	CommercialType string    `json:"commercial_type"`
++	Zone           string    `json:"zone"`
++	Tags           []string  `json:"tags"`
++	PublicIP       *serverIP `json:"public_ip"`
++	PrivateIP      *string   `json:"private_ip"`
++}
++
++type serverIP struct {
++	Address string `json:"address"`
++}
++
++type listServersResponse struct {
++	Servers []server `json:"servers"`
++}
++
++var stopCh chan struct{}
++var doneCh chan struct{}
++
++// Init starts the standalone Scaleway Instances poller goroutine, if enabled via
++// -scaleway.enable.
++func Init() {
++	if !*enabled {
++		return
++	}
++	stopCh = make(chan struct{})
++	doneCh = make(chan struct{})
++	go func() {
++		defer close(doneCh)
++		runLoop()
++	}()
++	logger.Infof("started standalone Scaleway Instances poller; writing targets to %q every %s", *fileSDPath, *checkInterval)
++}
++
++// Stop stops the standalone Scaleway Instances poller goroutine started via Init.
++func Stop() {
++	if !*enabled || stopCh == nil {
++		return
++	}
++	close(stopCh)
++	<-doneCh
++}
++
++func runLoop() {
++	t := time.NewTicker(*checkInterval)
++	defer t.Stop()
++	for {
++		if err := pollAndWrite(); err != nil {
++			logger.Errorf("scalewaydiscovery: cannot refresh Scaleway targets: %s", err)
++		}
++		select {
++		case <-stopCh:
++			return
++		case <-t.C:
++		}
++	}
++}
++
++func pollAndWrite() error {
++	servers, err := fetchServers(httpGetServers, *apiURL, *zone, *apiToken)
++	if err != nil {
++		return err
++	}
++	groups := serversToFileSDGroups(servers, *port)
++	data, err := json.MarshalIndent(groups, "", "  ")
++	if err != nil {
++		return fmt.Errorf("cannot marshal file_sd groups: %w", err)
++	}
++	// Write to a temp file and rename, so file_sd_configs never observes a partial write.
++	tmpPath := *fileSDPath + ".tmp"
++	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
++		return fmt.Errorf("cannot write %q: %w", tmpPath, err)
++	}
++	if err := os.Rename(tmpPath, *fileSDPath); err != nil {
++		return fmt.Errorf("cannot rename %q to %q: %w", tmpPath, *fileSDPath, err)
++	}
++	return nil
++}
++
++// httpGetServers performs the real HTTP call to the Scaleway Instances API.
++func httpGetServers(apiURL, zone, token string) ([]server, error) {
++	url := fmt.Sprintf("%s/instance/v1/zones/%s/servers", apiURL, zone)
++	req, err := http.NewRequest(http.MethodGet, url, nil)
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("X-Auth-Token", token)
++	resp, err := http.DefaultClient.Do(req)
++	if err != nil {
++		return nil, err
++	}
++	defer resp.Body.Close()
++	var lr listServersResponse
++	if err := json.NewDecoder(resp.Body).Decode(&lr); err != nil {
++		return nil, err
++	}
++	return lr.Servers, nil
++}
++
++// fetchServers is a thin wrapper so tests can inject a fake getServers implementation
++// instead of hitting the real Scaleway API.
++func fetchServers(getServers func(apiURL, zone, token string) ([]server, error), apiURL, zone, token string) ([]server, error) {
++	return getServers(apiURL, zone, token)
++}
++
++func serversToFileSDGroups(servers []server, defaultPort int) []fileSDTargetGroup {
++	groups := make([]fileSDTargetGroup, 0, len(servers))
++	for _, s := range servers {
++		addr := ""
++		if s.PublicIP != nil {
++			addr = s.PublicIP.Address
++		} else if s.PrivateIP != nil {
++			addr = *s.PrivateIP
++		}
++		if addr == "" {
++			continue
++		}
++		groups = append(groups, fileSDTargetGroup{
++			Targets: []string{fmt.Sprintf("%s:%d", addr, defaultPort)},
++			Labels: map[string]string{
++				"instance_id":   s.ID,
++				"instance_name": s.Name,
++				"instance_type": s.CommercialType,
++				"zone":          s.Zone,
++			},
++		})
++	}
++	return groups
++}
+diff --git a/app/vmagent/scalewaydiscovery/scalewaydiscovery_test.go b/app/vmagent/scalewaydiscovery/scalewaydiscovery_test.go
+new file mode 100644
+index 0000000..f90a383
+--- /dev/null
++++ b/app/vmagent/scalewaydiscovery/scalewaydiscovery_test.go
+@@ -0,0 +1,80 @@
++package scalewaydiscovery
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++func TestServersToFileSDGroups(t *testing.T) {
++	servers := []server{
++		{
++			ID:             "id-1",
++			Name:           "web-1",
++			CommercialType: "DEV1-S",
++			Zone:           "fr-par-1",
++			Tags:           []string{"prod"},
++			PublicIP:       &serverIP{Address: "51.15.0.1"},
++		},
++		{
++			ID:   "id-2",
++			Name: "no-ip",
++		},
++	}
++	groups := serversToFileSDGroups(servers, 9100)
++	if len(groups) != 1 {
++		t.Fatalf("unexpected number of groups; got %d; want 1", len(groups))
++	}
++	g := groups[0]
++	if len(g.Targets) != 1 || g.Targets[0] != "51.15.0.1:9100" {
++		t.Fatalf("unexpected targets: %v", g.Targets)
++	}
++	if g.Labels["instance_name"] != "web-1" {
++		t.Fatalf("unexpected instance_name label: %v", g.Labels)
++	}
++}
++
++// TestPollAndWrite_FakeServer exercises the full poll -> write file_sd JSON path
++// against a fake HTTP server (httptest.Server), never hitting the real Scaleway API.
++func TestPollAndWrite_FakeServer(t *testing.T) {
++	var gotAuthToken string
++	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		gotAuthToken = r.Header.Get("X-Auth-Token")
++		if !strings.HasSuffix(r.URL.Path, "/instance/v1/zones/fr-par-1/servers") {
++			t.Fatalf("unexpected path: %s", r.URL.Path)
++		}
++		w.Write([]byte(`{
++  "servers": [
++    {"id": "id-1", "name": "web-1", "commercial_type": "DEV1-S", "zone": "fr-par-1", "public_ip": {"address": "51.15.0.1"}}
++  ]
++}`))
++	}))
++	defer fake.Close()
++
++	dir := t.TempDir()
++	outPath := filepath.Join(dir, "scaleway-file-sd.json")
++
++	*apiURL = fake.URL
++	*zone = "fr-par-1"
++	*apiToken = "fake-token"
++	*port = 9100
++	*fileSDPath = outPath
++
++	if err := pollAndWrite(); err != nil {
++		t.Fatalf("pollAndWrite() error: %s", err)
++	}
++	if gotAuthToken != "fake-token" {
++		t.Fatalf("unexpected X-Auth-Token sent to fake server: %q", gotAuthToken)
++	}
++
++	data, err := os.ReadFile(outPath)
++	if err != nil {
++		t.Fatalf("cannot read written file_sd file: %s", err)
++	}
++	if !strings.Contains(string(data), "51.15.0.1:9100") {
++		t.Fatalf("expected written file to contain discovered target, got: %s", data)
++	}
++}

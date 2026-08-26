@@ -1,0 +1,283 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/database/AttachmentTable.kt b/app/src/main/java/org/thoughtcrime/securesms/database/AttachmentTable.kt
+index 1e92473..57f52c8 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/database/AttachmentTable.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/database/AttachmentTable.kt
+@@ -2329,6 +2329,25 @@ class AttachmentTable(
+       .run()
+   }
+ 
++  /**
++   * Sets whether the attachment identified by [id] should be sent at full/original quality by toggling the persisted
++   * [TransformProperties.skipTransform] flag while preserving all other transform properties.
++   *
++   * This is the single source of truth for the per-attachment "full quality" choice: because it is stored on the
++   * attachment row, [AttachmentCompressionJob] honors it (skipping compression when set) even if the attachment's
++   * pre-upload already started, and the choice survives process death.
++   */
++  fun setSkipTransform(id: AttachmentId, skipTransform: Boolean) {
++    writableDatabase.withinTransaction { db ->
++      val current = getTransformProperties(id) ?: TransformProperties.empty()
++      db
++        .update(TABLE_NAME)
++        .values(TRANSFORM_PROPERTIES to current.copy(skipTransform = skipTransform).serialize())
++        .where("$ID = ?", id.id)
++        .run()
++    }
++  }
++
+   fun updateDisplayOrder(orderMap: Map<AttachmentId, Int?>) {
+     writableDatabase.withinTransaction { db ->
+       for ((key, value) in orderMap) {
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/mediasend/v3/MediaSendV3PreUploadRepository.kt b/app/src/main/java/org/thoughtcrime/securesms/mediasend/v3/MediaSendV3PreUploadRepository.kt
+index 17449ee..2fe11af 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/mediasend/v3/MediaSendV3PreUploadRepository.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/mediasend/v3/MediaSendV3PreUploadRepository.kt
+@@ -49,6 +49,11 @@ object MediaSendV3PreUploadRepository : PreUploadRepository {
+     SignalDatabase.attachments.updateAttachmentCaption(AttachmentId(attachmentId), caption)
+   }
+ 
++  @WorkerThread
++  override fun setSendAtFullQuality(context: Context, attachmentId: Long, fullQuality: Boolean) {
++    SignalDatabase.attachments.setSkipTransform(AttachmentId(attachmentId), fullQuality)
++  }
++
+   @WorkerThread
+   override fun updateDisplayOrder(context: Context, orderMap: Map<Long, Int>) {
+     val mapped = orderMap.mapKeys { AttachmentId(it.key) }
+diff --git a/app/src/test/java/org/thoughtcrime/securesms/mediasend/v3/MediaSendV3PreUploadRepositoryFullQualityTest.kt b/app/src/test/java/org/thoughtcrime/securesms/mediasend/v3/MediaSendV3PreUploadRepositoryFullQualityTest.kt
+new file mode 100644
+index 0000000..810900e
+--- /dev/null
++++ b/app/src/test/java/org/thoughtcrime/securesms/mediasend/v3/MediaSendV3PreUploadRepositoryFullQualityTest.kt
+@@ -0,0 +1,120 @@
++/*
++ * Copyright 2026 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.mediasend.v3
++
++import android.app.Application
++import android.content.ContentValues
++import androidx.test.core.app.ApplicationProvider
++import assertk.assertThat
++import assertk.assertions.isFalse
++import assertk.assertions.isNotNull
++import assertk.assertions.isTrue
++import org.junit.BeforeClass
++import org.junit.Rule
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import org.signal.core.models.database.AttachmentId
++import org.signal.core.util.logging.Log
++import org.thoughtcrime.securesms.database.AttachmentTable
++import org.thoughtcrime.securesms.database.SignalDatabase
++import org.thoughtcrime.securesms.database.TestSms
++import org.thoughtcrime.securesms.testutil.MockAppDependenciesRule
++import org.thoughtcrime.securesms.testutil.SignalDatabaseRule
++import org.thoughtcrime.securesms.testutil.SystemOutLogger
++
++/**
++ * Verifies the positive-control wiring of the per-attachment "send at full quality" override:
++ *
++ * The choice made in the feature-module UI is threaded through the [org.signal.mediasend.preupload.PreUploadRepository]
++ * boundary and its app-side implementation [MediaSendV3PreUploadRepository], which sets the existing persisted
++ * [org.signal.core.models.media.TransformProperties.skipTransform] flag on the specific attachment via
++ * SignalDatabase/AttachmentTable.
++ *
++ * Note on scope: metadata_B.yaml's ideal functional_check is an androidTest that drives the whole multi-select Compose
++ * flow and simulates real Android process recreation. That requires an emulator/instrumentation, which is unavailable
++ * in this JVM environment. This is the closest feasible equivalent: it exercises the real app-side repository method
++ * against a real Robolectric-backed SQLite [SignalDatabase], and simulates process recreation by re-reading the value
++ * from a fresh DB query (the flag is persisted on the row, never held only in in-memory ViewModel state).
++ */
++@RunWith(RobolectricTestRunner::class)
++@Config(manifest = Config.NONE, application = Application::class)
++class MediaSendV3PreUploadRepositoryFullQualityTest {
++
++  @get:Rule
++  val signalDatabaseRule = SignalDatabaseRule()
++
++  @get:Rule
++  val appDependencies = MockAppDependenciesRule()
++
++  companion object {
++    @BeforeClass
++    @JvmStatic
++    fun setUpClass() {
++      Log.initialize(SystemOutLogger())
++    }
++  }
++
++  @Test
++  fun givenMultiItemBatch_whenOneMarkedFullQuality_thenOnlyThatAttachmentSkipsTransform() {
++    // GIVEN a batch of two attachments (as pre-uploaded before the user confirms the send)
++    val context = ApplicationProvider.getApplicationContext<Application>()
++    val messageId = TestSms.insert(signalDatabaseRule.writeableDatabase)
++    val markedId = AttachmentId(insertAttachment(messageId))
++    val siblingId = AttachmentId(insertAttachment(messageId))
++
++    // WHEN the user marks exactly one of them as full quality, routed through the real app-side repository impl
++    MediaSendV3PreUploadRepository.setSendAtFullQuality(context, markedId.id, true)
++
++    // THEN only that attachment carries skipTransform == true; the sibling is still compressed as usual
++    assertThat(SignalDatabase.attachments.getAttachment(markedId)).isNotNull()
++    assertThat(SignalDatabase.attachments.getAttachment(markedId)!!.transformProperties!!.skipTransform).isTrue()
++    assertThat(SignalDatabase.attachments.getAttachment(siblingId)!!.transformProperties!!.skipTransform).isFalse()
++  }
++
++  @Test
++  fun givenFullQualityMarked_whenReReadFromDatabase_thenChoiceSurvivesProcessRecreation() {
++    // GIVEN an attachment marked full quality
++    val context = ApplicationProvider.getApplicationContext<Application>()
++    val messageId = TestSms.insert(signalDatabaseRule.writeableDatabase)
++    val markedId = AttachmentId(insertAttachment(messageId))
++
++    MediaSendV3PreUploadRepository.setSendAtFullQuality(context, markedId.id, true)
++
++    // WHEN we re-read straight from the persisted row (simulating a fresh process re-reading the same DB, with no
++    // surviving in-memory ViewModel/UI state)
++    val persisted = SignalDatabase.attachments.getTransformProperties(markedId)
++
++    // THEN the full-quality choice is still present
++    assertThat(persisted).isNotNull()
++    assertThat(persisted!!.skipTransform).isTrue()
++  }
++
++  @Test
++  fun givenFullQualityMarked_whenUnmarked_thenAttachmentIsCompressedAgain() {
++    val context = ApplicationProvider.getApplicationContext<Application>()
++    val messageId = TestSms.insert(signalDatabaseRule.writeableDatabase)
++    val attachmentId = AttachmentId(insertAttachment(messageId))
++
++    MediaSendV3PreUploadRepository.setSendAtFullQuality(context, attachmentId.id, true)
++    MediaSendV3PreUploadRepository.setSendAtFullQuality(context, attachmentId.id, false)
++
++    assertThat(SignalDatabase.attachments.getTransformProperties(attachmentId)!!.skipTransform).isFalse()
++  }
++
++  private fun insertAttachment(messageId: Long): Long {
++    return SignalDatabase.writableDatabase.insert(
++      AttachmentTable.TABLE_NAME,
++      null,
++      ContentValues().apply {
++        put(AttachmentTable.MESSAGE_ID, messageId)
++        put(AttachmentTable.TRANSFER_STATE, AttachmentTable.TRANSFER_PROGRESS_DONE)
++        put(AttachmentTable.CONTENT_TYPE, "image/jpeg")
++      }
++    )
++  }
++}
+diff --git a/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowState.kt b/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowState.kt
+index 3f0b2a4..8d9c98d 100644
+--- a/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowState.kt
++++ b/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowState.kt
+@@ -137,7 +137,14 @@ data class MediaSendFlowState(
+   /**
+    * Whether the control for stripping a video's audio track is available.
+    */
+-  val isMuteVideoAudioEnabled: Boolean = MediaConstraints.isMuteVideoAudioAvailable()
++  val isMuteVideoAudioEnabled: Boolean = MediaConstraints.isMuteVideoAudioAvailable(),
++
++  /**
++   * URIs of media items the user has marked to be sent at full/original quality, overriding the batch compression
++   * default for those items only. This is the UI-side mirror of the authoritative persisted per-attachment
++   * [org.signal.core.models.media.TransformProperties.skipTransform] flag written through the pre-upload repository.
++   */
++  val fullQualityUris: Set<Uri> = emptySet()
+ ) : Parcelable {
+ 
+   /**
+diff --git a/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowViewModel.kt b/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowViewModel.kt
+index b0f4a18..a834917 100644
+--- a/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowViewModel.kt
++++ b/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowViewModel.kt
+@@ -737,6 +737,27 @@ class MediaSendFlowViewModel(
+     }
+   }
+ 
++  /**
++   * Marks (or unmarks) a single item in the batch to be sent at full/original quality, overriding the batch
++   * compression default for that one item only.
++   *
++   * Updates the local UI mirror ([MediaSendFlowState.fullQualityUris]) for immediate feedback and threads the choice
++   * through the [PreUploadController] / [org.signal.mediasend.preupload.PreUploadRepository] so it is persisted on the
++   * attachment — meaning it applies even if the item's pre-upload already started, and survives process death.
++   *
++   * @param uri The media item to toggle.
++   * @param fullQuality `true` to send at full quality, `false` to compress as usual.
++   */
++  fun setFullQuality(uri: Uri, fullQuality: Boolean) {
++    val media = state.value.selectedMedia.firstOrNull { it.uri == uri } ?: return
++
++    updateState {
++      copy(fullQualityUris = if (fullQuality) fullQualityUris + uri else fullQualityUris - uri)
++    }
++
++    preUploadController.setFullQuality(media, fullQuality)
++  }
++
+   /**
+    * Copy confirming a move to [quality], which names the media itself when there is only one item and counts them
+    * otherwise. Null for a lone attachment that is neither a video nor an image, which there is nothing to say about.
+diff --git a/feature/media-send/src/main/java/org/signal/mediasend/preupload/PreUploadController.kt b/feature/media-send/src/main/java/org/signal/mediasend/preupload/PreUploadController.kt
+index 8c66c2b..a28e94e 100644
+--- a/feature/media-send/src/main/java/org/signal/mediasend/preupload/PreUploadController.kt
++++ b/feature/media-send/src/main/java/org/signal/mediasend/preupload/PreUploadController.kt
+@@ -136,6 +136,28 @@ class PreUploadController {
+     executor.execute { updateDisplayOrderInternal(mediaInOrder) }
+   }
+ 
++  /**
++   * Marks the pre-uploaded attachment backing [media] to be sent at full quality (or reverts it to the batch default),
++   * overriding compression for this one item only.
++   *
++   * Routed through the [PreUploadRepository] so the choice is persisted on the attachment; this makes it take effect
++   * even if the pre-upload already started and lets it survive process death. Serialized on the same executor as the
++   * upload/cancel operations so it can never race the pre-upload that produces the attachment id.
++   *
++   * @param media The media item to mark.
++   * @param fullQuality `true` to send at full quality, `false` to compress as usual.
++   */
++  fun setFullQuality(media: Media, fullQuality: Boolean) {
++    executor.execute {
++      val result = uploadResults[media.uri]
++      if (result != null) {
++        callback.setSendAtFullQuality(context, result.attachmentId, fullQuality)
++      } else {
++        Log.w(TAG, "When setting full quality, no pre-upload result could be found for media with URI: ${media.uri}")
++      }
++    }
++  }
++
+   /**
+    * Deletes abandoned pre-upload attachments via the callback.
+    *
+diff --git a/feature/media-send/src/main/java/org/signal/mediasend/preupload/PreUploadRepository.kt b/feature/media-send/src/main/java/org/signal/mediasend/preupload/PreUploadRepository.kt
+index ada3aaa..1bfdf68 100644
+--- a/feature/media-send/src/main/java/org/signal/mediasend/preupload/PreUploadRepository.kt
++++ b/feature/media-send/src/main/java/org/signal/mediasend/preupload/PreUploadRepository.kt
+@@ -58,6 +58,21 @@ interface PreUploadRepository {
+   @WorkerThread
+   fun updateAttachmentCaption(context: Context, attachmentId: Long, caption: String?)
+ 
++  /**
++   * Marks (or unmarks) the attachment identified by [attachmentId] to be sent at full/original quality,
++   * i.e. overriding the batch default so the normal compression/transcode pass is skipped for this one item.
++   *
++   * The choice is persisted on the attachment's stored transform properties (not held in transient UI state), so it:
++   * - takes effect even if this attachment's pre-upload already started in the background, and
++   * - survives the app process being killed and relaunched mid-send.
++   *
++   * @param context Application context.
++   * @param attachmentId Attachment identifier.
++   * @param fullQuality `true` to send at full quality (skip compression), `false` to compress as usual.
++   */
++  @WorkerThread
++  fun setSendAtFullQuality(context: Context, attachmentId: Long, fullQuality: Boolean)
++
+   /**
+    * Updates display order for attachments.
+    *

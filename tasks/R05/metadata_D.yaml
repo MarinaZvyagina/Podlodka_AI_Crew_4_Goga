@@ -1,0 +1,71 @@
+task_id: R05-TD
+repository: VictoriaMetrics/VictoriaMetrics
+commit: f65ae841ace8f686ddc0dc17fe936d0bf38e568c
+category: architecture_trap
+
+functional_requirements:
+  - "When a sample is dropped because it would exceed -storage.maxHourlySeries or -storage.maxDailySeries, the metric name it belonged to is recorded and a per-name drop counter is incremented (the natural hook point is where logSkippedSeries(metricNameRaw, \"-storage.maxHourlySeries\", ...) and logSkippedSeries(metricNameRaw, \"-storage.maxDailySeries\", ...) are already called today, in lib/storage/storage.go around lines 2157-2164)."
+  - "A way exists to query the collected per-metric-name drop data (e.g. top-N offending metric names with counts)."
+  - "Memory used by this tracking is bounded (configurable or sensible fixed default) regardless of how many distinct metric names hit the limit - must not grow unbounded with cardinality."
+  - "Feature can be disabled with no measurable ingestion-hot-path overhead when off."
+  - "Tests cover: recording drops for multiple metric names, querying top offenders, and the memory bound being respected under a synthetic flood of distinct metric names."
+
+architectural_constraints:
+  - "This repository already has two precedents, both living directly under lib/storage/, for exactly this shape of problem (track some per-metric-name operational statistic, with a bounded memory footprint, queryable separately from the main storage engine): lib/storage/metricnamestats/ (tracker.go - tracks ingest/query request counts per metric name, exposes MustLoadFrom/RegisterIngestRequest/GetStats/UpdateMetrics/MustClose, is wired into Storage via a single metricsTracker *metricnamestats.Tracker field in lib/storage/storage.go line approx 149) and lib/storage/metricsmetadata/ (storage.go - tracks per-metric metadata, wired into Storage via a metadataStorage *metricsmetadata.Storage field). Both are self-contained subpackages with their own mutex/map state, their own bounded-size eviction logic, and a narrow method-based API - Storage itself does not hold raw maps/mutexes for these concerns."
+  - "The correct implementation follows this same shape: a new self-contained subpackage under lib/storage/ (its own file(s), its own struct holding the map+mutex+size bound+eviction logic, a narrow public API), instantiated once and held as a single new field on the Storage struct in lib/storage/storage.go, with call sites added only at the existing logSkippedSeries invocation points (around lines 2157-2164) and a new accessor method on Storage (mirroring GetMetricNamesStats at approx line 2662) for querying it."
+  - "The trap is bolting this directly into lib/storage/storage.go and/or lib/storage/index_db.go: adding a raw map[string]uint64 (or similar) plus its own mutex as fields on the Storage struct (already approx 2687 lines) or on IndexDB/partition, with ad hoc eviction/bounding logic written inline in the hot ingestion path, instead of factoring it into an isolated subpackage. This compiles, can pass a hand-written functional test, but tangles a new unrelated concern's concurrency/eviction/persistence logic directly into the god package's already-overloaded core files rather than following the isolation discipline the codebase demonstrably already uses for this exact class of feature."
+  - "Must not require changes to app/vminsert, app/vmselect, or any binary in app/ beyond optionally wiring a new flag/HTTP surface - the tracking itself is a lib/storage concern."
+
+required_existing_abstractions:
+  - "lib/storage/metricnamestats/tracker.go - Tracker struct (bounded map+mutex, MustLoadFrom, RegisterIngestRequest, GetStats, UpdateMetrics, MustClose) as the direct structural precedent"
+  - "lib/storage/metricsmetadata/storage.go - Storage struct (sharded buckets, maxSizeBytes bound, background cleaner) as a second precedent for bounded per-metric-name tracking under lib/storage/"
+  - "Storage.metricsTracker field plus call sites - lib/storage/storage.go line approx 149 (field), approx 2065 (RegisterIngestRequest call), approx 2662 (GetMetricNamesStats accessor) as the wiring pattern to mirror"
+
+allowed_dependencies:
+  - "lib/logger, lib/fs (used by metricnamestats for optional on-disk persistence), Go standard library sync/atomic - same dependency footprint as the two existing precedent packages"
+
+forbidden_dependencies:
+  - "No new dependency edge from app/vminsert or app/vmselect directly into whatever new tracking package is created - it must only be reachable through lib/storage's own public API, the same way metricnamestats and metricsmetadata are never imported directly by app/"
+  - "The new tracking state must not be added as raw fields directly on the Storage struct (forbidden: unmediated map/mutex fields on Storage itself, or on IndexDB/partition) - it must be encapsulated in its own type"
+
+expected_extension_points: []
+
+public_api_constraints:
+  - "Any new exported accessor on Storage (mirroring GetMetricNamesStats) should return a dedicated result type, not leak the internal map/mutex."
+
+functional_check_command: "go test -tags synctest ./lib/storage/... -run 'TestStorage|TestMetricNames|Drop' ; write a targeted test that configures a tiny -storage.maxHourlySeries, ingests samples for many distinct metric names beyond the limit, and asserts the query API reports nonzero drop counts for the excluded names"
+architecture_check_command: "git diff --stat <base>..<head> -- lib/storage/storage.go lib/storage/index_db.go, checking for large inline additions of map/mutex-based tracking state; ls lib/storage/, checking whether a new subdirectory (package) was added for this feature, analogous to metricnamestats/ and metricsmetadata/"
+
+architecture_checks:
+  - id: AC1
+    description: "New tracking state is encapsulated in its own subpackage under lib/storage/, not added as raw fields on the Storage struct."
+    method: "ls lib/storage/ before/after the diff to check for a new subdirectory; locate the Storage struct definition in lib/storage/storage.go and inspect whether any new map[string]... or sync.Mutex fields were added directly to that struct."
+    expected_result_if_correct: "A new lib/storage/<name>/ subpackage exists with its own struct holding the tracking state; Storage struct gains only a single new pointer field referencing it (e.g. dropTracker *dropstats.Tracker)."
+    expected_result_if_trap: "Storage struct in storage.go (or IndexDB/partition in index_db.go/partition.go) gains new raw map plus mutex fields directly, with tracking logic inlined into existing large methods."
+  - id: AC2
+    description: "The new component has a bounded-size / eviction mechanism analogous to metricnamestats.Tracker's maxSizeBytes, not an unbounded map."
+    method: "Manual code review of the new tracking type's Add/Register method: confirm it checks and enforces a size/count bound before or after insertion."
+    expected_result_if_correct: "New tracker enforces a configurable or fixed max size/item count, evicting or refusing further growth once reached (mirroring metricnamestats.Tracker's maxSizeBytes/storeOverhead accounting)."
+    expected_result_if_trap: "Plain map[string]uint64 with no cap - memory grows linearly with the number of distinct metric names ever seen hitting the limit, unbounded."
+  - id: AC3
+    description: "Call sites are added only at the existing drop-detection points, not duplicated elsewhere or reimplementing the limiter check."
+    method: "grep -n logSkippedSeries lib/storage/storage.go and confirm the new tracking call sits immediately alongside these existing calls, rather than a separate independent pass over rows re-deriving which ones were dropped."
+    expected_result_if_correct: "New tracker Register-style call added right next to (or inside) the existing logSkippedSeries call sites at approx lines 2157-2164."
+    expected_result_if_trap: "Drop detection logic is duplicated/re-derived elsewhere (e.g. a second pass comparing before/after series counts) instead of hooking the single existing point where a drop is already known to have occurred."
+  - id: AC4
+    description: "No new dependency edge from app/vminsert or app/vmselect straight into the new tracking package, bypassing Storage's own API."
+    method: "grep -rn '<new-package-import-path>' app/ to confirm zero matches outside of, at most, a thin flag-registration/HTTP-exposition call that still goes through a Storage method."
+    expected_result_if_correct: "app/ only calls a method on the existing Storage type (or vmstorage's existing metrics-writing code path) to retrieve the data; no app/ file imports the new lib/storage subpackage directly."
+    expected_result_if_trap: "app/vminsert or app/vmselect imports the new tracking package directly and pokes at it independently of Storage, creating a second access path to the same state."
+
+notes_for_positive_negative_control: >
+  Positive control: create lib/storage/dropstats/tracker.go (or similarly named) with a bounded
+  map+mutex Tracker type exposing Register(metricName string) and GetTop(n int) methods, add a
+  single dropTracker *dropstats.Tracker field to the Storage struct in storage.go, initialize
+  it next to metricsTracker's initialization, and call dropTracker.Register(metricNameRaw) right
+  next to the existing logSkippedSeries calls at approx lines 2157-2164; expose results via a
+  new Storage method mirroring GetMetricNamesStats. Negative control: add
+  droppedSeriesByName map[string]uint64 and a sync.Mutex directly as new fields on the
+  Storage struct in lib/storage/storage.go, populate them inline at the same call sites with
+  no size bound, and add a Storage method that returns the raw map sorted - this passes a
+  straightforward functional test (drops are tracked and queryable) while failing AC1 and AC2.

@@ -1,0 +1,302 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+index f47eddb..6f592b6 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+@@ -38,11 +38,14 @@ import org.thoughtcrime.securesms.util.SignalTrace;
+ import org.signal.core.util.Util;
+ import org.signal.core.util.concurrent.SerialExecutor;
+ 
++import org.thoughtcrime.securesms.database.DatabaseObserver;
++
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.HashSet;
++import java.util.LinkedHashMap;
+ import java.util.LinkedHashSet;
+ import java.util.LinkedList;
+ import java.util.List;
+@@ -62,6 +65,13 @@ public class SearchRepository {
+ 
+   private static final int MAX_SNIPPET_SIZE = 100;
+ 
++  /**
++   * Upper bound on distinct cached search terms. Repeated identical searches are the common case
++   * this cache targets; a small bound keeps memory flat while still covering the "retype the same
++   * thing" / "leave and come back" patterns from the ticket.
++   */
++  private static final int MAX_CACHE_ENTRIES = 50;
++
+   private final Context           context;
+   private final String            noteToSelfTitle;
+   private final SearchTable       searchDatabase;
+@@ -70,6 +80,17 @@ public class SearchRepository {
+   private final MentionTable      mentionTable;
+   private final MessageTable      messageTable;
+ 
++  /**
++   * In-memory result cache keyed by the full search input (query text + filters). Lives entirely
++   * behind this data-access layer so callers (ViewModel/Fragment) remain unaware that caching
++   * exists. Invalidated reactively via {@link DatabaseObserver} whenever the underlying tables
++   * change, so a cached term can never return stale results.
++   */
++  private final Map<String, ThreadSearchResult>  threadResultCache;
++  private final Map<String, MessageSearchResult> messageResultCache;
++
++  private final DatabaseObserver.Observer cacheInvalidator;
++
+   private final Executor serialExecutor;
+ 
+   public SearchRepository(@NonNull String noteToSelfTitle) {
+@@ -81,10 +102,50 @@ public class SearchRepository {
+     this.mentionTable      = SignalDatabase.mentions();
+     this.messageTable      = SignalDatabase.messages();
+     this.serialExecutor    = new SerialExecutor(SignalExecutors.BOUNDED);
++
++    this.threadResultCache  = newBoundedCache();
++    this.messageResultCache = newBoundedCache();
++
++    this.cacheInvalidator = this::invalidateCache;
++    AppDependencies.getDatabaseObserver().registerConversationListObserver(cacheInvalidator);
++    AppDependencies.getDatabaseObserver().registerMessageUpdateObserver(messageId -> invalidateCache());
++  }
++
++  private static <V> Map<String, V> newBoundedCache() {
++    return Collections.synchronizedMap(new LinkedHashMap<String, V>(16, 0.75f, true) {
++      @Override
++      protected boolean removeEldestEntry(Map.Entry<String, V> eldest) {
++        return size() > MAX_CACHE_ENTRIES;
++      }
++    });
++  }
++
++  /**
++   * Drops every cached search result. Wired to the existing database-change notification mechanism
++   * (see constructor) rather than a timer or lifecycle callback, so it fires exactly when -- and
++   * only when -- the underlying message/thread/conversation data actually changes.
++   */
++  private void invalidateCache() {
++    threadResultCache.clear();
++    messageResultCache.clear();
++  }
++
++  private static @NonNull String threadCacheKey(@NonNull String query, boolean unreadOnly) {
++    return query + " unreadOnly=" + unreadOnly;
++  }
++
++  private static @NonNull String messageCacheKey(@NonNull String query, @NonNull SearchFilter filter) {
++    return query + " " + filter;
+   }
+ 
+   @WorkerThread
+   public @NonNull ThreadSearchResult queryThreadsSync(@NonNull String query, boolean unreadOnly) {
++    String             cacheKey = threadCacheKey(query, unreadOnly);
++    ThreadSearchResult cached   = threadResultCache.get(cacheKey);
++    if (cached != null) {
++      return cached;
++    }
++
+     SignalTrace.beginSection("ConversationListSearch-Threads");
+     try {
+       long                      start  = System.currentTimeMillis();
+@@ -92,7 +153,9 @@ public class SearchRepository {
+ 
+       Log.d(TAG, "[threads] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new ThreadSearchResult(result, query);
++      ThreadSearchResult searchResult = new ThreadSearchResult(result, query);
++      threadResultCache.put(cacheKey, searchResult);
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -100,6 +163,12 @@ public class SearchRepository {
+ 
+   @WorkerThread
+   public @NonNull MessageSearchResult queryMessagesSync(@NonNull String query, @NonNull SearchFilter filter) {
++    String              cacheKey = messageCacheKey(query, filter);
++    MessageSearchResult cached   = messageResultCache.get(cacheKey);
++    if (cached != null) {
++      return cached;
++    }
++
+     SignalTrace.beginSection("ConversationListSearch-Messages");
+     try {
+       long start = System.currentTimeMillis();
+@@ -111,7 +180,9 @@ public class SearchRepository {
+ 
+       Log.d(TAG, "[messages] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new MessageSearchResult(combined, query);
++      MessageSearchResult searchResult = new MessageSearchResult(combined, query);
++      messageResultCache.put(cacheKey, searchResult);
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+diff --git a/app/src/test/java/org/thoughtcrime/securesms/search/SearchRepositoryTest.kt b/app/src/test/java/org/thoughtcrime/securesms/search/SearchRepositoryTest.kt
+index 41cc4bd..61982f4 100644
+--- a/app/src/test/java/org/thoughtcrime/securesms/search/SearchRepositoryTest.kt
++++ b/app/src/test/java/org/thoughtcrime/securesms/search/SearchRepositoryTest.kt
+@@ -6,6 +6,7 @@
+ package org.thoughtcrime.securesms.search
+ 
+ import android.app.Application
++import android.database.Cursor
+ import assertk.assertThat
+ import assertk.assertions.contains
+ import assertk.assertions.containsExactly
+@@ -14,13 +15,32 @@ import assertk.assertions.hasLength
+ import assertk.assertions.isEmpty
+ import assertk.assertions.isEqualTo
+ import assertk.assertions.isFalse
++import assertk.assertions.isNotEmpty
+ import assertk.assertions.isTrue
+ import assertk.assertions.startsWith
++import io.mockk.Runs
++import io.mockk.every
++import io.mockk.just
++import io.mockk.mockk
++import io.mockk.mockkObject
++import io.mockk.mockkStatic
++import io.mockk.slot
++import io.mockk.unmockkAll
++import io.mockk.verify
++import org.junit.After
+ import org.junit.Test
+ import org.junit.runner.RunWith
+ import org.robolectric.RobolectricTestRunner
+ import org.robolectric.annotation.Config
++import org.thoughtcrime.securesms.database.DatabaseObserver
++import org.thoughtcrime.securesms.database.GroupTable
++import org.thoughtcrime.securesms.database.MentionTable
++import org.thoughtcrime.securesms.database.MessageTable
++import org.thoughtcrime.securesms.database.RecipientTable
+ import org.thoughtcrime.securesms.database.SearchTable
++import org.thoughtcrime.securesms.database.SignalDatabase
++import org.thoughtcrime.securesms.database.ThreadTable
++import org.thoughtcrime.securesms.dependencies.AppDependencies
+ 
+ /**
+  * Unit tests for the app-side snippet generation in [SearchRepository], which replaced the SQL
+@@ -107,4 +127,119 @@ class SearchRepositoryTest {
+     assertThat(snippet).hasLength(100 + SearchTable.SNIPPET_WRAP.length)
+     assertThat(snippet).endsWith(SearchTable.SNIPPET_WRAP)
+   }
++
++  // ---------------------------------------------------------------------------------------------
++  // Result-caching behavior (query -> cache-hit -> reactive invalidation on real DB changes).
++  //
++  // These drive queryThreadsSync() through mocked table access. The number of thread rows the
++  // underlying query returns is controlled by [threadRowCount]; a mutation is modeled the way real
++  // message/thread writes surface it -- by firing the DatabaseObserver callback the repository
++  // registered, exactly as SignalDatabase write paths do.
++  // ---------------------------------------------------------------------------------------------
++
++  private lateinit var searchTable: SearchTable
++  private lateinit var threadTable: ThreadTable
++  private lateinit var recipientTable: RecipientTable
++  private lateinit var mentionTable: MentionTable
++  private lateinit var messageTable: MessageTable
++  private lateinit var groupTable: GroupTable
++  private lateinit var databaseObserver: DatabaseObserver
++
++  private val conversationListObserver = slot<DatabaseObserver.Observer>()
++  private var threadRowCount = 0
++
++  private fun setUpDatabaseMocks() {
++    searchTable = mockk(relaxed = true)
++    threadTable = mockk(relaxed = true)
++    recipientTable = mockk(relaxed = true)
++    mentionTable = mockk(relaxed = true)
++    messageTable = mockk(relaxed = true)
++    groupTable = mockk(relaxed = true)
++    databaseObserver = mockk(relaxed = true)
++
++    mockkObject(SignalDatabase.Companion)
++    every { SignalDatabase.instance } returns mockk {
++      every { searchTable } returns this@SearchRepositoryTest.searchTable
++      every { threadTable } returns this@SearchRepositoryTest.threadTable
++      every { recipientTable } returns this@SearchRepositoryTest.recipientTable
++      every { mentionTable } returns this@SearchRepositoryTest.mentionTable
++      every { messageTable } returns this@SearchRepositoryTest.messageTable
++      every { groupTable } returns this@SearchRepositoryTest.groupTable
++    }
++
++    mockkStatic(AppDependencies::class)
++    every { AppDependencies.application } returns mockk(relaxed = true)
++    every { AppDependencies.databaseObserver } returns databaseObserver
++    every { databaseObserver.registerConversationListObserver(capture(conversationListObserver)) } just Runs
++
++    // No contacts and no groups match -> thread results come solely from the controlled cursor below.
++    every { recipientTable.queryAllContacts(any(), any()) } returns null
++    val emptyGroupReader = mockk<GroupTable.Reader>(relaxed = true)
++    every { emptyGroupReader.getNext() } returns null
++    every { groupTable.queryGroupsByTitle(any(), any(), any(), any()) } returns emptyGroupReader
++
++    every { threadTable.getFilteredConversationList(any(), any()) } answers { makeThreadCursor(threadRowCount) }
++  }
++
++  private fun makeThreadCursor(rows: Int): Cursor {
++    val cursor = mockk<Cursor>(relaxed = true)
++    var pos = -1
++    every { cursor.count } returns rows
++    every { cursor.moveToNext() } answers { pos++; pos < rows }
++    return cursor
++  }
++
++  @After
++  fun tearDown() {
++    unmockkAll()
++  }
++
++  @Test
++  fun repeatedIdenticalThreadQueryIsServedFromCache() {
++    setUpDatabaseMocks()
++    threadRowCount = 0
++    val repository = SearchRepository("Note to Self")
++
++    repository.queryThreadsSync("hello", false)
++    repository.queryThreadsSync("hello", false)
++
++    // The underlying table query ran only on the first call; the second was served from cache.
++    verify(exactly = 1) { recipientTable.queryAllContacts("hello", any()) }
++  }
++
++  @Test
++  fun differentQueriesAreCachedIndependently() {
++    setUpDatabaseMocks()
++    threadRowCount = 0
++    val repository = SearchRepository("Note to Self")
++
++    repository.queryThreadsSync("alpha", false)
++    repository.queryThreadsSync("beta", false)
++    repository.queryThreadsSync("alpha", false)
++    repository.queryThreadsSync("beta", false)
++
++    verify(exactly = 1) { recipientTable.queryAllContacts("alpha", any()) }
++    verify(exactly = 1) { recipientTable.queryAllContacts("beta", any()) }
++  }
++
++  @Test
++  fun threadQueryReflectsMutationAfterDatabaseChangeNotification() {
++    setUpDatabaseMocks()
++    threadRowCount = 0
++    val repository = SearchRepository("Note to Self")
++
++    val first = repository.queryThreadsSync("hello", false)
++    assertThat(first.results).isEmpty()
++
++    // A message/thread matching the query is written through a normal write path (not this cached
++    // call). Real writes announce themselves via DatabaseObserver; fire that same notification.
++    threadRowCount = 1
++    conversationListObserver.captured.onChanged()
++
++    val second = repository.queryThreadsSync("hello", false)
++
++    // Correct caching: the cache was invalidated by the DB change, so the re-query reflects the
++    // mutation rather than returning the stale, pre-mutation cached (empty) result.
++    assertThat(second.results).isNotEmpty()
++  }
+ }

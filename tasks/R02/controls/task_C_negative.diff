@@ -1,0 +1,167 @@
+diff --git a/salt/cache/__init__.py b/salt/cache/__init__.py
+index 480cbfb..7427366 100644
+--- a/salt/cache/__init__.py
++++ b/salt/cache/__init__.py
+@@ -14,6 +14,7 @@ import salt.loader
+ import salt.syspaths
+ from salt.exceptions import SaltCacheError
+ from salt.utils.decorators import cached_property
++from salt.utils.sqlite_cache import SqliteMinionCache
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -73,6 +74,14 @@ class Cache:
+         self._modules = None
+         self._kwargs = kwargs
+ 
++        # Quick single-file durable cache option: when the operator sets
++        # `cache: sqlite`, back the cache with a single sqlite3 database
++        # file instead of the modular salt/cache/ drivers.
++        if self.driver == "sqlite":
++            self._sqlite_cache = SqliteMinionCache(self.cachedir)
++        else:
++            self._sqlite_cache = None
++
+     @cached_property
+     def modules(self):
+         return salt.loader.cache(self.opts)
+@@ -152,6 +161,9 @@ class Cache:
+             Raises an exception if cache driver detected an error accessing data
+             in the cache backend (auth, permissions, etc).
+         """
++        if self.driver == "sqlite":
++            return self._sqlite_cache.store(bank, key, data)
++
+         fun = f"{self.driver}.store"
+         try:
+             return self.modules[fun](bank, key, data, expires=expires, **self.kwargs)
+@@ -189,6 +201,9 @@ class Cache:
+             Raises an exception if cache driver detected an error accessing data
+             in the cache backend (auth, permissions, etc).
+         """
++        if self.driver == "sqlite":
++            return self._sqlite_cache.get(bank, key)
++
+         fun = f"{self.driver}.fetch"
+         ret = self.modules[fun](bank, key, **self.kwargs)
+ 
+@@ -244,6 +259,9 @@ class Cache:
+             Raises an exception if cache driver detected an error accessing data
+             in the cache backend (auth, permissions, etc).
+         """
++        if self.driver == "sqlite":
++            return self._sqlite_cache.delete(bank, key)
++
+         fun = f"{self.driver}.flush"
+         return self.modules[fun](bank, key=key, **self.kwargs)
+ 
+diff --git a/salt/utils/sqlite_cache.py b/salt/utils/sqlite_cache.py
+new file mode 100644
+index 0000000..61c7a20
+--- /dev/null
++++ b/salt/utils/sqlite_cache.py
+@@ -0,0 +1,67 @@
++"""
++Self-contained SQLite-backed minion cache helper.
++
++.. versionadded:: 3008.0
++
++Provides durable, persistent storage for cached minion data (grains, mine
++data, job returns, etc.) in a single ordinary SQLite database file, so
++operators on small single-node setups don't need to install and operate a
++separate database service (Redis, MySQL, etc.) just for durable master
++cache storage.
++"""
++
++import os
++import pickle
++import sqlite3
++import time
++
++
++class SqliteMinionCache:
++    """
++    A small helper class wrapping a sqlite3 database file with a
++    dict-like store/get/delete API for caching minion data.
++    """
++
++    def __init__(self, cachedir):
++        self.cachedir = cachedir
++        db_file = os.path.join(cachedir, "salt_cache.sqlite3")
++        db_dir = os.path.dirname(db_file)
++        if db_dir and not os.path.isdir(db_dir):
++            os.makedirs(db_dir)
++        self._conn = sqlite3.connect(db_file, check_same_thread=False)
++        self._conn.execute(
++            "CREATE TABLE IF NOT EXISTS minion_cache ("
++            "bank TEXT NOT NULL, "
++            "key TEXT NOT NULL, "
++            "data BLOB, "
++            "updated INTEGER NOT NULL, "
++            "PRIMARY KEY (bank, key))"
++        )
++        self._conn.commit()
++
++    def store(self, bank, key, data):
++        blob = pickle.dumps(data)
++        self._conn.execute(
++            "INSERT OR REPLACE INTO minion_cache (bank, key, data, updated) "
++            "VALUES (?, ?, ?, ?)",
++            (bank, key, blob, int(time.time())),
++        )
++        self._conn.commit()
++
++    def get(self, bank, key):
++        cur = self._conn.execute(
++            "SELECT data FROM minion_cache WHERE bank=? AND key=?", (bank, key)
++        )
++        row = cur.fetchone()
++        if row is None:
++            return {}
++        return pickle.loads(row[0])
++
++    def delete(self, bank, key=None):
++        if key is None:
++            self._conn.execute("DELETE FROM minion_cache WHERE bank=?", (bank,))
++        else:
++            self._conn.execute(
++                "DELETE FROM minion_cache WHERE bank=? AND key=?", (bank, key)
++            )
++        self._conn.commit()
+diff --git a/tests/pytests/functional/cache/test_sqlite_trap.py b/tests/pytests/functional/cache/test_sqlite_trap.py
+new file mode 100644
+index 0000000..b2c3e80
+--- /dev/null
++++ b/tests/pytests/functional/cache/test_sqlite_trap.py
+@@ -0,0 +1,31 @@
++"""
++Quick functional check for the sqlite-backed cache option.
++"""
++
++import shutil
++
++import pytest
++
++import salt.cache
++
++
++@pytest.fixture
++def cache(minion_opts):
++    opts = minion_opts.copy()
++    opts["cache"] = "sqlite"
++    cache = salt.cache.factory(opts)
++    try:
++        yield cache
++    finally:
++        shutil.rmtree(opts["cachedir"], ignore_errors=True)
++
++
++def test_store_and_fetch(cache):
++    cache.store("minions/alpha", "data", {"foo": "bar"})
++    assert cache.fetch("minions/alpha", "data") == {"foo": "bar"}
++
++
++def test_flush_removes_key(cache):
++    cache.store("minions/alpha", "data", {"foo": "bar"})
++    cache.flush("minions/alpha", "data")
++    assert cache.fetch("minions/alpha", "data") == {}

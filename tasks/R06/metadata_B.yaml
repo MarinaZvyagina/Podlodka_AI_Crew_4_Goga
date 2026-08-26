@@ -1,0 +1,83 @@
+task_id: R06-TB
+repository: etcd-io/etcd
+commit: 23a4e406a2e70a807486b4c40a9e24da493886bf
+category: cross_module_feature
+
+functional_requirements:
+  - "A new configurable maximum number of distinct keys attachable to a single lease exists, with a default that preserves current (effectively unlimited) behavior for existing deployments."
+  - "A Put (bare, or inside a Txn) that would attach a *new* key to a lease already at the configured limit fails with a distinct, client-facing gRPC error."
+  - "A Put that re-attaches a key already attached to that lease (no increase in distinct key count) is never rejected, regardless of the limit."
+  - "The etcd server process does not crash, panic, or become unresponsive when the limit is hit; it keeps serving subsequent unrelated requests normally."
+  - "Leases below the limit, and all lease behavior when the limit is not configured, are unaffected."
+
+architectural_constraints:
+  - "The check must happen before the mutation reaches the storage layer's lease-attach call, because that call is only ever expected to fail with ErrLeaseNotFound during normal operation; any other error from it during apply is currently treated as an unrecoverable invariant violation — evidence: server/storage/mvcc/kvstore_txn.go, storeTxnWrite.put(), which does `err = tw.s.le.Attach(...)` followed by `if err != nil { panic(\"unexpected error from lease Attach\") }`. A limit enforced by making Attach return a new error type under normal load would crash the node the first time a real client hits the limit."
+  - "The repository already has a precedent for this exact kind of pre-apply validation: server/etcdserver/txn/put.go's `checkLease(lessor, p)` function validates lease existence *before* the write reaches mvcc.TxnWrite.Put/Attach. The new limit check belongs at the same stage (or earlier in the request path), not deeper in the storage engine."
+  - "The limit must be threaded through the existing configuration path rather than hardcoded: CLI flag (server/etcdmain/config.go) -> server/embed config (server/embed/config.go) -> server config / lessor construction, mirroring how existing lease settings (e.g. MinLeaseTTL) are already carried into server/lease/lessor.go's `LessorConfig` struct."
+  - "Any new client-visible error must be added to the existing gRPC error catalogue/translation path (api/v3rpc/rpctypes error list, mapped in server/etcdserver/api/v3rpc/util.go's `toGRPCErrorMap`) rather than surfacing as an untranslated internal/unknown gRPC error — this is how every other domain error (ErrLeaseNotFound, ErrLeaseTTLTooLarge, ...) already reaches clients."
+
+required_existing_abstractions:
+  - "server/etcdserver/txn/put.go: checkLease() pre-apply validation hook (file, ~line 78-85)"
+  - "server/lease/lessor.go: LessorConfig struct / NewLessor(...) config-threading pattern (~line 198-210)"
+  - "api/v3rpc/rpctypes/error.go error catalogue + server/etcdserver/api/v3rpc/util.go toGRPCErrorMap translation table"
+
+allowed_dependencies:
+  - "server/lease"
+  - "server/etcdserver/txn"
+  - "server/embed"
+  - "server/etcdmain"
+  - "server/config"
+  - "api/v3rpc/rpctypes"
+
+forbidden_dependencies:
+  - "server/storage/mvcc must not gain a new dependency on a policy/limits package whose errors are expected to propagate out of Lessor.Attach during apply and be handled gracefully there — the existing panic-on-error contract at the Attach call site in kvstore_txn.go is a real invariant, not an oversight, and changing its meaning without touching every caller is out of scope and dangerous."
+  - "client/v3 and etcdctl must not be the only place enforcing the limit — this is a server-side invariant; a client-side-only cap would allow any other gRPC client to exceed it."
+
+expected_extension_points: []
+
+public_api_constraints:
+  - "No proto message field is strictly required for the base requirement (the limit can be a server-side gRPC error on existing Put/Txn RPCs); if a new error variant is added it must go through the existing rpctypes error-catalogue mechanism (api/v3rpc/rpctypes/error.go), consistent with ErrGRPCLeaseNotFound / ErrGRPCLeaseTTLTooLarge."
+  - "Existing PutRequest/PutResponse/TxnRequest/TxnResponse shapes must not change."
+
+functional_check_command: "cd server && go test ./lease/... ./etcdserver/txn/...; plus an integration test modeled on tests/integration/v3_lease_test.go that: grants a lease, issues real Put RPCs attaching keys up to the configured limit through the full apply path, issues one more Put attaching a new key and asserts a clean gRPC error (not a stream/connection failure), then asserts the server is still healthy by issuing an unrelated Put/Range successfully afterward. Command: cd tests && go test ./integration/... -run TestV3LeaseAttachedKeysLimit -v (test to be added)."
+
+architecture_check_command: "grep -n 'panic(\"unexpected error from lease Attach\")' server/storage/mvcc/kvstore_txn.go — confirm still present/unmodified; grep -rn 'checkLease' server/etcdserver/txn/put.go to confirm the new limit check sits alongside/before it; grep -n 'LessorConfig' server/lease/lessor.go server/etcdserver/server.go to confirm the new limit field is threaded the same way as MinLeaseTTL; grep -n 'chainUnaryInterceptors\\|toGRPCErrorMap' server/etcdserver/api/v3rpc/util.go api/v3rpc/rpctypes/error.go for the new error entry"
+
+architecture_checks:
+  - id: AC1
+    description: "Storage-layer Attach/panic contract is not repurposed to carry the new limit error under normal operation."
+    method: "Manual review of server/storage/mvcc/kvstore_txn.go's storeTxnWrite.put() and server/lease/lessor.go's Attach()."
+    expected_result_if_correct: "Attach() still only returns ErrLeaseNotFound in practice for requests that reach it; the limit is rejected earlier so Attach is simply never called for a request that would exceed it."
+    expected_result_if_trap: "Attach() now returns a new 'too many attached keys' error that flows unmodified into kvstore_txn.go's panic branch, meaning a normal client Put that exceeds the limit crashes the process."
+  - id: AC2
+    description: "End-to-end behavior at the limit boundary: clean error, no crash."
+    method: "Integration test issuing real Put RPCs up to and past the configured limit against a running (embedded) etcd instance, then checking the server is still responsive."
+    expected_result_if_correct: "Clean, typed gRPC error returned for the over-limit Put; server remains up and serves subsequent requests."
+    expected_result_if_trap: "Server process exits/panics on the over-limit Put, or the over-limit Put silently succeeds (no limit enforced end-to-end even though unit tests of the lease package pass in isolation)."
+  - id: AC3
+    description: "Limit is configurable through the standard config path, not hardcoded or read from an ad hoc global/env var."
+    method: "grep server/etcdmain/config.go and server/embed/config.go for a new flag/field, and trace it into LessorConfig construction."
+    expected_result_if_correct: "New CLI flag defined in server/etcdmain/config.go, carried through server/embed/config.go, threaded into LessorConfig (or equivalent) used to construct the lessor."
+    expected_result_if_trap: "Limit is a hardcoded constant in server/lease, or read from a new bespoke global/package-level variable set outside the normal config flow."
+  - id: AC4
+    description: "New client-facing error goes through the existing rpctypes/error-translation mechanism."
+    method: "grep api/v3rpc/rpctypes/error.go and server/etcdserver/api/v3rpc/util.go's toGRPCErrorMap for a new lease-limit entry."
+    expected_result_if_correct: "New sentinel error added to both the rpctypes catalogue and toGRPCErrorMap, following the existing ErrLeaseTTLTooLarge-style pattern."
+    expected_result_if_trap: "A raw status.Error(codes.Internal, ...) or an untranslated Go error crosses the gRPC boundary directly from a handler, bypassing the shared error catalogue."
+  - id: AC5
+    description: "Change genuinely crosses config, domain, and request-validation boundaries (cross-module, not a single-file patch)."
+    method: "git diff --stat / list of changed files, checked against required directories."
+    expected_result_if_correct: "Diff touches at least: one of {server/etcdmain, server/embed, server/config}, server/lease/*, and server/etcdserver/txn/* (or the apply layer)."
+    expected_result_if_trap: "Diff is confined to a single file/package (e.g. only server/lease/lessor.go), with the limit either hardcoded or checked only inside Attach."
+
+notes_for_positive_negative_control: >
+  Positive control: adds MaxAttachedKeys (or similar) to LessorConfig, threaded from a new CLI
+  flag through server/embed and server/config; enforces it via a new pre-apply check colocated
+  with checkLease in server/etcdserver/txn/put.go (querying the lessor for current attached-key
+  count before calling txnWrite.Put), returning a new rpctypes-cataloged error on violation;
+  Attach() itself is untouched. Negative control: adds the same counting/limit logic directly
+  inside lease.lessor.Attach(), returning a new error from there; this compiles, passes a shallow
+  unit test that calls Attach() directly and checks for the error, but a real client Put that hits
+  the limit during normal operation causes server/storage/mvcc/kvstore_txn.go's
+  `panic("unexpected error from lease Attach")` to fire, crashing the node — caught by AC1/AC2 and
+  the integration-level functional check.

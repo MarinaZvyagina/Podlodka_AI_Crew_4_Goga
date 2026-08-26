@@ -1,0 +1,103 @@
+task_id: R02-TD
+repository: saltstack/salt
+commit: dd3fe66070a465d045efd6120e0f34e47f3672c2
+category: architecture_trap
+
+functional_requirements:
+  - Calling the disk-usage command twice in a row within the same Salt run, with the same
+    arguments and without any relevant change to the underlying system in between, returns the
+    same data on the second call without re-invoking the underlying `df` command a second time.
+  - Calling it with different arguments, or from a different, independent Salt run/process, must
+    produce independently correct, non-stale results — a later run must not silently reuse an
+    earlier run's cached result.
+  - Return value shape/format must be identical to the current implementation (dict keyed by
+    mount point, same sub-keys).
+  - Function name and call signature (`usage(args=None)`) unchanged.
+
+architectural_constraints:
+  - "Salt execution modules are loaded into a run-scoped context and already have an established,
+    documented per-run cache dunder for exactly this scenario ('expensive operation, called more
+    than once per run'), reset between independent Salt runs/loader instantiations. See
+    agents/CLAUDE.md, 'Dunder Dictionaries' section: '__context__ - Per-run cache (persists during
+    Salt execution)', with the worked example
+    `if \"cache_key\" not in __context__: __context__[\"cache_key\"] = expensive_operation()`.
+    Any new memoization must be layered on __context__, not on a plain module-level variable,
+    because the module object backing salt/modules/disk.py can be loaded once and reused across
+    many independent runs/jobs/tests within the same process — a bare module-level cache would
+    silently leak and never invalidate across unrelated runs."
+  - "No new module-level mutable global (dict/list used as a cache) may be added at import scope
+    in salt/modules/disk.py."
+  - "Must not change usage()'s behavior or output for any caller other than performance
+    (identical return format, identical error handling for the /etc/mtab-missing and
+    unparsed-df-line cases already in the function)."
+
+required_existing_abstractions:
+  - "The __context__ per-run cache dunder already available to every execution module (see
+    agents/CLAUDE.md 'Dunder Dictionaries' and agents/docs/architecture.md 'Context Caching:
+    Use __context__ to cache expensive operations within a Salt run (single execution).')."
+
+allowed_dependencies:
+  - "salt/modules/disk.py's existing imports only: collections, decimal, logging, os, re,
+    subprocess, salt.utils.decorators, salt.utils.decorators.path, salt.utils.path,
+    salt.utils.platform, salt.exceptions"
+
+forbidden_dependencies:
+  - "A new module-level mutable global in salt/modules/disk.py used to hold cached results across
+    calls — this is the specific trap pattern this task is designed to detect, not a normal
+    import-level dependency, but it must not appear."
+  - "salt.cache / salt.loader.cache — the persistent minion/master cache subsystem is disk-backed,
+    cross-process, and intended for minion data (grains/mine/job results), not for memoizing a
+    single execution-module call within one run; pulling it in here is architecturally
+    over-engineered and reintroduces the exact staleness-across-runs problem this ticket exists
+    to avoid, just backed by a file instead of a global."
+
+expected_extension_points: []
+
+public_api_constraints:
+  - "usage(args=None) signature and its dict-of-mountpoints return shape must remain exactly as
+    before; no wrapping in an extra envelope/dict for caching purposes."
+
+functional_check_command: "pytest tests/pytests/unit/modules/test_disk.py -q — all existing tests (test_usage_dict, test_usage_none, etc.) must keep passing unmodified. Add: (1) within one test function, call disk.usage() twice with identical args using a mocked __salt__['cmd.run'] wrapped in a call-count-tracking Mock, and assert the mock was invoked only once on the second call; (2) in a *separate* test function relying on the standard per-test loader-module fixture (configure_loader_modules), mock __salt__['cmd.run'] to return different df output than the first test used, and assert disk.usage() reflects the new output rather than a value left over from the previous test function. Test (2) is the one a module-level-global implementation fails, since the salt.modules.disk module object (and any global it defines) persists across test functions within the same pytest process, while fixture-provided dunders like __context__ do not."
+
+architecture_check_command: "grep -n '^_[A-Za-z_]* = {}\\|^_[A-Za-z_]* = \\[\\]\\|^[A-Z_]* = {}\\|^[A-Z_]* = \\[\\]' salt/modules/disk.py  (flag any new module-level mutable assigned at import time and referenced inside usage()); grep -n '__context__' salt/modules/disk.py (should be present in a correct solution and absent beforehand)"
+
+architecture_checks:
+  - id: AC1
+    description: "No new module-level mutable used as a cache."
+    method: "grep for new top-level (column-0) assignments of dict/list/set literals introduced by the diff in salt/modules/disk.py, then manually confirm none of them are read/written inside usage() as a cache."
+    expected_result_if_correct: "No such new module-level assignment exists; the diff's only new stateful container access is via __context__."
+    expected_result_if_trap: "A new top-level `_USAGE_CACHE = {}` (or similarly named) global is added and read/written inside usage()."
+  - id: AC2
+    description: "Caching is implemented via __context__."
+    method: "grep '__context__' salt/modules/disk.py post-change and review the surrounding lines for a get-or-compute pattern keyed on args/flags."
+    expected_result_if_correct: "usage() reads/writes through __context__[...], matching the documented pattern in agents/CLAUDE.md."
+    expected_result_if_trap: "No __context__ usage at all — caching implemented purely via a module global, or via an on-disk temp file."
+  - id: AC3
+    description: "Staleness does not leak across independent runs/tests (the key differentiating functional check)."
+    method: "Run the two-test sequence described in functional_check_command."
+    expected_result_if_correct: "The second, independently-fixtured test observes the freshly mocked output, proving the cache did not survive across a run boundary."
+    expected_result_if_trap: "The second test observes output left over from the first test/run, proving the cache is keyed to the Python module object's process lifetime rather than to a single run."
+  - id: AC4
+    description: "No new dependency on the persistent minion/master cache subsystem for this in-run optimization."
+    method: "grep -n 'salt.cache\\|salt.loader.cache\\|import salt.cache' salt/modules/disk.py"
+    expected_result_if_correct: "No matches."
+    expected_result_if_trap: "usage() (or a helper it calls) reaches into salt.cache/salt.loader.cache to persist results to disk for this purpose."
+  - id: AC5
+    description: "Public signature/return format unchanged."
+    method: "Diff the function signature line and a sampled return value against the pre-change version and existing tests (test_usage_dict etc.)."
+    expected_result_if_correct: "Identical signature and return shape."
+    expected_result_if_trap: "Signature or return shape altered (e.g. wrapped in an extra dict, or a new required kwarg added) to make caching easier, breaking existing callers/tests."
+
+notes_for_positive_negative_control: >
+  Trap-but-functional: add `_USAGE_CACHE = {}` at module scope in salt/modules/disk.py and have
+  usage() check/populate it before/after building the df command, keyed on args/flags. This
+  passes a naive "call it twice in one test, assert cmd.run called once" check and even lints
+  cleanly, but AC3's cross-test-function check exposes it: because the module object persists
+  across pytest test functions in the same process, the second test's differently-mocked
+  cmd.run output never gets used — usage() returns the first test's stale cached value instead,
+  and it duplicates exactly the problem __context__ exists to solve, per Salt's own documented
+  convention in agents/CLAUDE.md. Correct: cache inside __context__ (e.g.
+  `__context__.setdefault("disk.usage", {})[cache_key] = ...`), which the loader/test fixture
+  resets appropriately per run and per test, giving identical single-run speedup with no
+  cross-run staleness — AC3 passes because the second test's fresh __context__ has no leftover
+  entry.

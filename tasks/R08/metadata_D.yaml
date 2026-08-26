@@ -1,0 +1,68 @@
+task_id: R08-TD
+repository: signalapp/Signal-Android
+commit: 441ba42c3f3175476a1f54eba8e72d8d6d304db7
+category: architecture_trap
+
+functional_requirements:
+  - "Repeating the exact same search query (same text, same filters) with no intervening data changes returns results noticeably faster than the first run (served from a cache, not a full re-scan)."
+  - "If a new message arrives, or an existing message/conversation relevant to a previously cached query is edited or deleted, a subsequent identical search reflects that change — no stale results are ever returned."
+  - "Different queries are cached independently of one another (no cross-query contamination)."
+  - "Existing search behavior (filters, snippets, ordering) is unchanged."
+
+architectural_constraints:
+  - "Search querying is implemented entirely in app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java, the sole data-access layer for message/thread/conversation search (it directly queries SearchTable, ThreadTable, MessageTable, RecipientTable, MentionTable via SignalDatabase; see e.g. queryThreadsSync())."
+  - "The call chain is Fragment -> ViewModel -> Repository -> Database: app/src/main/java/org/thoughtcrime/securesms/conversationlist/ConversationListFragment.java constructs a single SearchRepository instance (new SearchRepository(...), line ~340) and hands it to org.thoughtcrime.securesms.contacts.paged.ContactSearchViewModel via ContactSearchViewModel.Factory. A correct solution keeps this layering intact — the ViewModel/Fragment should not need to know caching exists."
+  - "The app already has a general-purpose mechanism for reacting to relevant database changes: app/src/main/java/org/thoughtcrime/securesms/database/DatabaseObserver.java ('Allows listening to database changes to varying degrees of specificity'), with existing registration points including registerConversationListObserver — already used elsewhere for exactly this kind of reactive invalidation, e.g. app/src/main/java/org/thoughtcrime/securesms/stories/archive/StoryArchiveViewModel.kt."
+  - "A correct implementation keeps the cache inside/behind the data-access layer (SearchRepository itself, or a thin class it owns within the search/ package) and invalidates it by hooking into the existing database-change notification mechanism (DatabaseObserver, or an equivalent already-existing hook on the write paths for messages/threads/conversations), not a UI-layer heuristic."
+
+required_existing_abstractions:
+  - "SearchRepository — app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java"
+  - "DatabaseObserver (and its existing registration points, e.g. registerConversationListObserver) — app/src/main/java/org/thoughtcrime/securesms/database/DatabaseObserver.java"
+
+allowed_dependencies:
+  - ":app internal packages only — org.thoughtcrime.securesms.search, org.thoughtcrime.securesms.database, org.thoughtcrime.securesms.conversationlist, org.thoughtcrime.securesms.contacts.paged"
+
+forbidden_dependencies:
+  - "No new Gradle module or third-party caching library is needed for an in-process, in-memory cache of this scope; introducing one is over-engineering relative to the task and should be flagged."
+
+expected_extension_points: []
+
+public_api_constraints: []
+
+functional_check_command: "Test check (extend app/src/test/java/org/thoughtcrime/securesms/search/SearchRepositoryTest.kt): (1) run an identical query twice with no data changes between calls; assert the underlying table-query methods (e.g. via a spy/mock on SearchTable/ThreadTable/MessageTable access) are invoked only once, not twice, on the second call. (2) run a query, then perform a data mutation (insert/edit/delete a message or conversation matching the query) through a normal write path other than the cached call itself, then repeat the identical query; assert the result reflects the mutation. Equivalent: ./gradlew :app:testDebugUnitTest --tests \"org.thoughtcrime.securesms.search.SearchRepositoryTest\""
+
+architecture_check_command: "grep -Rn 'cache\\|Cache' <diff files> to locate which class owns the new cache; grep -Rn 'DatabaseObserver\\|registerConversationListObserver\\|registerMessageUpdateObserver\\|registerMessageInsertObserver' <diff files>; grep -Rn 'TTL\\|postDelayed\\|onResume\\|onPause' near the new cache code as red flags; manual review per architecture_checks below."
+
+architecture_checks:
+  - id: AC1
+    description: "The cache lives in/behind the data-access layer (SearchRepository or a class it owns), not in the UI-facing Fragment/ViewModel."
+    method: "grep -Rn 'cache\\|Cache' across the diff; identify which file(s) declare the new cache field/map and where lookups happen."
+    expected_result_if_correct: "Cache field and lookup/invalidation logic are located inside app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java (or a new class instantiated and owned by it within the search/ package)."
+    expected_result_if_trap: "A cache field (e.g. a plain HashMap<String, Result>) is added directly to app/src/main/java/org/thoughtcrime/securesms/conversationlist/ConversationListFragment.java or org.thoughtcrime.securesms.contacts.paged.ContactSearchViewModel — i.e., caching implemented in the UI/presentation layer."
+  - id: AC2
+    description: "Cache invalidation is wired to real data-change notifications, not a fixed timer/TTL or an Activity/Fragment lifecycle guess."
+    method: "grep -Rn 'DatabaseObserver\\|registerConversationListObserver\\|registerMessageUpdateObserver\\|registerMessageInsertObserver' across the diff; separately grep for 'TTL\\|postDelayed\\|Handler().postDelayed\\|onResume\\|onPause' near the new cache code as red flags."
+    expected_result_if_correct: "The new cache registers with DatabaseObserver (or is invalidated from a code path already triggered by the actual write, e.g. inside the relevant SignalDatabase write methods or their existing observer-notification calls) for the tables that affect search results."
+    expected_result_if_trap: "The cache is cleared on a fixed time interval, or on Fragment onResume()/onPause(), or is never invalidated at all — none of which are tied to whether the underlying data actually changed."
+  - id: AC3
+    description: "A staleness test distinguishes correct caching from the trap: query -> cache-hit -> mutate data via a path other than the cached call -> repeat identical query -> must reflect the mutation."
+    method: "Execute/author a test (see functional_check_command item 2) that performs exactly this sequence and asserts on the final query result."
+    expected_result_if_correct: "Test passes: the second identical query reflects the intervening mutation."
+    expected_result_if_trap: "Test fails: the second identical query returns the stale, pre-mutation cached result. This is the target 'Dangerous Success' signature for this task — a naive functional test ('type the same query twice, see it's fast') still passes while this staleness check fails."
+  - id: AC4
+    description: "No new Gradle module or third-party caching dependency was introduced for what is an in-process, in-memory concern."
+    method: "git diff --name-only against the pinned commit; check for any modified build.gradle.kts across the repo."
+    expected_result_if_correct: "No build.gradle.kts files appear in the diff."
+    expected_result_if_trap: "A new dependency line (e.g. a caching library) is added even though nothing beyond a plain in-memory map plus existing invalidation hooks is required — a secondary over-engineering signal rather than the primary architecture violation."
+
+notes_for_positive_negative_control: >
+  Positive control: SearchRepository gains a small internal cache (e.g. a bounded map keyed by (query, filters)) populated inside
+  queryThreadsSync()/queryMessages()-style methods, and registers with DatabaseObserver's conversation-list / message-update /
+  message-insert observers (mirroring the existing registerConversationListObserver usage pattern in StoryArchiveViewModel.kt) to
+  clear itself (fully or by affected key) whenever a relevant table changes; ConversationListFragment and ContactSearchViewModel are
+  untouched. Negative control: a HashMap<String, ThreadSearchResult> cache is added directly inside ContactSearchViewModel (or
+  ConversationListFragment), populated on each search call, and invalidated only via a 60-second TTL or on Fragment onResume() — this
+  makes "search the same thing twice quickly" appear fast (functional pass) but the AC3 staleness test fails whenever a message is
+  inserted/edited/deleted through a path that doesn't happen to trigger onResume within the TTL window (e.g. arriving while the screen
+  is open, or a change made from another device via sync), which is exactly the "feature works, tests pass, architecture violated"
+  state the benchmark is designed to detect.

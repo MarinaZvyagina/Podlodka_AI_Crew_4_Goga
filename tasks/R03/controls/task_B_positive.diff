@@ -1,0 +1,157 @@
+diff --git a/packages/common/interfaces/websockets/web-socket-adapter.interface.ts b/packages/common/interfaces/websockets/web-socket-adapter.interface.ts
+index fe08dbe..73a7c96 100644
+--- a/packages/common/interfaces/websockets/web-socket-adapter.interface.ts
++++ b/packages/common/interfaces/websockets/web-socket-adapter.interface.ts
+@@ -26,4 +26,12 @@ export interface WebSocketAdapter<
+     transform: (data: any) => Observable<any>,
+   ): any;
+   close(server: TServer): any;
++  /**
++   * Optional hook invoked for every registered gateway server right before
++   * the application shuts it down (e.g. via `enableShutdownHooks()` /
++   * `app.close()`). Implementations should notify all currently connected
++   * clients (using the transport's own wire protocol) that the server is
++   * shutting down, before their connections are closed.
++   */
++  notifyShutdown?(server: TServer, reason?: string): any;
+ }
+diff --git a/packages/platform-socket.io/adapters/io-adapter.ts b/packages/platform-socket.io/adapters/io-adapter.ts
+index 90c640c..5f64ab9 100644
+--- a/packages/platform-socket.io/adapters/io-adapter.ts
++++ b/packages/platform-socket.io/adapters/io-adapter.ts
+@@ -6,7 +6,11 @@ import { fromEvent, Observable } from 'rxjs';
+ import { filter, first, map, mergeMap, share, takeUntil } from 'rxjs/operators';
+ import { Namespace, Server, ServerOptions, Socket } from 'socket.io';
+ import { isFunction, isNil } from '@nestjs/common/internal';
+-import { DISCONNECT_EVENT } from '@nestjs/websockets/internal';
++import {
++  DEFAULT_SHUTDOWN_MESSAGE,
++  DISCONNECT_EVENT,
++  SHUTDOWN_EVENT,
++} from '@nestjs/websockets/internal';
+ 
+ /**
+  * @publicApi
+@@ -99,4 +103,24 @@ export class IoAdapter extends AbstractWsAdapter {
+ 
+     return super.close(server);
+   }
++
++  /**
++   * Notifies every socket currently connected to the given socket.io
++   * server (across all namespaces) that the server is shutting down,
++   * before the connection is closed.
++   */
++  public async notifyShutdown(
++    server: Server,
++    reason: string = DEFAULT_SHUTDOWN_MESSAGE,
++  ): Promise<void> {
++    if (!server || !isFunction(server.emit)) {
++      return;
++    }
++    server.emit(SHUTDOWN_EVENT, { message: reason });
++    // `emit` hands the packet off to the underlying transport
++    // asynchronously (encoding + writing to the socket happen on a later
++    // tick). Yield briefly so the notification actually reaches the wire
++    // before the caller proceeds to close the connection.
++    await new Promise(resolve => setTimeout(resolve, 50));
++  }
+ }
+diff --git a/packages/platform-ws/adapters/ws-adapter.ts b/packages/platform-ws/adapters/ws-adapter.ts
+index fd75cf7..ec29033 100644
+--- a/packages/platform-ws/adapters/ws-adapter.ts
++++ b/packages/platform-ws/adapters/ws-adapter.ts
+@@ -8,7 +8,9 @@ import { loadPackageSync, isNil, normalizePath } from '@nestjs/common/internal';
+ import {
+   CLOSE_EVENT,
+   CONNECTION_EVENT,
++  DEFAULT_SHUTDOWN_MESSAGE,
+   ERROR_EVENT,
++  SHUTDOWN_EVENT,
+ } from '@nestjs/websockets/internal';
+ import type { MessageMappingProperties } from '@nestjs/websockets';
+ 
+@@ -204,6 +206,25 @@ export class WsAdapter extends AbstractWsAdapter {
+     await closeEventSignal;
+   }
+ 
++  /**
++   * Sends a shutdown notification message to every client currently
++   * connected to the given `ws` server, before the connection is closed.
++   */
++  public async notifyShutdown(
++    server: any,
++    reason: string = DEFAULT_SHUTDOWN_MESSAGE,
++  ) {
++    if (!server?.clients) {
++      return;
++    }
++    const message = JSON.stringify({ event: SHUTDOWN_EVENT, data: reason });
++    for (const client of server.clients) {
++      if (client.readyState === READY_STATE.OPEN_STATE) {
++        client.send(message);
++      }
++    }
++  }
++
+   public async dispose() {
+     const closeEventSignals = Array.from(this.httpServersRegistry)
+       .filter(([port]) => port !== UNDERLYING_HTTP_SERVER_PORT)
+diff --git a/packages/websockets/adapters/ws-adapter.ts b/packages/websockets/adapters/ws-adapter.ts
+index 411b158..9a5e9ea 100644
+--- a/packages/websockets/adapters/ws-adapter.ts
++++ b/packages/websockets/adapters/ws-adapter.ts
+@@ -51,6 +51,14 @@ export abstract class AbstractWsAdapter<
+     isCallable && (await new Promise(resolve => server.close(resolve)));
+   }
+ 
++  /**
++   * Default (no-op) implementation. Concrete adapters (e.g. `IoAdapter`,
++   * `WsAdapter`) override this to notify connected clients — using their
++   * own transport-specific wire protocol — that the server is shutting
++   * down, before the connection is actually closed.
++   */
++  public async notifyShutdown(_server: TServer, _reason?: string) {}
++
+   public async dispose() {}
+ 
+   public abstract create(port: number, options?: TOptions): TServer;
+diff --git a/packages/websockets/constants.ts b/packages/websockets/constants.ts
+index e8b7b8e..bd5f35e 100644
+--- a/packages/websockets/constants.ts
++++ b/packages/websockets/constants.ts
+@@ -13,3 +13,11 @@ export const CONNECTION_EVENT = 'connection';
+ export const DISCONNECT_EVENT = 'disconnect';
+ export const CLOSE_EVENT = 'close';
+ export const ERROR_EVENT = 'error';
++
++/**
++ * Event name emitted to connected WebSocket clients right before the
++ * server closes their connection as part of the Nest application shutdown
++ * sequence (see `OnApplicationShutdown` / `enableShutdownHooks`).
++ */
++export const SHUTDOWN_EVENT = 'shutdown';
++export const DEFAULT_SHUTDOWN_MESSAGE = 'Server is shutting down';
+diff --git a/packages/websockets/socket-module.ts b/packages/websockets/socket-module.ts
+index 6a39c48..f236091 100644
+--- a/packages/websockets/socket-module.ts
++++ b/packages/websockets/socket-module.ts
+@@ -134,6 +134,18 @@ export class SocketModule<
+       return;
+     }
+     const servers = this.socketsContainer.getAll();
++
++    // Notify every connected client (through the adapter's own transport
++    // protocol) that the server is about to shut down, *before* actually
++    // closing their connection.
++    await Promise.all(
++      iterate(servers.values())
++        .filter(({ server }) => server)
++        .map(async ({ server }) =>
++          (adapter as AbstractWsAdapter).notifyShutdown?.(server),
++        ),
++    );
++
+     await Promise.all(
+       iterate(servers.values())
+         .filter(({ server }) => server)

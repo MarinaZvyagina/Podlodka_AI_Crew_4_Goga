@@ -1,0 +1,236 @@
+diff --git a/integration/_scratch-D/e2e/request-id-express.spec.ts b/integration/_scratch-D/e2e/request-id-express.spec.ts
+new file mode 100644
+index 0000000..fb661e3
+--- /dev/null
++++ b/integration/_scratch-D/e2e/request-id-express.spec.ts
+@@ -0,0 +1,46 @@
++import { INestApplication } from '@nestjs/common';
++import { Test } from '@nestjs/testing';
++import request from 'supertest';
++import { App } from 'supertest/types';
++import { AppModule } from '../src/app.module.js';
++
++describe('Request ID (platform-express)', () => {
++  let app: INestApplication;
++  let server: App;
++
++  beforeEach(async () => {
++    const module = await Test.createTestingModule({
++      imports: [AppModule],
++    }).compile();
++
++    app = module.createNestApplication();
++    server = app.getHttpServer();
++    await app.init();
++  });
++
++  it('generates a well-formed X-Request-Id when none is supplied, matching the value seen inside the handler', async () => {
++    const res = await request(server).get('/hello').expect(200);
++
++    const headerValue = res.headers['x-request-id'];
++    expect(headerValue).toBeTruthy();
++    expect(headerValue).toMatch(
++      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
++    );
++    expect(res.body.requestIdSeenInHandler).toBe(headerValue);
++  });
++
++  it('echoes back an incoming X-Request-Id unchanged', async () => {
++    const incomingId = 'incoming-correlation-id-express-123';
++    const res = await request(server)
++      .get('/hello')
++      .set('X-Request-Id', incomingId)
++      .expect(200);
++
++    expect(res.headers['x-request-id']).toBe(incomingId);
++    expect(res.body.requestIdSeenInHandler).toBe(incomingId);
++  });
++
++  afterEach(async () => {
++    await app.close();
++  });
++});
+diff --git a/integration/_scratch-D/e2e/request-id-fastify.spec.ts b/integration/_scratch-D/e2e/request-id-fastify.spec.ts
+new file mode 100644
+index 0000000..e138e7d
+--- /dev/null
++++ b/integration/_scratch-D/e2e/request-id-fastify.spec.ts
+@@ -0,0 +1,52 @@
++import {
++  FastifyAdapter,
++  NestFastifyApplication,
++} from '@nestjs/platform-fastify';
++import { Test } from '@nestjs/testing';
++import { AppModule } from '../src/app.module.js';
++
++describe('Request ID (platform-fastify)', () => {
++  let app: NestFastifyApplication;
++
++  beforeEach(async () => {
++    const module = await Test.createTestingModule({
++      imports: [AppModule],
++    }).compile();
++
++    app = module.createNestApplication<NestFastifyApplication>(
++      new FastifyAdapter(),
++    );
++    await app.init();
++  });
++
++  it('generates a well-formed X-Request-Id when none is supplied, matching the value seen inside the handler', async () => {
++    const res = await app.inject({ method: 'GET', url: '/hello' });
++
++    expect(res.statusCode).toBe(200);
++    const headerValue = res.headers['x-request-id'];
++    expect(headerValue).toBeTruthy();
++    expect(headerValue).toMatch(
++      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
++    );
++    const body = JSON.parse(res.payload);
++    expect(body.requestIdSeenInHandler).toBe(headerValue);
++  });
++
++  it('echoes back an incoming X-Request-Id unchanged', async () => {
++    const incomingId = 'incoming-correlation-id-fastify-456';
++    const res = await app.inject({
++      method: 'GET',
++      url: '/hello',
++      headers: { 'x-request-id': incomingId },
++    });
++
++    expect(res.statusCode).toBe(200);
++    expect(res.headers['x-request-id']).toBe(incomingId);
++    const body = JSON.parse(res.payload);
++    expect(body.requestIdSeenInHandler).toBe(incomingId);
++  });
++
++  afterEach(async () => {
++    await app.close();
++  });
++});
+diff --git a/integration/_scratch-D/src/app.controller.ts b/integration/_scratch-D/src/app.controller.ts
+new file mode 100644
+index 0000000..9820b04
+--- /dev/null
++++ b/integration/_scratch-D/src/app.controller.ts
+@@ -0,0 +1,13 @@
++import { Controller, Get } from '@nestjs/common';
++import { getRequestId } from './request-id.storage.js';
++
++@Controller()
++export class AppController {
++  @Get('hello')
++  getHello() {
++    // Value captured from *inside* the route handler, via the
++    // platform-neutral AsyncLocalStorage holder - not by parsing the
++    // outgoing response.
++    return { requestIdSeenInHandler: getRequestId() };
++  }
++}
+diff --git a/integration/_scratch-D/src/app.module.ts b/integration/_scratch-D/src/app.module.ts
+new file mode 100644
+index 0000000..397f018
+--- /dev/null
++++ b/integration/_scratch-D/src/app.module.ts
+@@ -0,0 +1,15 @@
++import { Module } from '@nestjs/common';
++import { APP_INTERCEPTOR } from '@nestjs/core';
++import { AppController } from './app.controller.js';
++import { RequestIdInterceptor } from './request-id.interceptor.js';
++
++@Module({
++  controllers: [AppController],
++  providers: [
++    {
++      provide: APP_INTERCEPTOR,
++      useClass: RequestIdInterceptor,
++    },
++  ],
++})
++export class AppModule {}
+diff --git a/integration/_scratch-D/src/request-id.interceptor.ts b/integration/_scratch-D/src/request-id.interceptor.ts
+new file mode 100644
+index 0000000..1d1761a
+--- /dev/null
++++ b/integration/_scratch-D/src/request-id.interceptor.ts
+@@ -0,0 +1,58 @@
++import {
++  CallHandler,
++  ExecutionContext,
++  Injectable,
++  NestInterceptor,
++} from '@nestjs/common';
++import { HttpAdapterHost } from '@nestjs/core';
++import { randomUUID } from 'node:crypto';
++import { Observable } from 'rxjs';
++import { requestIdStorage } from './request-id.storage.js';
++
++export const REQUEST_ID_HEADER = 'X-Request-Id';
++const INCOMING_REQUEST_ID_HEADER = 'x-request-id';
++
++/**
++ * Reads (or generates) a per-request correlation ID and:
++ *  - echoes it back on the response via the framework's platform-agnostic
++ *    `AbstractHttpAdapter#setHeader` (through `HttpAdapterHost`), never by
++ *    calling a raw `response.setHeader(...)`/`res.set(...)` directly, and
++ *    never by branching on which adapter/platform is active.
++ *  - exposes it to application code (e.g. route handlers, loggers) through
++ *    an AsyncLocalStorage-backed holder that does not assume any concrete
++ *    request/response shape either.
++ *
++ * Works unmodified under both `@nestjs/platform-express` and
++ * `@nestjs/platform-fastify` because it only ever touches:
++ *   - `request.headers[...]` (a plain object on both platforms), and
++ *   - `httpAdapter.setHeader(response, ...)` (dispatched through the
++ *     abstract adapter, realized differently per platform internally).
++ */
++@Injectable()
++export class RequestIdInterceptor implements NestInterceptor {
++  constructor(private readonly adapterHost: HttpAdapterHost) {}
++
++  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
++    const httpAdapter = this.adapterHost.httpAdapter;
++    const httpCtx = context.switchToHttp();
++    const request = httpCtx.getRequest();
++    const response = httpCtx.getResponse();
++
++    const incoming = request?.headers?.[INCOMING_REQUEST_ID_HEADER];
++    const incomingValue = Array.isArray(incoming) ? incoming[0] : incoming;
++    const requestId = incomingValue || randomUUID();
++
++    httpAdapter.setHeader(response, REQUEST_ID_HEADER, requestId);
++
++    return new Observable(subscriber => {
++      requestIdStorage.run(requestId, () => {
++        const subscription = next.handle().subscribe({
++          next: value => subscriber.next(value),
++          error: err => subscriber.error(err),
++          complete: () => subscriber.complete(),
++        });
++        return () => subscription.unsubscribe();
++      });
++    });
++  }
++}
+diff --git a/integration/_scratch-D/src/request-id.storage.ts b/integration/_scratch-D/src/request-id.storage.ts
+new file mode 100644
+index 0000000..a558ee7
+--- /dev/null
++++ b/integration/_scratch-D/src/request-id.storage.ts
+@@ -0,0 +1,16 @@
++import { AsyncLocalStorage } from 'node:async_hooks';
++
++/**
++ * Platform-neutral holder for the per-request correlation/request ID.
++ *
++ * Deliberately does NOT reach into any concrete request/response object
++ * shape (Express `req`/`res` vs Fastify `request`/`reply`) - it is a plain
++ * Node.js AsyncLocalStorage instance keyed by the async execution context of
++ * the request, so it works identically regardless of which HTTP adapter
++ * bootstrapped the application.
++ */
++export const requestIdStorage = new AsyncLocalStorage<string>();
++
++export function getRequestId(): string | undefined {
++  return requestIdStorage.getStore();
++}

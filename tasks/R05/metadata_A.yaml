@@ -1,0 +1,70 @@
+task_id: R05-TA
+repository: VictoriaMetrics/VictoriaMetrics
+commit: f65ae841ace8f686ddc0dc17fe936d0bf38e568c
+category: local_change
+
+functional_requirements:
+  - "A new relabeling action is available in relabel_configs (e.g. named \"trim\" / \"trim_space\") that joins the configured source_labels with the configured separator (default \";\", matching existing actions), trims leading/trailing whitespace from the result, and stores it into target_label."
+  - "The new action is usable both in scrape-time relabel_configs and in remote-write relabeling, since both consume the same RelabelConfig type from lib/promrelabel."
+  - "Config validation rejects the new action at load time (not at runtime) if source_labels or target_label are missing, with an error message in the same style as existing actions (missing source_labels for action=... / missing target_label for action=...)."
+  - "All other existing relabel actions behave exactly as before (no regressions in lib/promrelabel tests)."
+  - "Documentation lists the new action alongside the other relabeling actions."
+
+architectural_constraints:
+  - "The action must be implemented as a new case inside the existing action-dispatch switch in lib/promrelabel/relabel.go (func (prc *parsedRelabelConfig) apply), the same switch that already contains \"uppercase\" and \"lowercase\" (verified at approx. lines 405-425 of relabel.go at the pinned commit) - not as a new standalone function, file, or package."
+  - "The action name must be added to the validation switch in lib/promrelabel/config.go (the switch that already validates \"uppercase\", \"lowercase\", \"keep\", \"drop\", etc., ending in a default case returning an \"unknown action\" error - verified at approx. lines 330-393 of config.go at the pinned commit)."
+  - "Must not introduce a second, parallel place where label values get transformed/trimmed (e.g. inside lib/promscrape scrape-config parsing, or inside app/vmagent or app/vminsert request handlers) - lib/promrelabel is the single shared implementation used by both scraping and remote-write relabeling, and that must remain true."
+  - "Should reuse the existing RelabelConfig fields (SourceLabels, Separator, TargetLabel) already used by \"uppercase\"/\"lowercase\" rather than adding new YAML fields, since the feature has the identical shape (concatenate source_labels, transform, store at target_label)."
+
+required_existing_abstractions:
+  - "parsedRelabelConfig.apply() action switch - lib/promrelabel/relabel.go (case \"uppercase\", \"lowercase\" is the direct precedent to follow)"
+  - "action validation switch - lib/promrelabel/config.go (case \"uppercase\", \"lowercase\" entry)"
+  - "concatLabelValues / setLabelValue / relabelBufPool helpers already used by other value-transforming actions in lib/promrelabel/relabel.go"
+
+allowed_dependencies:
+  - "Go standard library (strings.TrimSpace or equivalent)"
+  - "Existing internal helpers already imported by lib/promrelabel/relabel.go (bytesutil, relabelBufPool)"
+
+forbidden_dependencies:
+  - "lib/promscrape must not gain new label-trimming logic (relabeling is promrelabel's responsibility; promscrape only calls into promrelabel)"
+  - "app/vmagent, app/vminsert, app/victoria-metrics must not implement any new label transformation logic themselves - they only wire configs through to lib/promrelabel"
+
+expected_extension_points: []
+
+public_api_constraints:
+  - "RelabelConfig's YAML shape (Action as a plain string, existing typed fields) must not change in a way that breaks parsing of existing relabel_configs in currently-deployed configs."
+
+functional_check_command: "go test ./lib/promrelabel/... -run TestParsedConfigs -v ; also add/execute a table-test case in lib/promrelabel/relabel_test.go feeding a relabel_config with the new action and asserting the output label value is trimmed"
+architecture_check_command: "grep -rn 'trim' lib/promrelabel/relabel.go lib/promrelabel/config.go and confirm the new action is registered in both the apply() switch and the validation switch; grep -rln '<new-action-name>' --include=*.go . should return only lib/promrelabel/*.go and test files (no app/ or other lib/ packages)"
+
+architecture_checks:
+  - id: AC1
+    description: "New action is implemented inside the existing single dispatch switch in lib/promrelabel/relabel.go rather than as a separate mechanism."
+    method: "Manual code review of the diff to relabel.go; confirm the new logic is a case arm inside func (prc *parsedRelabelConfig) apply, not a new top-level function called from outside that switch."
+    expected_result_if_correct: "A single new case clause added to the existing apply() switch, following the shape of the uppercase/lowercase cases."
+    expected_result_if_trap: "A new standalone function/file (e.g. lib/promrelabel/trim.go with its own exported Trim() applied by a caller outside the switch), or trimming logic duplicated in lib/promscrape or app/ handlers."
+  - id: AC2
+    description: "The action is validated at config-parse time in lib/promrelabel/config.go, consistent with all other actions."
+    method: "grep -n 'case \"<name>' lib/promrelabel/config.go"
+    expected_result_if_correct: "New case present in the validation switch with checks for missing source_labels/target_label mirroring uppercase/lowercase."
+    expected_result_if_trap: "No validation added (invalid configs only fail at runtime with a panic via the default unknown-action path in relabel.go), or validation duplicated in a different, new function outside config.go's existing switch."
+  - id: AC3
+    description: "No parallel/duplicate label-trimming mechanism introduced outside lib/promrelabel."
+    method: "grep -rn 'TrimSpace|trim' --include=*.go app/ lib/promscrape (excluding lib/promrelabel itself and existing unrelated matches) and manually inspect any hits introduced by the diff."
+    expected_result_if_correct: "No new whitespace-trimming logic outside lib/promrelabel/*.go."
+    expected_result_if_trap: "New trimming logic added in app/vmagent, app/vminsert, or lib/promscrape (e.g. trimming labels right after scraping/ingestion instead of via relabel_configs)."
+  - id: AC4
+    description: "No new YAML fields added to RelabelConfig that duplicate SourceLabels/Separator/TargetLabel."
+    method: "Diff lib/promrelabel/config.go's RelabelConfig struct definition against the pre-change version."
+    expected_result_if_correct: "RelabelConfig struct fields unchanged; only the Action string enum of accepted values grows."
+    expected_result_if_trap: "New fields added (e.g. a bespoke TrimTarget field) duplicating existing SourceLabels/TargetLabel semantics."
+
+notes_for_positive_negative_control: >
+  Positive control: add a case "trim" (or "trim_space") arm to the apply() switch in
+  lib/promrelabel/relabel.go that mirrors "uppercase"/"lowercase" (concat source_labels, call
+  strings.TrimSpace, setLabelValue at target_label), plus a matching validation case in
+  config.go requiring source_labels and target_label. Negative control: implement the same
+  user-visible behavior by adding a TrimLabels []string post-processing step invoked from
+  lib/promscrape's scrape-config loader (or from app/vmagent) that runs after promrelabel
+  finishes, entirely bypassing the RelabelConfig action mechanism - this can pass a
+  hand-written functional test (labels do get trimmed) while failing AC1/AC3.

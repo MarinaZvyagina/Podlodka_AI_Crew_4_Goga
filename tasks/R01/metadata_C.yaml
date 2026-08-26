@@ -1,0 +1,132 @@
+task_id: R01-TC
+repository: freqtrade/freqtrade
+commit: 936f28e28cbcd4e9e146cbc076c54933517a92eb
+category: existing_extension_point
+
+functional_requirements:
+  - "A new mechanism that counts CONSECUTIVE losing trades (a streak, not cumulative/summed profit like
+     the existing low-profit-pairs style check) for a given pair, using closed-trade history."
+  - "Once the configured streak threshold is reached for a pair, no new entries are allowed on that pair
+     until a configurable cool-down window elapses."
+  - "A bot-wide equivalent: once a configured number of consecutive losses has occurred across trading in
+     general (not confined to one pair), new entries are paused everywhere for a configurable cool-down
+     window."
+  - "Threshold and cool-down duration must be configurable per strategy, alongside the strategy's other
+     existing risk-management configuration."
+  - "The pause must clear itself automatically once the cool-down window elapses, with no manual
+     intervention required."
+  - "The active pause must be visible through whichever channel the bot already uses to report this class
+     of automatic trading interruption (existing status/notification surfaces)."
+
+architectural_constraints:
+  - "Must be implemented as a new subclass of the existing abstract base class for automatic
+     trading-pause handlers: `IProtection` (freqtrade/plugins/protections/iprotection.py, lines 25-143),
+     implementing `global_stop()` and `stop_per_pair()` (abstract methods, lines 104-122) and returning a
+     `ProtectionReturn` (lines 17-22) exactly like the four built-in handlers in
+     freqtrade/plugins/protections/ (cooldown_period.py, low_profit_pairs.py, max_drawdown_protection.py,
+     stoploss_guard.py)."
+  - "Must be dynamically loadable by class name the same way all four built-ins already are, via
+     `ProtectionResolver` (freqtrade/resolvers/protection_resolver.py, a thin subclass of the generic
+     `IResolver` at freqtrade/resolvers/iresolver.py) — i.e., a user must be able to reference the new
+     handler by class name from their strategy's protections config list the same way they reference
+     `StoplossGuard` or `CooldownPeriod` today, with no core code changes required to enable it for a
+     given strategy."
+  - "Must be orchestrated through the existing `ProtectionManager` (freqtrade/plugins/protectionmanager.py)
+     which already calls `global_stop()`/`stop_per_pair()` on every configured handler and persists the
+     resulting lock via `freqtrade.persistence.PairLocks` (protectionmanager.py lines 50-88). Must NOT add
+     a second, parallel pause-tracking mechanism directly inside freqtrade/freqtradebot.py (e.g. a new
+     ad hoc dict of paused pairs) that bypasses ProtectionManager/PairLocks."
+  - "Must represent the resulting pause using the existing `PairLocks`/`PairLock` persistence
+     (freqtrade/persistence/pairlock*.py, freqtrade/persistence/models.py) — the same storage every other
+     automatic pause already uses — rather than a new bespoke state store, so existing surfaces that
+     already read PairLocks (RPC's `_rpc_locks`, the `/locks` API endpoint, Telegram's lock listing)
+     automatically pick it up with no changes needed there."
+  - "Must not require changing the call site in freqtrade/freqtradebot.py::handle_protections() (lines
+     2455-2477, which already calls self.protections.stop_per_pair(...) and
+     self.protections.global_stop(...)) — a correctly implemented new handler plugs in purely through
+     config, with zero changes needed to freqtradebot.py's control flow."
+
+required_existing_abstractions:
+  - "IProtection — freqtrade/plugins/protections/iprotection.py"
+  - "ProtectionResolver / IResolver — freqtrade/resolvers/protection_resolver.py, freqtrade/resolvers/iresolver.py"
+  - "ProtectionManager — freqtrade/plugins/protectionmanager.py"
+  - "PairLocks / PairLock — freqtrade/persistence/pairlock.py, freqtrade/persistence/pairlock_middleware.py, freqtrade/persistence/models.py"
+  - "Trade.get_trades_proxy() — freqtrade/persistence/trade_model.py (used by all four existing protections to read closed-trade history)"
+
+allowed_dependencies:
+  - "The new handler module lives under freqtrade/plugins/protections/ and may depend on
+     freqtrade.persistence (Trade), freqtrade.constants, freqtrade.plugins.protections (IProtection,
+     ProtectionReturn) — the same dependency set the four existing handlers already have."
+
+forbidden_dependencies:
+  - "freqtrade/freqtradebot.py must not gain a new, second pause/lock data structure — it already depends
+     on ProtectionManager/PairLocks and that must remain the sole mechanism."
+  - "The new handler must not depend on freqtrade/rpc/ or freqtrade/plugins/pairlist/ — visibility comes
+     for free once PairLocks is used correctly, no direct RPC calls should be added inside the protection
+     handler itself (existing handlers never call rpc directly; ProtectionManager's caller does)."
+
+expected_extension_points:
+  - "IProtection ABC — freqtrade/plugins/protections/iprotection.py (abstract methods short_desc(),
+     global_stop(), stop_per_pair(); class attributes has_global_stop/has_local_stop). Verified by reading
+     the four existing implementations (cooldown_period.py, low_profit_pairs.py,
+     max_drawdown_protection.py, stoploss_guard.py), all of which subclass IProtection and are loaded via
+     ProtectionResolver.load_protection() (protection_resolver.py lines 26-44) called from
+     ProtectionManager.__init__ (protectionmanager.py lines 20-32)."
+
+public_api_constraints:
+  - "New handler's config schema (parameters accepted in the strategy's `protections` list entry) should
+     follow the existing convention: a `method` key naming the class, plus handler-specific keys read via
+     `self._protection_config.get(...)` in __init__, matching the pattern in the four existing handlers."
+  - "Must not change the public signature of IProtection.global_stop()/stop_per_pair() or ProtectionReturn
+     — existing handlers and ProtectionManager call sites must keep working unmodified."
+
+functional_check_command: >
+  Mirrors tests/plugins/test_protections.py's existing structure (which already parametrizes/tests
+  CooldownPeriod, LowProfitPairs, MaxDrawdown, StoplossGuard against constructed Trade fixtures). A new
+  test in that file/style would: create a sequence of N consecutive losing Trade rows for one pair via the
+  existing test fixtures, instantiate the new handler with a configured streak threshold, call
+  stop_per_pair() and assert it returns a ProtectionReturn with lock=True once the streak threshold is
+  met (and None below it); separately verify global_stop() behaves equivalently for the bot-wide variant.
+  Also run `pytest tests/plugins/test_protections.py tests/plugins/test_pairlocks.py`.
+
+architecture_check_command: "See architecture_checks below."
+
+architecture_checks:
+  - id: AC1
+    description: "New handler subclasses IProtection rather than being a standalone/ad hoc class."
+    method: "grep -n 'class .*IProtection' freqtrade/plugins/protections/*.py — confirm a new file defines a class inheriting IProtection, alongside CooldownPeriod/LowProfitPairs/MaxDrawdown/StoplossGuard."
+    expected_result_if_correct: "New class found under freqtrade/plugins/protections/, subclassing IProtection, implementing short_desc/global_stop/stop_per_pair."
+    expected_result_if_trap: "No new IProtection subclass exists anywhere in the diff; streak-pause logic instead lives inline in freqtradebot.py or in a new, unrelated top-level module."
+  - id: AC2
+    description: "The new handler is loadable through the existing resolver, i.e. discoverable purely by class name from config, no core wiring changes needed."
+    method: "Manual check: confirm the new class's file lives in freqtrade/plugins/protections/ (ProtectionResolver's initial_search_path, protection_resolver.py line 24) and that freqtrade/resolvers/protection_resolver.py and freqtrade/plugins/protectionmanager.py have an EMPTY diff (no special-casing added for the new handler's name)."
+    expected_result_if_correct: "protection_resolver.py and protectionmanager.py unchanged; new handler is picked up purely by being placed in the existing search path and referenced by class name in a strategy's protections config."
+    expected_result_if_trap: "protection_resolver.py or protectionmanager.py modified with an if/elif branch specifically naming the new handler class, indicating it isn't being loaded through the generic dynamic-loading path."
+  - id: AC3
+    description: "Pause state is represented via PairLocks, not a parallel structure."
+    method: "grep -n 'PairLocks\\|lock_pair' <new handler file> — confirm the handler returns a ProtectionReturn (as all existing handlers do) rather than calling any lock-setting API itself; separately grep freqtrade/freqtradebot.py for any new dict/set/attribute that looks like a second 'paused pairs' tracker."
+    expected_result_if_correct: "New handler only returns ProtectionReturn objects (lock/until/reason/lock_side); no new pause-tracking state exists outside PairLocks/ProtectionManager."
+    expected_result_if_trap: "A new attribute such as self._paused_pairs or self._loss_streak_locks is added to FreqtradeBot and consulted directly in the entry path, bypassing PairLocks and hence invisible to /locks, RPC, and Telegram's existing lock displays."
+  - id: AC4
+    description: "freqtradebot.py's protection call site is unmodified."
+    method: "git diff freqtrade/freqtradebot.py — expect either an empty diff, or only config/import changes strictly required for feature configuration (not control-flow changes to handle_protections())."
+    expected_result_if_correct: "handle_protections() (lines 2455-2477) unchanged; ProtectionManager continues to be the sole call path for pause logic."
+    expected_result_if_trap: "handle_protections() or execute_entry() modified with new inline consecutive-loss-checking logic."
+  - id: AC5
+    description: "Consecutive-loss streak counting is genuinely distinct from the existing profit-sum-based check (LowProfitPairs), not a copy/rename."
+    method: "Manual code review of the new handler's core evaluation method: confirm it iterates closed trades ordered by recency and stops counting at the first winning trade (streak logic), rather than summing profit over a lookback window (LowProfitPairs' approach, low_profit_pairs.py lines 121-161)."
+    expected_result_if_correct: "Streak/consecutive-loss logic distinguishable from LowProfitPairs' profit-sum logic."
+    expected_result_if_trap: "New handler is effectively a copy of LowProfitPairs with cosmetic renaming, not actually implementing consecutive-loss counting as requested."
+
+notes_for_positive_negative_control: >
+  Correct: a new IProtection subclass (e.g. under freqtrade/plugins/protections/) implementing streak
+  counting over Trade.get_trades_proxy() history, loaded via the existing ProtectionResolver with zero
+  changes to protection_resolver.py/protectionmanager.py/freqtradebot.py, returning ProtectionReturn
+  objects that ProtectionManager persists via PairLocks as usual. Negative/trap control: a functionally
+  working implementation that instead adds a new `self._consecutive_loss_pairs: dict[str, tuple[int, datetime]]`
+  attribute to FreqtradeBot, updates it inside handle_protections() or the trade-close handler, and adds a
+  new guard clause early in execute_entry() checking that dict directly — this can pass a naive functional
+  test (bot stops entering after N losses, resumes after cooldown) while being invisible to
+  `/locks`/the API's pairlocks endpoint/Telegram's lock display, inconsistent with every other automatic
+  pause in the system, and undiscoverable/unconfigurable the way every other protection already is
+  (no class name in the protections config list activates it).

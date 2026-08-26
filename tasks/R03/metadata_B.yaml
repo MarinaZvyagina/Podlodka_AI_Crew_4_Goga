@@ -1,0 +1,166 @@
+task_id: R03-TB
+repository: nestjs/nest
+commit: f94e9eb15ba2a22f69aef234cb81333764d0b298
+category: cross_module_feature
+
+functional_requirements:
+  - When the application's graceful-shutdown flow runs (either invoked directly or triggered by a
+    registered OS termination signal), every WebSocket client currently connected to any
+    registered gateway receives a notification (message/event) that the server is shutting down
+    before its connection is closed.
+  - Behavior is equivalent for applications using the socket.io-based WebSocket integration
+    (packages/platform-socket.io) and the ws-library-based integration (packages/platform-ws).
+  - The behavior fires automatically as part of the shutdown sequence already used for the rest of
+    the app (e.g. reachable from `enableShutdownHooks()`/`close()`); it must not require a
+    developer to add a separate, manually-invoked call per gateway.
+  - Normal (non-shutdown) connect/disconnect/message handling for existing gateways is unaffected;
+    gateways with zero connected clients at shutdown time, and apps with no WebSocket gateways at
+    all, see no behavior change.
+
+architectural_constraints:
+  - The trigger must be wired into the existing DI-orchestrated application lifecycle/shutdown
+    flow — the `OnApplicationShutdown` hook contract at
+    packages/common/interfaces/hooks/on-application-shutdown.interface.ts, invoked via
+    packages/core/hooks/on-app-shutdown.hook.ts as part of
+    packages/core/nest-application-context.ts `close()` — not a new, standalone shutdown
+    entrypoint that bypasses `enableShutdownHooks()`/`close()`.
+  - Active gateway servers must be discovered through the existing websockets registry
+    (`SocketsContainer` at packages/websockets/sockets-container.ts, populated via
+    packages/websockets/socket-module.ts), not through a new, independently-maintained record of
+    connected sockets.
+  - Per-transport "notify then close" behavior must be realized through the shared adapter
+    abstraction — the `WebSocketAdapter` interface at
+    packages/common/interfaces/websockets/web-socket-adapter.interface.ts and its base class
+    `AbstractWsAdapter` at packages/websockets/adapters/ws-adapter.ts — with concrete behavior
+    added in packages/platform-socket.io/adapters/io-adapter.ts and
+    packages/platform-ws/adapters/ws-adapter.ts respectively.
+  - packages/core and packages/websockets must not gain a new *static* import from
+    packages/platform-socket.io or packages/platform-ws. Any dynamic/optional loading must follow
+    the existing pattern in packages/core/helpers/load-adapter.ts, not a hardcoded static import.
+  - No new dependency/peerDependency entries pointing at @nestjs/platform-socket.io or
+    @nestjs/platform-ws should appear in packages/core/package.json or
+    packages/websockets/package.json.
+
+required_existing_abstractions:
+  - OnApplicationShutdown hook interface — packages/common/interfaces/hooks/on-application-shutdown.interface.ts
+  - Shutdown orchestration — packages/core/nest-application-context.ts (`close()`,
+    `enableShutdownHooks()`), packages/core/hooks/on-app-shutdown.hook.ts
+  - SocketsContainer — packages/websockets/sockets-container.ts, packages/websockets/socket-module.ts
+  - AbstractWsAdapter / WebSocketAdapter interface — packages/websockets/adapters/ws-adapter.ts,
+    packages/common/interfaces/websockets/web-socket-adapter.interface.ts
+
+allowed_dependencies:
+  - packages/core, packages/common, packages/websockets, packages/platform-socket.io,
+    packages/platform-ws (existing edges only; no new cross-package edges beyond these)
+
+forbidden_dependencies:
+  - packages/core -> packages/platform-socket.io or packages/platform-ws as a new static edge
+    (reasoning — core must stay transport/platform-agnostic; the existing dynamic-load pattern is
+    the only sanctioned exception)
+  - packages/websockets -> packages/platform-socket.io or packages/platform-ws as a new static
+    edge (same reasoning; websockets already only optionally/dynamically depends on
+    platform-socket.io as a default)
+  - packages/platform-express, packages/platform-fastify, packages/microservices — irrelevant
+    transports for this ticket; touching them signals scope creep or a misunderstanding of which
+    packages own WebSocket gateways
+
+expected_extension_points: []
+
+public_api_constraints:
+  - Any new public method added to `AbstractWsAdapter`/`WebSocketAdapter` must be additive and
+    optional (consistent with how `bindClientDisconnect?` is already optional), so third-party
+    adapters that don't implement it don't break.
+  - Must not change the public signature of `OnApplicationShutdown` or other existing lifecycle
+    hook interfaces.
+
+functional_check_command: >
+  Add an e2e spec analogous to integration/hooks/e2e/on-app-shutdown.spec.ts and
+  integration/graceful-shutdown/e2e/express.spec.ts: boot a Nest app with a WebSocket gateway
+  using platform-socket.io, connect a client, call the app's shutdown routine (or send the
+  configured signal to a spawned child process), and assert the client receives the shutdown
+  notification event before its 'disconnect' event fires. Repeat the same scenario with
+  platform-ws and assert equivalent behavior. Run via
+  `npx vitest run` against the new spec path(s), plus the full existing
+  `packages/websockets`, `packages/platform-socket.io`, `packages/platform-ws` suites for
+  regressions.
+
+architecture_check_command: >
+  grep-based diff inspection plus manual code review, per architecture_checks below.
+
+architecture_checks:
+  - id: AC1
+    description: Shutdown notification is wired through the existing OnApplicationShutdown/close() flow, not a separate manually-invoked entrypoint.
+    method: >
+      grep -n "onApplicationShutdown" across the diff; confirm the new/changed provider
+      implements the interface from packages/common/interfaces/hooks/on-application-shutdown.interface.ts,
+      or the change sits inside packages/core/nest-application-context.ts's close()/shutdown-hook
+      call chain. Trace whether the new logic is reachable purely by calling `app.close()` /
+      receiving a configured signal, with no additional call required in application code.
+    expected_result_if_correct: >
+      New logic is reachable automatically from close()/onApplicationShutdown with no extra call
+      required in a consuming application's main.ts.
+    expected_result_if_trap: >
+      A new exported function/method (e.g. `notifyAndCloseSockets()`) exists but is only invoked
+      if a developer manually calls it themselves — disconnected from enableShutdownHooks()/close().
+  - id: AC2
+    description: Gateway/connection discovery goes through the existing SocketsContainer registry, not a new parallel bookkeeping structure.
+    method: >
+      grep -n "SocketsContainer" in the diff; separately search the diff for new module-level
+      arrays/maps/sets that independently track connected sockets or gateway instances.
+    expected_result_if_correct: Enumeration uses SocketsContainer.getAll() (or equivalent already-registered host map).
+    expected_result_if_trap: >
+      A new, independently-maintained registry of connected sockets/gateways is introduced,
+      duplicating SocketsContainer's responsibility.
+  - id: AC3
+    description: Per-transport wire-protocol behavior stays behind the adapter abstraction and is implemented symmetrically for both platforms.
+    method: >
+      `git diff --stat` to confirm both packages/platform-socket.io/adapters/io-adapter.ts and
+      packages/platform-ws/adapters/ws-adapter.ts (or the shared base class
+      packages/websockets/adapters/ws-adapter.ts, if using a template-method style addition) are
+      touched with comparable logic. Separately, grep packages/core and packages/websockets
+      (excluding test files) for socket.io-specific calls (e.g. `.emit(`, `.disconnectSockets(`)
+      or `ws`-specific calls (e.g. raw `.send(`, `.close(code, reason)`).
+    expected_result_if_correct: >
+      Platform-specific wire-protocol calls appear only inside the respective platform-* package;
+      shared code in core/websockets calls only the adapter interface's methods.
+    expected_result_if_trap: >
+      packages/core or packages/websockets directly imports/calls a socket.io- or ws-specific API
+      (e.g. `import { Server } from 'socket.io'` inside packages/websockets, or code assuming one
+      library's client `.close(code, reason)` signature), meaning the feature is only really
+      implemented for one of the two required transports despite the ticket explicitly requiring
+      both.
+  - id: AC4
+    description: No new static dependency edge from core/websockets onto a specific platform package.
+    method: >
+      Diff packages/core/package.json and packages/websockets/package.json
+      dependencies/peerDependencies; grep changed *.ts files (excluding tests) in packages/core
+      and packages/websockets for `from '@nestjs/platform-socket.io'` / `from '@nestjs/platform-ws'`
+      static import specifiers.
+    expected_result_if_correct: No new package.json entries; no static imports of either platform package found.
+    expected_result_if_trap: >
+      A static `import ... from '@nestjs/platform-socket.io'` (or platform-ws) appears in
+      packages/core or packages/websockets source, or a new dependency/peerDependency entry is
+      added to either package.json.
+  - id: AC5
+    description: Existing gateway/adapter test suites still pass (no regression to normal connect/disconnect/message flow).
+    method: "`npx vitest run packages/websockets packages/platform-socket.io packages/platform-ws`"
+    expected_result_if_correct: All pre-existing tests remain green.
+    expected_result_if_trap: >
+      Pre-existing tests fail because the shutdown-notification logic interferes with normal
+      connection handling (e.g. notification code runs on every disconnect, not just during
+      shutdown).
+
+notes_for_positive_negative_control: >
+  Positive control: an internal provider implementing `onApplicationShutdown`, resolved through
+  DI, that pulls the set of registered gateway hosts from `SocketsContainer`, and for each one
+  calls a new optional method on the adapter abstraction (e.g. `notifyAndClose(server, reason)`)
+  which `AbstractWsAdapter` exposes with a default no-op-ish base implementation, overridden
+  concretely in `IoAdapter` (socket.io `.emit()` to all sockets, then close) and in `WsAdapter`
+  (iterate raw `ws` clients, `.send()` a message, then `.close()`); exercised green under both
+  platform-socket.io and platform-ws e2e tests. Negative/trap control: the same user-visible
+  behavior implemented by a provider whose `onApplicationShutdown` (or a free-standing helper
+  function) directly reaches into `(host as any).server.sockets` and calls socket.io-specific
+  `.emit()`/`.disconnectSockets()` inline from within packages/websockets or packages/core,
+  hardcoding one transport's wire protocol — this passes an e2e test run only against
+  platform-socket.io while doing nothing (or throwing) under platform-ws, i.e. a "Dangerous
+  Success" if the validator isn't run against both platforms.

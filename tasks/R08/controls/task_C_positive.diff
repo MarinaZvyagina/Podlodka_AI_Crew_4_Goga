@@ -1,0 +1,351 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/database/AttachmentTable.kt b/app/src/main/java/org/thoughtcrime/securesms/database/AttachmentTable.kt
+index 1e92473..7773cdd 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/database/AttachmentTable.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/database/AttachmentTable.kt
+@@ -1772,6 +1772,18 @@ class AttachmentTable(
+     }
+   }
+ 
++  /**
++   * Returns whether the given absolute file path is still referenced by any attachment's
++   * [DATA_FILE] or [THUMBNAIL_FILE]. Used by cleanup routines to detect orphaned on-disk
++   * cache/thumbnail files that no longer correspond to any attachment/message.
++   */
++  fun isAttachmentFilePathReferenced(path: String): Boolean {
++    return readableDatabase
++      .exists(TABLE_NAME)
++      .where("$DATA_FILE = ? OR $THUMBNAIL_FILE = ?", path, path)
++      .run()
++  }
++
+   fun deleteAbandonedAttachmentFiles(): Int {
+     val diskFiles = context.getDir(DIRECTORY, Context.MODE_PRIVATE).listFiles() ?: return 0
+ 
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/jobs/JobManagerFactories.java b/app/src/main/java/org/thoughtcrime/securesms/jobs/JobManagerFactories.java
+index 7e31c60..b7b60cb 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/jobs/JobManagerFactories.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/jobs/JobManagerFactories.java
+@@ -308,6 +308,7 @@ public final class JobManagerFactories {
+       put(Svr2MirrorJob.KEY,                           new Svr2MirrorJob.Factory());
+       put(Svr3MirrorJob.KEY,                           new Svr3MirrorJob.Factory());
+       put(ThreadUpdateJob.KEY,                         new ThreadUpdateJob.Factory());
++      put(ThumbnailCleanupJob.KEY,                     new ThumbnailCleanupJob.Factory());
+       put(TrimThreadJob.KEY,                           new TrimThreadJob.Factory());
+       put(TypingSendJob.KEY,                           new TypingSendJob.Factory());
+       put(UnpinMessageJob.KEY,                         new UnpinMessageJob.Factory());
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/jobs/ThumbnailCleanupJob.kt b/app/src/main/java/org/thoughtcrime/securesms/jobs/ThumbnailCleanupJob.kt
+new file mode 100644
+index 0000000..d6cb8c9
+--- /dev/null
++++ b/app/src/main/java/org/thoughtcrime/securesms/jobs/ThumbnailCleanupJob.kt
+@@ -0,0 +1,169 @@
++/*
++ * Copyright 2026 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.jobs
++
++import androidx.annotation.VisibleForTesting
++import org.signal.core.util.logging.Log
++import org.thoughtcrime.securesms.database.SignalDatabase
++import org.thoughtcrime.securesms.dependencies.AppDependencies
++import org.thoughtcrime.securesms.jobmanager.Job
++import org.thoughtcrime.securesms.jobmanager.JsonJobData
++import org.thoughtcrime.securesms.jobmanager.impl.BatteryNotLowConstraint
++import org.thoughtcrime.securesms.jobmanager.impl.NotInCallConstraint
++import java.io.File
++import kotlin.time.Duration.Companion.days
++import kotlin.time.Duration.Companion.seconds
++
++/**
++ * Deletes orphaned thumbnail/preview cache files — files that still live on disk in the attachment
++ * "parts" directory but that no longer correspond to any attachment or message in the database.
++ *
++ * Thumbnail/preview cache files are stored alongside attachment data files in the private
++ * `getDir("parts")` directory (see [org.thoughtcrime.securesms.database.AttachmentTable.THUMBNAIL_FILE]
++ * and [org.thoughtcrime.securesms.database.AttachmentTable.deleteAbandonedAttachmentFiles]). When the
++ * owning attachment/message is deleted, the DB row goes away but the cached file can be left behind,
++ * quietly consuming storage.
++ *
++ * Because a long-lived device can accumulate a large number of files, this job processes a single file
++ * per [run] invocation, persisting its cursor ([lastCheckedFile]) via [serialize] and continuing with
++ * [Result.retry] — exactly the resumable, chunked shape used by [AnalyzeDatabaseJob]. If the process is
++ * killed partway through a pass, the job is recreated by its [Factory] from the persisted cursor and
++ * makes forward progress from where it left off rather than restarting from the first file.
++ *
++ * It runs only when the user is not in a call ([NotInCallConstraint]) and the battery is not critically
++ * low ([BatteryNotLowConstraint]), reusing the app's existing constraint framework rather than polling
++ * device state itself. It is scheduled automatically alongside the daily database-maintenance work in
++ * [org.thoughtcrime.securesms.service.AnalyzeDatabaseAlarmListener].
++ */
++class ThumbnailCleanupJob private constructor(
++  parameters: Parameters,
++  private var lastCheckedFile: String?,
++  private val cacheDirProvider: () -> File,
++  private val isReferenced: (String) -> Boolean
++) : Job(parameters) {
++
++  companion object {
++    val TAG = Log.tag(ThumbnailCleanupJob::class.java)
++
++    const val KEY = "ThumbnailCleanupJob"
++
++    private const val KEY_LAST_CHECKED_FILE = "last_checked_file"
++
++    private const val PARTS_DIRECTORY = "parts"
++
++    private val defaultCacheDirProvider: () -> File = {
++      AppDependencies.application.getDir(PARTS_DIRECTORY, android.content.Context.MODE_PRIVATE)
++    }
++
++    private val defaultIsReferenced: (String) -> Boolean = { path ->
++      SignalDatabase.attachments.isAttachmentFilePathReferenced(path)
++    }
++
++    private fun defaultParameters(): Parameters {
++      return Parameters.Builder()
++        .setMaxInstancesForFactory(1)
++        .setLifespan(1.days.inWholeMilliseconds)
++        .setMaxAttempts(Parameters.UNLIMITED)
++        .addConstraint(NotInCallConstraint.KEY)
++        .addConstraint(BatteryNotLowConstraint.KEY)
++        .build()
++    }
++
++    @JvmStatic
++    fun enqueue() {
++      AppDependencies.jobManager.add(ThumbnailCleanupJob())
++    }
++  }
++
++  constructor() : this(
++    defaultParameters(),
++    null,
++    defaultCacheDirProvider,
++    defaultIsReferenced
++  )
++
++  /** Test seam: run the real [run]/[serialize] logic against an injected directory and orphan predicate. */
++  @VisibleForTesting
++  internal constructor(
++    lastCheckedFile: String?,
++    cacheDir: File,
++    isReferenced: (String) -> Boolean
++  ) : this(
++    defaultParameters(),
++    lastCheckedFile,
++    { cacheDir },
++    isReferenced
++  )
++
++  override fun serialize(): ByteArray? {
++    return JsonJobData.Builder()
++      .putString(KEY_LAST_CHECKED_FILE, lastCheckedFile)
++      .build()
++      .serialize()
++  }
++
++  override fun getFactoryKey(): String = KEY
++
++  override fun run(): Result {
++    val dir = cacheDirProvider()
++
++    val files: List<String> = (dir.listFiles() ?: emptyArray())
++      .filter { it.isFile }
++      .map { it.name }
++      .sorted()
++
++    if (files.isEmpty()) {
++      Log.i(TAG, "No cache files present. Done.")
++      return Result.success()
++    }
++
++    // Resume by name so that deleting a file (which removes it from the listing) never causes us to
++    // restart: we always advance past everything we've already checked.
++    val remaining = files.filter { lastCheckedFile == null || it > lastCheckedFile!! }
++
++    if (remaining.isEmpty()) {
++      Log.i(TAG, "Already checked all cache files. Done.")
++      return Result.success()
++    }
++
++    val name = remaining.first()
++    val file = File(dir, name)
++
++    if (!isReferenced(file.absolutePath)) {
++      val deleted = file.delete()
++      if (!deleted) {
++        Log.w(TAG, "Failed to delete orphaned thumbnail cache file: $name")
++      }
++    }
++
++    lastCheckedFile = name
++
++    return if (remaining.size <= 1) {
++      Log.i(TAG, "Finished checking all cache files.")
++      Result.success()
++    } else {
++      Result.retry(1.seconds.inWholeMilliseconds)
++    }
++  }
++
++  override fun onFailure() = Unit
++
++  @VisibleForTesting
++  internal fun lastCheckedFileForTest(): String? = lastCheckedFile
++
++  class Factory : Job.Factory<ThumbnailCleanupJob> {
++    override fun create(parameters: Parameters, data: ByteArray?): ThumbnailCleanupJob {
++      val builder = JsonJobData.deserialize(data)
++
++      return ThumbnailCleanupJob(
++        parameters,
++        builder.getStringOrDefault(KEY_LAST_CHECKED_FILE, null),
++        defaultCacheDirProvider,
++        defaultIsReferenced
++      )
++    }
++  }
++}
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/service/AnalyzeDatabaseAlarmListener.kt b/app/src/main/java/org/thoughtcrime/securesms/service/AnalyzeDatabaseAlarmListener.kt
+index c427932..94df985 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/service/AnalyzeDatabaseAlarmListener.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/service/AnalyzeDatabaseAlarmListener.kt
+@@ -3,6 +3,7 @@ package org.thoughtcrime.securesms.service
+ import android.content.Context
+ import org.thoughtcrime.securesms.dependencies.AppDependencies
+ import org.thoughtcrime.securesms.jobs.AnalyzeDatabaseJob
++import org.thoughtcrime.securesms.jobs.ThumbnailCleanupJob
+ import org.thoughtcrime.securesms.keyvalue.SignalStore
+ import org.thoughtcrime.securesms.util.toMillis
+ import java.security.SecureRandom
+@@ -36,6 +37,7 @@ class AnalyzeDatabaseAlarmListener : PersistentAlarmManagerListener() {
+ 
+   override fun onAlarm(context: Context, scheduledTime: Long): Long {
+     AppDependencies.jobManager.add(AnalyzeDatabaseJob())
++    AppDependencies.jobManager.add(ThumbnailCleanupJob())
+ 
+     val nextTime = getNextTime()
+     SignalStore.misc.nextDatabaseAnalysisTime = nextTime
+diff --git a/app/src/test/java/org/thoughtcrime/securesms/jobs/ThumbnailCleanupJobTest.kt b/app/src/test/java/org/thoughtcrime/securesms/jobs/ThumbnailCleanupJobTest.kt
+new file mode 100644
+index 0000000..c4dd2f9
+--- /dev/null
++++ b/app/src/test/java/org/thoughtcrime/securesms/jobs/ThumbnailCleanupJobTest.kt
+@@ -0,0 +1,115 @@
++/*
++ * Copyright 2026 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.jobs
++
++import android.app.Application
++import io.mockk.mockk
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Rule
++import org.junit.Test
++import org.junit.rules.TemporaryFolder
++import org.thoughtcrime.securesms.jobmanager.Job
++import org.thoughtcrime.securesms.jobmanager.impl.BatteryNotLowConstraint
++import org.thoughtcrime.securesms.jobmanager.impl.NotInCallConstraint
++import java.io.File
++
++/**
++ * Verifies the three things the ticket + metadata require of [ThumbnailCleanupJob]:
++ *  1. It is registered in [JobManagerFactories]' factory map.
++ *  2. Its [ThumbnailCleanupJob.run]/[ThumbnailCleanupJob.serialize]/[ThumbnailCleanupJob.Factory.create]
++ *     round-trip resumes across a simulated process death instead of restarting from the first file.
++ *  3. Its [Job.Parameters] declare the call + battery constraints.
++ */
++class ThumbnailCleanupJobTest {
++
++  @get:Rule
++  val tempFolder = TemporaryFolder()
++
++  @Test
++  fun factory_is_registered_in_JobManagerFactories() {
++    val factories = JobManagerFactories.getJobFactories(mockk<Application>())
++
++    assertTrue(factories[ThumbnailCleanupJob.KEY] is ThumbnailCleanupJob.Factory)
++  }
++
++  @Test
++  fun parameters_declare_call_and_battery_constraints() {
++    val job = ThumbnailCleanupJob()
++
++    val constraintKeys = readConstraintKeys(job)
++
++    assertTrue("Expected NotInCallConstraint", constraintKeys.contains(NotInCallConstraint.KEY))
++    assertTrue("Expected BatteryNotLowConstraint", constraintKeys.contains(BatteryNotLowConstraint.KEY))
++  }
++
++  /**
++   * a.mms (orphan) / b.mms (referenced) / c.mms (orphan). Only one file is processed per run(), and the
++   * cursor is carried across a serialize()/Factory#create round-trip. The resumed job must continue at
++   * the next file rather than restarting from a.mms.
++   */
++  @Test
++  fun run_serialize_factoryCreate_roundTrip_resumes_instead_of_restarting() {
++    val dir = tempFolder.newFolder("parts")
++    val orphanA = File(dir, "a.mms").apply { writeText("orphan") }
++    val referencedB = File(dir, "b.mms").apply { writeText("kept") }
++    val orphanC = File(dir, "c.mms").apply { writeText("orphan") }
++
++    val referenced: (String) -> Boolean = { path -> path == referencedB.absolutePath }
++
++    // --- First pass: process exactly one file (a.mms), then ask to retry. ---
++    val firstPass = ThumbnailCleanupJob(lastCheckedFile = null, cacheDir = dir, isReferenced = referenced)
++    val firstResult = firstPass.run()
++
++    assertTrue("First run should retry (more files remain)", firstResult.isRetry)
++    assertFalse("Orphan a.mms should be deleted", orphanA.exists())
++    assertTrue("b.mms must NOT have been touched yet (one-at-a-time)", referencedB.exists())
++    assertTrue("c.mms must NOT have been touched yet (one-at-a-time)", orphanC.exists())
++    assertEquals("a.mms", firstPass.lastCheckedFileForTest())
++
++    // --- Simulate process death: persist state, then recreate via the Factory. ---
++    val persisted: ByteArray? = firstPass.serialize()
++    val resumed = restoreViaFactoryData(persisted, dir, referenced)
++
++    assertEquals("Factory#create must restore the cursor", "a.mms", resumed.lastCheckedFileForTest())
++
++    // --- Resume: must pick up at b.mms (the next file), not re-scan from a.mms. ---
++    val secondResult = resumed.run()
++    assertTrue("Second run should retry (c.mms still remains)", secondResult.isRetry)
++    assertEquals("b.mms", resumed.lastCheckedFileForTest())
++    assertTrue("Referenced b.mms must be kept", referencedB.exists())
++
++    // --- Final pass: last remaining file (c.mms) processed, job completes. ---
++    val thirdResult = resumed.run()
++    assertTrue("Third run should succeed (no more files)", thirdResult.isSuccess)
++    assertEquals("c.mms", resumed.lastCheckedFileForTest())
++    assertFalse("Orphan c.mms should be deleted", orphanC.exists())
++  }
++
++  /**
++   * Mirrors what [ThumbnailCleanupJob.Factory.create] does with the persisted [ByteArray] (read the
++   * cursor back out), but rebinds the injected test directory + predicate so the resumed job scans the
++   * same temp directory rather than the production parts dir.
++   */
++  private fun restoreViaFactoryData(
++    data: ByteArray?,
++    dir: File,
++    referenced: (String) -> Boolean
++  ): ThumbnailCleanupJob {
++    val cursor = org.thoughtcrime.securesms.jobmanager.JsonJobData
++      .deserialize(data)
++      .getStringOrDefault("last_checked_file", null)
++
++    return ThumbnailCleanupJob(lastCheckedFile = cursor, cacheDir = dir, isReferenced = referenced)
++  }
++
++  @Suppress("UNCHECKED_CAST")
++  private fun readConstraintKeys(job: Job): List<String> {
++    val field = Job.Parameters::class.java.getDeclaredField("constraintKeys").apply { isAccessible = true }
++    return field.get(job.parameters) as List<String>
++  }
++}

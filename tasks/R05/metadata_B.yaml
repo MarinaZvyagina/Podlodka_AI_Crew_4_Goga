@@ -1,0 +1,71 @@
+task_id: R05-TB
+repository: VictoriaMetrics/VictoriaMetrics
+commit: f65ae841ace8f686ddc0dc17fe936d0bf38e568c
+category: cross_module_feature
+
+functional_requirements:
+  - "A configurable maximum number of active scrape targets per job_name exists, defaulting to unlimited/off so existing deployments are unaffected."
+  - "When a job's discovered target count exceeds the configured maximum, scraping continues for only up to that many targets for that job (the process must not crash or drop the whole job)."
+  - "The limit is enforced identically regardless of which service-discovery mechanism produced the targets for that job_name (kubernetes_sd_configs, ec2_sd_configs, consul_sd_configs, static_configs, etc. all funnel through the same enforcement point)."
+  - "Jobs currently over the limit, and an indication of how many targets are being excluded, are visible through the existing scrape-target status surfaces (the human-readable /targets page and the /api/v1/targets JSON API already served by app/vmagent/main.go via promscrape.WriteHumanReadableTargetsStatus / promscrape.WriteAPIV1Targets), not a new bespoke endpoint."
+  - "Tests cover: a job under the limit (unaffected), a job over the limit (truncated and visible in status output), and default/unlimited behavior (no change)."
+
+architectural_constraints:
+  - "Flags/config for this feature live in lib/promscrape (the package that already defines all other promscrape.* command-line flags, e.g. noStaleMarkers, seriesLimitPerTarget, maxScrapeSize in lib/promscrape/config.go) - app/vmagent/main.go must not declare its own competing flag for the same concern; it only imports and calls into lib/promscrape."
+  - "Enforcement must sit in the shared scrape-work assembly path used by every discovery mechanism - concretely, cfg.getScrapeWorkGeneric / appendScrapeWorkForTargetLabels in lib/promscrape/config.go, which every getXXXSDScrapeWork function (getAzureSDScrapeWork, getConsulSDScrapeWork, getKubernetesSDScrapeWork, etc.) already funnels through - not duplicated per-backend inside each lib/promscrape/discovery/<name> package."
+  - "Status/visibility must reuse the existing target-status tracking data structures in lib/promscrape/targetstatus.go (tsmGlobal and the existing droppedTargets mechanism backing -promscrape.maxDroppedTargets) rather than introducing a second, parallel status-tracking mechanism."
+  - "HTTP exposition stays in app/vmagent/main.go's existing route handlers for target status (WriteHumanReadableTargetsStatus, WriteAPIV1Targets) - no new standalone HTTP endpoint should be required to see which jobs are over the limit."
+
+required_existing_abstractions:
+  - "cfg.getScrapeWorkGeneric / appendScrapeWorkForTargetLabels - lib/promscrape/config.go (shared assembly path used by every *_sd_configs type)"
+  - "targetLabelsGetter-driven get*SDScrapeWork functions - lib/promscrape/config.go"
+  - "tsmGlobal / target status tracking - lib/promscrape/targetstatus.go"
+  - "WriteHumanReadableTargetsStatus / WriteAPIV1Targets route handlers - app/vmagent/main.go"
+
+allowed_dependencies:
+  - "lib/promscrape internal helpers (ScrapeWork, ScrapeConfig, targetstatus.go structures)"
+  - "lib/logger for warnings when a job is truncated"
+
+forbidden_dependencies:
+  - "Individual lib/promscrape/discovery/<backend> packages must not each grow their own per-backend target-count limiting logic (that would duplicate the check 22 times and could drift out of sync between backends)"
+  - "app/vminsert, app/vmselect, lib/storage must not be touched - this is purely a scrape-side concern and must not leak into the ingestion/storage layers"
+
+expected_extension_points: []
+
+public_api_constraints:
+  - "The existing /api/v1/targets JSON schema should be extended additively (e.g. an added field per target group) rather than restructured, so existing consumers (Grafana, scripts) do not break."
+
+functional_check_command: "go test ./lib/promscrape/... ./app/vmagent/... ; manually run vmagent with a static_configs job listing more targets than a low configured limit and confirm /api/v1/targets and /targets show the job as truncated with a count of excluded targets"
+architecture_check_command: "grep -n 'func.*getScrapeWorkGeneric|appendScrapeWorkForTargetLabels' lib/promscrape/config.go to confirm the enforcement call site sits in the shared path; grep -rn '<new-flag-name>' --include=*.go . to confirm the flag is declared exactly once, inside lib/promscrape"
+
+architecture_checks:
+  - id: AC1
+    description: "The limit is enforced once, in the shared scrape-work assembly path, not per discovery backend."
+    method: "Manual code review of the diff: locate where the new limiting logic runs; confirm it is a single call site touching cfg.getScrapeWorkGeneric / appendScrapeWorkForTargetLabels (or an equivalent single shared function), not edits spread across lib/promscrape/discovery/*/*.go."
+    expected_result_if_correct: "One enforcement point in lib/promscrape/config.go (or a function it calls) that every get*SDScrapeWork path passes through."
+    expected_result_if_trap: "Per-backend edits scattered across multiple lib/promscrape/discovery/<name> packages, or the limit implemented only for one or two discovery types (e.g. only kubernetes) instead of generically."
+  - id: AC2
+    description: "New flag lives in lib/promscrape, not duplicated/redefined in app/vmagent."
+    method: "grep -rn 'flag\\.' app/vmagent/main.go lib/promscrape/*.go for the new flag name; expect exactly one flag declaration, inside lib/promscrape."
+    expected_result_if_correct: "Single flag declaration inside lib/promscrape/config.go or lib/promscrape/scraper.go."
+    expected_result_if_trap: "Flag declared in app/vmagent/main.go with app/vmagent implementing its own truncation logic on top of promscrape's public API, bypassing lib/promscrape's internal target list construction."
+  - id: AC3
+    description: "Status visibility reuses lib/promscrape/targetstatus.go rather than a new tracking structure."
+    method: "Manual review of the diff to targetstatus.go / WriteHumanReadableTargetsStatus / WriteAPIV1Targets vs. any newly introduced status-tracking types."
+    expected_result_if_correct: "Existing tsmGlobal-based structures extended with the new drop-count/limited info; existing HTTP handlers extended to render it."
+    expected_result_if_trap: "A brand-new package-level map/struct tracking jobs-over-limit independent of tsmGlobal, exposed via a newly added HTTP route in app/vmagent/main.go instead of extending /targets or /api/v1/targets."
+  - id: AC4
+    description: "No leakage into ingestion/storage layers."
+    method: "git diff --stat against the pinned commit; confirm no changes under app/vminsert/, app/vmselect/, lib/storage/."
+    expected_result_if_correct: "Diff touches only lib/promscrape/** and app/vmagent/** (plus docs/tests)."
+    expected_result_if_trap: "Changes bleed into app/vminsert or lib/storage (e.g. trying to rate-limit at the remote-write receiving end instead of at scrape-target-list construction time)."
+
+notes_for_positive_negative_control: >
+  Positive control: add the flag and a truncation function inside lib/promscrape/config.go that
+  is invoked from getScrapeWorkGeneric (or immediately after all get*SDScrapeWork results are
+  merged), record drop info into the existing targetstatus.go structures, and extend the
+  existing /targets and /api/v1/targets renderers to show it. Negative control: implement the
+  cap by editing only lib/promscrape/discovery/kubernetes (the most commonly demoed backend) to
+  self-truncate its own GetLabels() result, leaving all 21 other backends unbounded, and expose
+  the truncated-job list via a brand-new ad hoc /api/v1/limited_jobs endpoint added directly in
+  app/vmagent/main.go - this can pass a Kubernetes-only functional test while failing AC1 and AC3.

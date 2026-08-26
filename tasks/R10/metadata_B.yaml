@@ -1,0 +1,85 @@
+task_id: R10-TB
+repository: signalapp/Signal-iOS
+commit: 6e3a059f752785b349d5938dfa4c36f216fb0ae3
+category: cross_module_feature
+
+functional_requirements:
+  - Within an already-open conversation's search, the user can switch to (or additionally apply) an "attachments only" mode/filter that returns only messages containing a photo, video, voice message, or file attachment.
+  - Filtered results integrate with the existing in-conversation search results navigation (SearchResultsBar / previous-next jump) rather than opening a separate screen.
+  - Works for both 1:1 (TSContactThread) and group (TSGroupThread) conversations, matching how unfiltered search already handles `isGroupThread`.
+  - Unfiltered text search behavior (Signal/ConversationView/ConversationSearch.swift, SignalUI/Search/FullTextSearcher.swift searchWithinConversation, SignalServiceKit/Search/FullTextSearchIndexer.swift) is unchanged when the filter is off.
+  - Attachment presence is derived from current attachment state at query time (no separately-maintained, independently-updated index that can go stale relative to the attachments table).
+
+architectural_constraints:
+  - Query/orchestration logic for the new filter belongs in SignalUI/Search/FullTextSearcher.swift, extending `searchWithinConversation(threadUniqueId:isGroupThread:searchText:...)`, in the same layering style as the existing mention-search logic there (which itself calls into SignalServiceKit/Search/FullTextSearchIndexer.swift and SearchableNameFinder).
+  - Attachment-presence determination must go through the existing attachment storage abstraction in SignalServiceKit (e.g. `TSMessage.hasBodyAttachments(transaction:)` / `DependenciesBridge.shared.attachmentStore.fetchReferences(owners:...)` in SignalServiceKit/Messages/Interactions/TSMessage.swift), not by reading files from disk, duplicating attachment-lookup SQL, or hardcoding mime-type checks against unrelated fields.
+  - Presentation of the filter control belongs in the Signal app target's conversation search UI (Signal/ConversationView/ConversationSearch.swift and its results bar), not inside SignalServiceKit or SignalUI's data layer.
+  - No new dependency edge from SignalServiceKit to SignalUI or to the Signal app target may be introduced (SignalServiceKit must stay UI-agnostic).
+  - No new persisted database table, migration, or standalone search index should be introduced solely for this filter; it must be computed from the existing attachments/messages schema at query time (or via the existing FTS index plus the existing attachment reference store).
+
+required_existing_abstractions:
+  - "FullTextSearcher.searchWithinConversation — SignalUI/Search/FullTextSearcher.swift"
+  - "FullTextSearchIndexer.search — SignalServiceKit/Search/FullTextSearchIndexer.swift"
+  - "TSMessage.hasBodyAttachments(transaction:) / AttachmentStore.fetchReferences — SignalServiceKit/Messages/Interactions/TSMessage.swift"
+  - "ConversationSearchController / SearchResultsBar / ConversationScreenSearchResultSet — Signal/ConversationView/ConversationSearch.swift"
+
+allowed_dependencies:
+  - "Signal app target -> SignalUI (existing; ConversationSearch.swift already imports SignalUI)"
+  - "Signal app target -> SignalServiceKit (existing)"
+  - "SignalUI -> SignalServiceKit (existing; FullTextSearcher already depends on SignalServiceKit types)"
+
+forbidden_dependencies:
+  - "SignalServiceKit -> SignalUI: would invert the established one-directional layering (verified: no SignalServiceKit file imports SignalUI in this repo)."
+  - "SignalServiceKit -> Signal app target: same reasoning; search/business logic must remain host-app-agnostic since SignalServiceKit is also linked into the share extension and notification service extension targets."
+  - "Direct file-system / raw-SQL attachment lookups from Signal/ConversationView UI code, bypassing AttachmentStore."
+
+expected_extension_points: []
+
+public_api_constraints:
+  - "ConversationSearchControllerDelegate and related public protocols in ConversationSearch.swift should be extended (e.g. new optional filter-state parameter) rather than replaced, so existing call sites don't need unrelated rewrites."
+  - "FullTextSearcher.searchWithinConversation's existing signature/callers should keep working (e.g. via a new parameter with a default value), since it's `public` API within SignalUI."
+
+functional_check_command: >
+  Manual/code-level check: confirm searchWithinConversation gained a way to request attachment-only filtering (new
+  parameter or a sibling method), confirm it is wired from ConversationSearchController's UISearchResultsUpdating
+  implementation through to SearchResultsBar, and confirm the returned ConversationScreenSearchResultSet only contains
+  messages for which attachment-presence was checked via the attachment store abstraction.
+
+architecture_check_command: >
+  Manual diff review against AC1-AC4; also run `grep -rn "import SignalUI" SignalServiceKit/` and
+  `grep -rn "import Signal$" SignalServiceKit/` style checks (adapted to the actual changed files) to confirm no new
+  reverse import was introduced.
+
+architecture_checks:
+  - id: AC1
+    description: "No new reverse dependency edge (SignalServiceKit importing SignalUI or the Signal app target)."
+    method: "grep the diff for new `import SignalUI` or app-target imports inside any file under SignalServiceKit/."
+    expected_result_if_correct: "Zero such imports; all SignalUI/Signal-target changes stay in SignalUI/ and Signal/ directories."
+    expected_result_if_trap: "A file under SignalServiceKit/ (e.g. FullTextSearchIndexer.swift) adds `import SignalUI` or references UIKit/presentation types to support the filter."
+  - id: AC2
+    description: "Attachment presence is determined via the existing attachment storage abstraction, not reimplemented."
+    method: "grep the diff for calls to `hasBodyAttachments`, `attachmentStore.fetchReferences`, or an equivalent existing AttachmentStore/AttachmentReference API; grep for new raw SQL (`sql:` / `Database.query`) or `FileManager` attachment-existence checks added specifically for this feature."
+    expected_result_if_correct: "The new filter logic calls into the existing attachment store/finder API; no new raw SQL or filesystem probing was added."
+    expected_result_if_trap: "New code queries the attachments table directly with hand-written SQL, or checks whether a locally-cached file exists on disk, instead of reusing AttachmentStore/TSMessage.hasBodyAttachments."
+  - id: AC3
+    description: "Filter orchestration lives in FullTextSearcher.swift (SignalUI), not duplicated ad hoc inside the view/controller layer."
+    method: "Diff review of Signal/ConversationView/ConversationSearch.swift: confirm it only toggles a mode/parameter and passes it to `dbSearcher.searchWithinConversation(...)`, rather than independently querying TSMessage/attachments itself."
+    expected_result_if_correct: "ConversationSearchController remains a thin UI-driving layer: it forwards filter state into FullTextSearcher and renders whatever ConversationScreenSearchResultSet comes back."
+    expected_result_if_trap: "ConversationSearchController (or a new view) fetches messages/attachments itself (e.g. via SSKEnvironment.shared.databaseStorageRef.read directly with bespoke filtering logic) instead of delegating to FullTextSearcher, duplicating query logic outside the search layer."
+  - id: AC4
+    description: "No new standalone search index/table introduced; feature reuses existing FTS + attachment schema."
+    method: "grep the diff for new GRDB migrations, new database tables, or a newly created in-memory/duplicate search index dedicated to this filter."
+    expected_result_if_correct: "No schema/migration changes; filtering is done by intersecting FullTextSearchIndexer results (or a full conversation message scan) with attachment-presence checks at query time."
+    expected_result_if_trap: "A new persisted table or migration is added purely to track 'messages with attachments' as a denormalized cache, introducing a second source of truth that can drift from the real attachments data."
+
+notes_for_positive_negative_control: >
+  Positive control: extend `FullTextSearcher.searchWithinConversation` with an `attachmentsOnly: Bool` (or similar)
+  parameter; when true, after gathering candidate messages (either via FullTextSearchIndexer.search with an
+  empty/wildcard query scoped to the thread, or by enumerating the thread's interactions) filter using
+  `message.hasBodyAttachments(transaction:)`, then wire a segmented-control-style toggle in
+  ConversationSearchController through to that parameter. Negative/trap control: add the "attachments only" toggle in
+  ConversationSearchController, but implement the actual filtering inside the Signal app target by calling
+  `SSKEnvironment.shared.databaseStorageRef.read` and manually joining raw interaction rows against a hand-rolled
+  attachment existence check (e.g. checking `TSAttachment`/file paths directly) — this can pass a shallow "results are
+  filtered" functional test while failing AC2 and AC3 (duplicated, UI-layer business logic bypassing the
+  SignalServiceKit attachment abstraction and the SignalUI search layer).

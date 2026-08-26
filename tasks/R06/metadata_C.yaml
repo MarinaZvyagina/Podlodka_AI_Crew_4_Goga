@@ -1,0 +1,80 @@
+task_id: R06-TC
+repository: etcd-io/etcd
+commit: 23a4e406a2e70a807486b4c40a9e24da493886bf
+category: existing_extension_point
+
+functional_requirements:
+  - "Every Range, Put, DeleteRange, and Txn request handled by the gRPC server produces an audit record containing: caller identity (username if auth is enabled and available, otherwise an explicit 'unauthenticated' marker), operation kind, key/range involved, duration, and success/failure outcome."
+  - "Coverage is uniform: all four KV RPC methods are covered by the same mechanism, without a distinct hand-written logging call added inside each handler's business logic."
+  - "The mechanism does not alter the response content or semantics of Range/Put/DeleteRange/Txn."
+  - "Existing per-request debug/warning logging (already present for expensive or debug-level requests) keeps working."
+
+architectural_constraints:
+  - "The repository already registers a chain of cross-cutting per-request mechanisms exactly once for the whole KV/Lease/Watch/Auth gRPC surface: server/etcdserver/api/v3rpc/grpc.go builds `chainUnaryInterceptors := []grpc.UnaryServerInterceptor{ newLogUnaryInterceptor(s), serverMetrics.UnaryServerInterceptor(), newUnaryInterceptor(s) }` and installs it once via `grpc.ChainUnaryInterceptor(...)` for the whole grpc.Server, before any individual RPC method is invoked."
+  - "server/etcdserver/api/v3rpc/interceptor.go's `newLogUnaryInterceptor` / `logUnaryRequestStats` already implement exactly this kind of uniform, type-switch-based per-request instrumentation across *pb.RangeResponse, *pb.PutResponse, *pb.DeleteRangeResponse, *pb.TxnResponse in one place, without touching key.go's handler bodies."
+  - "The new audit mechanism must be added as another entry in that same chain (or by extending the existing logging interceptor), not as new logging statements added individually inside server/etcdserver/api/v3rpc/key.go's Range/Put/DeleteRange/Txn methods or inside server/etcdserver/v3_server.go."
+  - "Caller identity should be obtained the way the rest of the v3rpc package already does it — via AuthInfoFromCtx(ctx) (used e.g. by AuthAdmin.isPermitted in server/etcdserver/api/v3rpc/auth.go) — rather than re-parsing gRPC metadata/tokens from scratch."
+  - "Must not introduce a second, parallel wrapper mechanism (e.g. a new struct embedding pb.KVServer similar to quotaKVServer in server/etcdserver/api/v3rpc/quota.go) solely to add audit logging, when the interceptor chain already exists and is method-agnostic."
+
+required_existing_abstractions:
+  - "grpc.UnaryServerInterceptor chain registered in server/etcdserver/api/v3rpc/grpc.go (chainUnaryInterceptors / grpc.ChainUnaryInterceptor)"
+  - "server/etcdserver/api/v3rpc/interceptor.go: newLogUnaryInterceptor / logUnaryRequestStats type-switch pattern"
+  - "AuthInfoFromCtx (server/etcdserver/server.go, used via the AuthGetter interface in server/etcdserver/api/v3rpc/auth.go)"
+
+allowed_dependencies:
+  - "server/etcdserver/api/v3rpc (interceptor.go, grpc.go)"
+  - "server/auth (AuthInfo / AuthInfoFromCtx)"
+  - "go.uber.org/zap (already used for logging in this package)"
+
+forbidden_dependencies:
+  - "server/etcdserver/api/v3rpc/key.go must not gain new per-method audit/logging call sites — that duplicates logic the interceptor chain is meant to centralize and will silently miss future RPC methods."
+  - "server/etcdserver/v3_server.go must not gain new per-method audit/logging call sites for the same reason."
+  - "No new decorator type mirroring quotaKVServer (server/etcdserver/api/v3rpc/quota.go) should be introduced purely to bolt on audit logging alongside the existing interceptor mechanism."
+
+expected_extension_points:
+  - "server/etcdserver/api/v3rpc/interceptor.go: newLogUnaryInterceptor and the chainUnaryInterceptors registration in server/etcdserver/api/v3rpc/grpc.go (Server() function) — verified via direct code reading of both files at the pinned commit."
+
+public_api_constraints:
+  - "No change to any RPC request/response proto message is required; the audit trail is a side effect observed via server logs/metrics, not a new API field."
+
+functional_check_command: "Integration test issuing one Range, one Put, one DeleteRange, and one Txn (with auth enabled and a known user) against a running (embedded) etcd server, then asserting an audit record exists for each of the four calls with correct fields (username, op kind, key, duration>0, outcome). Suggested location/command: cd tests && go test ./integration/... -run TestV3AuditTrail -v (test to be added, modeled on the auth setup in tests/integration/v3_auth_test.go)."
+
+architecture_check_command: "grep -n 'chainUnaryInterceptors' server/etcdserver/api/v3rpc/grpc.go — confirm a new interceptor was added to this slice (or newLogUnaryInterceptor extended) and NOT that key.go/v3_server.go handler bodies changed; grep -n 'AuthInfoFromCtx' across the diff to confirm identity reuse; grep -n 'type .*Server struct' server/etcdserver/api/v3rpc/*.go for any new pb.KVServer-embedding wrapper type introduced only for audit logging"
+
+architecture_checks:
+  - id: AC1
+    description: "Audit mechanism is registered once, centrally, in the existing interceptor chain."
+    method: "Diff review of server/etcdserver/api/v3rpc/grpc.go's Server() function / chainUnaryInterceptors slice."
+    expected_result_if_correct: "A new interceptor function is added to chainUnaryInterceptors (or newLogUnaryInterceptor is extended in place)."
+    expected_result_if_trap: "grpc.go is unchanged; audit behavior instead comes from new code scattered across key.go/v3_server.go."
+  - id: AC2
+    description: "No per-method duplication inside the KV gRPC handlers."
+    method: "grep/diff review of server/etcdserver/api/v3rpc/key.go and server/etcdserver/v3_server.go for newly added logging/audit calls."
+    expected_result_if_correct: "Range/Put/DeleteRange/Txn method bodies in key.go are unchanged (or changed only incidentally, not for audit purposes)."
+    expected_result_if_trap: "Each of Range/Put/DeleteRange/Txn in key.go individually gained a new audit-logging call at its start/end."
+  - id: AC3
+    description: "No second parallel per-RPC wrapper mechanism introduced."
+    method: "grep for new struct types embedding pb.KVServer / pb.LeaseServer (the pattern used by quotaKVServer in quota.go) registered via pb.Register*Server in grpc.go."
+    expected_result_if_correct: "No new such wrapper type exists solely for audit logging; pb.RegisterKVServer(grpcServer, NewQuotaKVServer(s)) (or equivalent) is unchanged apart from what quota already does."
+    expected_result_if_trap: "A new `auditKVServer` (or similarly named) struct embedding pb.KVServer is added and registered instead of using the interceptor chain."
+  - id: AC4
+    description: "Caller identity is obtained via the existing AuthInfoFromCtx path."
+    method: "grep for AuthInfoFromCtx usage in the new/changed code, vs. any new manual metadata/token parsing."
+    expected_result_if_correct: "New code calls AuthInfoFromCtx(ctx) (or an equivalent already-existing accessor) to get the username."
+    expected_result_if_trap: "New code re-implements token/metadata extraction independently (e.g., reading grpc metadata keys or JWT claims directly) instead of reusing AuthInfoFromCtx."
+  - id: AC5
+    description: "Coverage is genuinely uniform across all four KV RPC kinds without per-type special-casing spread across multiple files."
+    method: "Integration test exercising Range/Put/DeleteRange/Txn and confirming an audit record for each; code review confirming the type-switch (or equivalent) lives in one function/file."
+    expected_result_if_correct: "All four operation kinds produce audit records via one shared code path; adding a hypothetical fifth KV RPC would only require extending that one type switch."
+    expected_result_if_trap: "Only some operation kinds (e.g. Put and DeleteRange but not Range or Txn) are actually covered, because logging calls were added ad hoc to only some handler methods."
+
+notes_for_positive_negative_control: >
+  Positive control: adds a new unary interceptor (or extends newLogUnaryInterceptor) in
+  server/etcdserver/api/v3rpc/interceptor.go that type-switches on the response the same way the
+  existing logging code does, pulls the username via AuthInfoFromCtx(ctx), and appends it to
+  chainUnaryInterceptors in grpc.go — key.go and v3_server.go are untouched. Negative control:
+  adds an `audit(...)` call at the top of each of kvServer.Range/Put/DeleteRange/Txn in key.go (or
+  wraps pb.KVServer in a brand-new `auditKVServer` decorator parallel to quotaKVServer), which
+  passes a shallow functional test that only exercises Put and Range, but silently misses Txn (or
+  any future RPC method) because the audit call wasn't added there too — a class of bug the
+  centralized interceptor mechanism structurally prevents.

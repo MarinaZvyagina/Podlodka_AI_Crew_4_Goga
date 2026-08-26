@@ -1,0 +1,474 @@
+diff --git a/server/storage/mvcc/kvstore.go b/server/storage/mvcc/kvstore.go
+index a9cb65c..8a1f7c3 100644
+--- a/server/storage/mvcc/kvstore.go
++++ b/server/storage/mvcc/kvstore.go
+@@ -20,6 +20,7 @@ import (
+ 	"fmt"
+ 	"math"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"go.uber.org/zap"
+@@ -79,6 +80,30 @@ type store struct {
+ 
+ 	lg     *zap.Logger
+ 	hashes HashStorage
++
++	// rangeCache implements a read-through cache for repeated, identical
++	// Range requests, keyed by (key, end, options, revision) -- see
++	// range_cache.go. rangeCache may be nil (e.g. stores built directly
++	// via struct literal in tests), which simply disables caching: reads
++	// fall back to the uncached path.
++	rangeCache *rangeCache
++	// compactRevAtomic mirrors compactMainRev so rangeCache can validate
++	// a cached revision against it without taking revMu on every Range
++	// call. It must be kept in sync with compactMainRev by always going
++	// through setCompactMainRev.
++	compactRevAtomic atomic.Int64
++}
++
++// setCompactMainRev updates compactMainRev (the caller must already hold
++// revMu for write, per the existing locking convention for that field),
++// keeps compactRevAtomic in sync, and drops the entire Range cache: once
++// compactMainRev advances, any cache entry for a revision below it would
++// describe data that's now physically gone, so there is nothing
++// (correctness-wise) lost by starting the cache fresh.
++func (s *store) setCompactMainRev(rev int64) {
++	s.compactMainRev = rev
++	s.compactRevAtomic.Store(rev)
++	s.rangeCache.clear()
+ }
+ 
+ // NewStore returns a new store. It is useful to create a store inside
+@@ -109,8 +134,11 @@ func NewStore(lg *zap.Logger, b backend.Backend, le lease.Lessor, cfg StoreConfi
+ 		stopc: make(chan struct{}),
+ 
+ 		lg: lg,
++
++		rangeCache: newRangeCache(),
+ 	}
+ 	s.hashes = NewHashStorage(lg, s)
++	s.compactRevAtomic.Store(s.compactMainRev)
+ 	s.ReadView = &readView{s}
+ 	s.WriteView = &writeView{s}
+ 	if s.le != nil {
+@@ -208,7 +236,7 @@ func (s *store) updateCompactRev(rev int64) (<-chan struct{}, int64, error) {
+ 		return nil, 0, ErrFutureRev
+ 	}
+ 	compactMainRev := s.compactMainRev
+-	s.compactMainRev = rev
++	s.setCompactMainRev(rev)
+ 
+ 	SetScheduledCompact(s.b.BatchTx(), rev)
+ 	// ensure that desired compaction is persisted
+@@ -303,7 +331,7 @@ func (s *store) Restore(b backend.Backend) error {
+ 		// During restore the metrics might report 'special' values
+ 		s.revMu.Lock()
+ 		s.currentRev = 1
+-		s.compactMainRev = -1
++		s.setCompactMainRev(-1)
+ 		s.revMu.Unlock()
+ 	}
+ 
+@@ -330,7 +358,7 @@ func (s *store) restore() error {
+ 	finishedCompact, found := UnsafeReadFinishedCompact(tx)
+ 	if found {
+ 		s.revMu.Lock()
+-		s.compactMainRev = finishedCompact
++		s.setCompactMainRev(finishedCompact)
+ 
+ 		s.lg.Info(
+ 			"restored last compact revision",
+diff --git a/server/storage/mvcc/kvstore_txn.go b/server/storage/mvcc/kvstore_txn.go
+index f46c797..7f9bd24 100644
+--- a/server/storage/mvcc/kvstore_txn.go
++++ b/server/storage/mvcc/kvstore_txn.go
+@@ -67,7 +67,28 @@ func (tr *storeTxnCommon) FirstRev() int64 { return tr.firstRev }
+ func (tr *storeTxnCommon) Rev() int64      { return tr.rev }
+ 
+ func (tr *storeTxnCommon) Range(ctx context.Context, key, end []byte, ro RangeOptions) (r *RangeResult, err error) {
+-	return tr.rangeKeys(ctx, key, end, tr.Rev(), ro)
++	// Consult the revision-validated read-through cache before doing the
++	// real index/backend lookup. curRev is *this* read transaction's own
++	// snapshot revision (tr.rev, fixed when the txn was opened) -- using
++	// it, rather than some separately-tracked "live" counter, is what
++	// keeps the cache correct for a long-lived read transaction that was
++	// opened before a concurrent write commits: it must keep seeing its
++	// own snapshot, and it naturally will, because it can only ever hit
++	// (or populate) cache entries keyed under its own revision.
++	// compactRev is read lock-free since it only gates whether a
++	// revision is still safe to serve from the cache at all.
++	curRev := tr.Rev()
++	compactRev := tr.s.compactRevAtomic.Load()
++	if cached, ok := tr.s.rangeCache.get(key, end, ro, curRev, compactRev); ok {
++		tr.trace.Step("range keys from cache")
++		return cached, nil
++	}
++
++	r, err = tr.rangeKeys(ctx, key, end, curRev, ro)
++	if err == nil {
++		tr.s.rangeCache.put(key, end, ro, curRev, compactRev, r)
++	}
++	return r, err
+ }
+ 
+ func (tr *storeTxnCommon) rangeKeys(ctx context.Context, key, end []byte, curRev int64, ro RangeOptions) (*RangeResult, error) {
+@@ -212,6 +233,11 @@ func (tw *storeTxnWrite) End() {
+ 		// hold revMu lock to prevent new read txns from opening until writeback.
+ 		tw.s.revMu.Lock()
+ 		tw.s.currentRev++
++		// Note: no rangeCache invalidation needed here. A committed write
++		// only ever creates a *new* revision; it never changes the
++		// answer for a Range already cached under an older revision (see
++		// range_cache.go). Only compaction (setCompactMainRev) or a full
++		// Restore can invalidate previously-cached entries.
+ 	}
+ 	tw.tx.Unlock()
+ 	if len(tw.changes) != 0 {
+diff --git a/server/storage/mvcc/range_cache.go b/server/storage/mvcc/range_cache.go
+new file mode 100644
+index 0000000..7a3e49c
+--- /dev/null
++++ b/server/storage/mvcc/range_cache.go
+@@ -0,0 +1,183 @@
++// Copyright 2015 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package mvcc
++
++import (
++	"sync"
++
++	"go.etcd.io/etcd/api/v3/mvccpb"
++)
++
++// rangeCacheKey identifies a Range call by every parameter that can affect
++// its result, including the exact revision the result was/would be served
++// at. Baking the revision into the key (rather than only validating
++// against a "live" store-wide counter) is what keeps this cache compatible
++// with mvcc's snapshot-isolated concurrent reads: two read transactions
++// open at different revisions must be able to ask the identical (key, end,
++// options) question and legitimately get different answers, each stable
++// for the lifetime of its own transaction. Since data at a given revision
++// never changes once written (that's the point of a multi-version store),
++// a cache entry for a specific revision is valid forever -- with exactly
++// one exception: compaction, which physically discards old revisions. See
++// rangeCache.get/put for how that's handled.
++type rangeCacheKey struct {
++	key, end       string
++	limit          int64
++	rev            int64
++	countOnly      bool
++	fastKeysOnly   bool
++	withTotalCount bool
++}
++
++// resolveRev mirrors the "rev<=0 means current" convention rangeKeys()
++// itself uses, so requests for an explicit historical revision and
++// requests for "whatever is current right now" that happen to resolve to
++// the same revision share a cache entry.
++func resolveRev(ro RangeOptions, curRev int64) int64 {
++	if ro.Rev > 0 {
++		return ro.Rev
++	}
++	return curRev
++}
++
++func rangeCacheKeyOf(key, end []byte, ro RangeOptions, effectiveRev int64) rangeCacheKey {
++	return rangeCacheKey{
++		key:            string(key),
++		end:            string(end),
++		limit:          ro.Limit,
++		rev:            effectiveRev,
++		countOnly:      ro.CountOnly,
++		fastKeysOnly:   ro.FastKeysOnly,
++		withTotalCount: ro.WithTotalCount,
++	}
++}
++
++// maxRangeCacheEntries is a defensive cap on cache size: if it's exceeded
++// (e.g. compaction is disabled and a very large number of distinct
++// key/revision combinations get cached over a long process lifetime), the
++// whole cache is dropped rather than growing without bound. This never
++// produces incorrect results, only a missed caching opportunity.
++const maxRangeCacheEntries = 100_000
++
++// rangeCache is a small read-through cache for repeated, identical Range
++// lookups against the MVCC store, validated against store revision instead
++// of a wall-clock TTL. It must be invalidated (see clear) any time a
++// revision it may hold entries for could stop being valid to serve -- in
++// practice that is exactly compaction (kvstore_compaction.go /
++// updateCompactRev) and a full snapshot Restore, both of which call
++// store.setCompactMainRev / clear directly. Ordinary Put/DeleteRange/Txn
++// writes do *not* need to invalidate anything here: they only ever create
++// a *new* revision, they never change the answer for an already-cached
++// older revision.
++type rangeCache struct {
++	mu      sync.Mutex
++	entries map[rangeCacheKey]*RangeResult
++}
++
++func newRangeCache() *rangeCache {
++	return &rangeCache{entries: make(map[rangeCacheKey]*RangeResult)}
++}
++
++// get returns a cached result for (key, end, ro) at revision curRev, but
++// only if that revision has not since been compacted away (compactRev is
++// the store's current compactMainRev, read by the caller without a lock
++// via store.compactRevAtomic). A result whose revision has been compacted
++// is never served from the cache: the caller falls through to the real
++// read path, which independently (and correctly) returns ErrCompacted.
++func (c *rangeCache) get(key, end []byte, ro RangeOptions, curRev, compactRev int64) (*RangeResult, bool) {
++	if c == nil {
++		return nil, false
++	}
++	effRev := resolveRev(ro, curRev)
++	if effRev < compactRev {
++		return nil, false
++	}
++	k := rangeCacheKeyOf(key, end, ro, effRev)
++
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	r, ok := c.entries[k]
++	if !ok {
++		return nil, false
++	}
++	return cloneRangeResult(r), true
++}
++
++// put records a fresh result for (key, end, ro) at revision curRev, unless
++// that revision has already been compacted away by the time we're storing
++// it (a compaction can race with the read that produced r).
++func (c *rangeCache) put(key, end []byte, ro RangeOptions, curRev, compactRev int64, r *RangeResult) {
++	if c == nil {
++		return
++	}
++	effRev := resolveRev(ro, curRev)
++	if effRev < compactRev {
++		return
++	}
++	k := rangeCacheKeyOf(key, end, ro, effRev)
++
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if len(c.entries) >= maxRangeCacheEntries {
++		c.entries = make(map[rangeCacheKey]*RangeResult)
++	}
++	c.entries[k] = cloneRangeResult(r)
++}
++
++// clear drops every cached entry. Called whenever compactMainRev advances
++// (some entries may now be for compacted revisions) or the store is
++// restored from a fresh backend (old entries no longer describe the same
++// data at all).
++func (c *rangeCache) clear() {
++	if c == nil {
++		return
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.entries = make(map[rangeCacheKey]*RangeResult)
++}
++
++// cloneRangeResult returns a defensive copy of r so that cached data can
++// never be mutated by a caller after the fact (e.g. the gRPC layer nils
++// out Value for keys-only responses, and callers may filter/sort/reslice
++// KVs in place) and so mutations from one caller can never leak into the
++// result seen by another caller of the cache.
++func cloneRangeResult(r *RangeResult) *RangeResult {
++	if r == nil {
++		return nil
++	}
++	out := &RangeResult{Count: r.Count, Rev: r.Rev}
++	if r.KVs != nil {
++		out.KVs = make([]*mvccpb.KeyValue, len(r.KVs))
++		for i, kv := range r.KVs {
++			if kv == nil {
++				continue
++			}
++			// Copy fields explicitly rather than dereferencing *kv: the
++			// generated proto struct embeds a protoimpl.MessageState
++			// (which contains a sync.Mutex), and copying that by value
++			// is unsafe/vet-flagged.
++			out.KVs[i] = &mvccpb.KeyValue{
++				Key:            kv.Key,
++				CreateRevision: kv.CreateRevision,
++				ModRevision:    kv.ModRevision,
++				Version:        kv.Version,
++				Value:          kv.Value,
++				Lease:          kv.Lease,
++			}
++		}
++	}
++	return out
++}
+diff --git a/tests/integration/v3_range_caching_check_test.go b/tests/integration/v3_range_caching_check_test.go
+new file mode 100644
+index 0000000..b5f58a3
+--- /dev/null
++++ b/tests/integration/v3_range_caching_check_test.go
+@@ -0,0 +1,151 @@
++// Copyright 2026 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package integration
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/require"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/api/v3/mvccpb"
++	"go.etcd.io/etcd/tests/v3/framework/integration"
++)
++
++// TestV3RangeCachingConsistency exercises the requirement from task R06-TD:
++// repeated, identical Range requests may be served from a cache, but a
++// client must never observe data staler than what an equivalent uncached
++// read would have returned at the time of the request. It covers Put,
++// DeleteRange, and Compact invalidation, each with both Serializable=false
++// (linearizable) and Serializable=true (serializable) Range requests.
++func TestV3RangeCachingConsistency(t *testing.T) {
++	t.Run("Put", testV3RangeCachingConsistencyPut)
++	t.Run("DeleteRange", testV3RangeCachingConsistencyDeleteRange)
++	t.Run("Compact", testV3RangeCachingConsistencyCompact)
++}
++
++// rangeValue issues a Range for key against kvc with the given Serializable
++// flag and returns the single value found (or nil if the key is absent).
++func rangeValue(t *testing.T, kvc pb.KVClient, key string, serializable bool) []byte {
++	t.Helper()
++	resp, err := kvc.Range(t.Context(), &pb.RangeRequest{
++		Key:          []byte(key),
++		Serializable: serializable,
++	})
++	require.NoError(t, err)
++	if len(resp.Kvs) == 0 {
++		return nil
++	}
++	return resp.Kvs[0].Value
++}
++
++func testV3RangeCachingConsistencyPut(t *testing.T) {
++	integration.BeforeTest(t)
++	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 3})
++	defer clus.Terminate(t)
++
++	kvc := integration.ToGRPC(clus.Client(0)).KV
++	key := "caching/put-key"
++
++	for _, serializable := range []bool{false, true} {
++		// (1) Range once to (potentially) warm any cache.
++		_, err := kvc.Range(t.Context(), &pb.RangeRequest{Key: []byte(key), Serializable: serializable})
++		require.NoError(t, err)
++
++		// (2) Put a new value through the normal client path.
++		newVal := []byte("new-value")
++		_, err = kvc.Put(t.Context(), &pb.PutRequest{Key: []byte(key), Value: newVal})
++		require.NoError(t, err)
++
++		// (3) Immediately Range again: must observe the new value, not a
++		// cached pre-Put result, for both linearizable and serializable
++		// requests.
++		got := rangeValue(t, kvc, key, serializable)
++		require.Equalf(t, newVal, got, "serializable=%v: stale value returned after Put: got %q, want %q", serializable, got, newVal)
++	}
++}
++
++func testV3RangeCachingConsistencyDeleteRange(t *testing.T) {
++	integration.BeforeTest(t)
++	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 3})
++	defer clus.Terminate(t)
++
++	kvc := integration.ToGRPC(clus.Client(0)).KV
++
++	for _, serializable := range []bool{false, true} {
++		key := "caching/delete-key"
++		_, err := kvc.Put(t.Context(), &pb.PutRequest{Key: []byte(key), Value: []byte("v1")})
++		require.NoError(t, err)
++
++		// Cache a range that sees the key present.
++		got := rangeValue(t, kvc, key, serializable)
++		require.Equal(t, []byte("v1"), got)
++
++		// Delete it.
++		_, err = kvc.DeleteRange(t.Context(), &pb.DeleteRangeRequest{Key: []byte(key)})
++		require.NoError(t, err)
++
++		// A subsequent Range must reflect the deletion, not serve the
++		// cached (pre-delete) value.
++		resp, err := kvc.Range(t.Context(), &pb.RangeRequest{Key: []byte(key), Serializable: serializable})
++		require.NoError(t, err)
++		require.Emptyf(t, resp.Kvs, "serializable=%v: deleted key still served (stale cache), got value %q", serializable, valueOrNil(resp.Kvs))
++	}
++}
++
++func testV3RangeCachingConsistencyCompact(t *testing.T) {
++	integration.BeforeTest(t)
++	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 3})
++	defer clus.Terminate(t)
++
++	kvc := integration.ToGRPC(clus.Client(0)).KV
++
++	for i, serializable := range []bool{false, true} {
++		key := "caching/compact-key"
++		_, err := kvc.Put(t.Context(), &pb.PutRequest{Key: []byte(key), Value: []byte("v1")})
++		require.NoError(t, err)
++		putResp, err := kvc.Put(t.Context(), &pb.PutRequest{Key: []byte(key), Value: []byte("v2")})
++		require.NoError(t, err)
++		compactRev := putResp.Header.Revision
++
++		// Cache a Range pinned at an old (pre-compaction) revision: this
++		// must succeed right now...
++		oldRevReq := &pb.RangeRequest{Key: []byte(key), Revision: compactRev - 1, Serializable: serializable}
++		_, err = kvc.Range(t.Context(), oldRevReq)
++		require.NoErrorf(t, err, "iteration %d: range at revision %d should succeed before compaction", i, compactRev-1)
++
++		// Compact away that old revision.
++		_, err = kvc.Compact(t.Context(), &pb.CompactionRequest{Revision: compactRev})
++		require.NoError(t, err)
++
++		// The identical Range request, repeated, must now report the
++		// revision as compacted -- not silently return the cached
++		// pre-compaction result.
++		_, err = kvc.Range(t.Context(), oldRevReq)
++		require.ErrorContainsf(t, err, "mvcc: required revision has been compacted", "iteration %d: compacted revision was served from a stale cache instead of returning ErrCompacted", i)
++
++		// A live (uncompacted) Range for the same key must still return
++		// the latest value.
++		got := rangeValue(t, kvc, key, serializable)
++		require.Equal(t, []byte("v2"), got)
++	}
++}
++
++func valueOrNil(kvs []*mvccpb.KeyValue) []byte {
++	if len(kvs) == 0 {
++		return nil
++	}
++	return kvs[0].Value
++}

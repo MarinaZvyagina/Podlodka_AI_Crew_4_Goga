@@ -14,7 +14,7 @@
 set -u
 REPO="${1:-.}"
 
-if [ ! -d "$REPO/.git" ]; then
+if ! git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "FAIL: '$REPO' is not a git repository"
   exit 1
 fi

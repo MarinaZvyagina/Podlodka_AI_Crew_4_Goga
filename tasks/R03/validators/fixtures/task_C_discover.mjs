@@ -73,10 +73,16 @@ const changed = changedFiles();
 if (changed.length === 0) die('no changes detected against HEAD (nothing to validate)');
 
 // --- 1. Locate the demo module -----------------------------------------
-const moduleFile = changed.find(f => /^integration\/[^/]+\/src\/.*\.module\.ts$/.test(f));
+// Accept either of nestjs/nest's two real conventions for a new demo app:
+// `integration/*/src/` (used by the repo's own e2e test fixtures) or
+// `sample/*/src/` (used by the repo's own public-facing numbered examples,
+// e.g. `sample/01-cats-app`) -- both are genuine, idiomatic places a
+// developer could reasonably add this, and narrowing to only one is an
+// implementation-agnosticism gap, not a real functional requirement.
+const moduleFile = changed.find(f => /^(integration|sample)\/[^/]+\/src\/.*\.module\.ts$/.test(f));
 if (!moduleFile) {
   die(
-    'could not locate a *.module.ts under an integration/*/src/ directory in the diff -- ' +
+    'could not locate a *.module.ts under an integration/*/src/ or sample/*/src/ directory in the diff -- ' +
       'cannot boot a demo app to functionally verify maintenance-mode behavior',
   );
 }

@@ -235,3 +235,29 @@ All four `task_X_functional.sh` scripts were left in a state where the
 target repo (`/tmp/benchmark-repos/R03/base`) is clean
 (`git status --porcelain` shows no tracked changes) after every run,
 including after this document was written.
+
+### Correction (Phase 10, first real execution test) — Task C's discovery script was too narrow
+
+The first real, live-agent test run against Task C (`R03-TC-G-07`, a real `claude -p` session,
+not a hand-authored control) revealed that `fixtures/task_C_discover.mjs` only recognized a new
+demo app placed under `integration/*/src/` (the convention the Phase 5 hand-authored controls
+happened to use) and rejected the real agent's equally-valid choice of `sample/*/src/` — which is
+nestjs/nest's *other* genuine, real convention for a new example app (its own repo ships public
+numbered examples under `sample/`). Fixed the regex to accept either. Re-verified clean against
+both the positive and negative control diffs after the fix (no change in their PASS/FAIL
+verdicts).
+
+**Known remaining limitation, not fixed further**: after the path fix, the same real agent run's
+diff still failed `task_C_discover.mjs`'s later step, which looks for exactly one `@Get` route
+carrying an extra non-standard decorator alongside one plain `@Get` route in the same controller,
+as its way of finding the "protected vs. unprotected handler" pair without assuming a fixed
+decorator name. The real agent's actual controller shape didn't match this specific heuristic
+closely enough for it to fire, even though the underlying guard mechanism itself was judged
+correct by all 4 architecture checks (see `PLAUSIBILITY_CHECK.md`/live run data). This is
+disclosed as a residual implementation-agnosticism gap in this one discovery heuristic — broadening
+it further to reliably match arbitrary real controller shapes would require materially more
+sophisticated static analysis than a regex/AST-light script can reasonably provide, and was judged
+not worth pursuing indefinitely at the cost of delaying Phase 10 execution. Any real run that hits
+this specific discovery failure mode will show `functional_success=False` with the discovery
+script's own diagnostic output preserved verbatim in `functional_results.json` for manual review
+during analysis, rather than a silently wrong verdict.

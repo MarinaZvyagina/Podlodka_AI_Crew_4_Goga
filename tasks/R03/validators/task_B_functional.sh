@@ -24,7 +24,7 @@ REPO="${1:-.}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FIXTURE_SRC="$SCRIPT_DIR/fixtures/task_B_test.spec.ts"
 
-if [ ! -d "$REPO/.git" ]; then
+if ! git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "FAIL: '$REPO' is not a git repository"
   exit 1
 fi

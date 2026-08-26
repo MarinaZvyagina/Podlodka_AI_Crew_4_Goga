@@ -14,7 +14,7 @@ set -uo pipefail
 REPO="${1:-.}"
 REPO="$(cd "$REPO" 2>/dev/null && pwd)"
 
-if [ ! -d "$REPO/.git" ]; then
+if ! git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "FAIL: AC2 - '$1' is not a git repo working directory"
   exit 1
 fi

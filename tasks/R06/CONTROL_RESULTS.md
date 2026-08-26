@@ -57,6 +57,37 @@ even though a naive functional test looks fine. AC2/AC5 don't fire for this part
 ### Notes
 - AC4's validator honestly reports `MANUAL REVIEW REQUIRED` (never a faked verdict) in both states
   here, since no NoPassword-specific subtest exists in `server/auth` in the trap's diff scope.
+
+### Correction (Phase 4.5, post-freeze) — the positive control had a real end-to-end bug
+
+While building a standalone, implementation-agnostic *functional* validator (Phase 4.5, extending
+Phase 4's rigor to functional checks — see `PROTOCOL.md` Amendment 2), a black-box test hitting
+the real `AuthServer` gRPC service (not the `server/auth` package directly, as the narrower Phase 5
+check did) found that **the positive control above does not actually work end-to-end**:
+`EtcdServer.UserAdd` (`server/etcdserver/v3_server.go`) unconditionally calls
+`bcrypt.GenerateFromPassword` on the request password before it ever reaches
+`authStore.UserAdd`'s `len(password) == 0` check — and bcrypt happily produces a valid, non-empty
+60-byte hash for an empty input. So by the time the store-layer check runs, `password` is never
+actually empty for a real client request, and the check silently never fires. The Phase 5 unit
+tests in `store_test.go` passed only because they call `authStore.UserAdd` directly, bypassing the
+hashing step entirely — a realistic and easy-to-miss gap between "the unit test I wrote passes"
+and "the feature works when a real client calls it."
+
+**Fix applied** (now folded into `controls/task_A_positive.diff`, re-verified): added an
+empty-password check directly in `EtcdServer.UserAdd`/`UserChangePassword`
+(`server/etcdserver/v3_server.go`), before hashing, returning `auth.ErrPasswordEmpty`. Re-ran:
+`go build ./server/...` clean; the new functional validator
+(`validators/task_A_functional.sh`) now **PASSES** against the corrected positive control; all 5
+architecture checks (AC1-AC5) still **PASS** unchanged; the negative control still **FAILS**
+functionally and architecturally exactly as before (untouched by this fix, since the trap's
+problem was always "wrong layer," not this specific bcrypt-masking bug).
+
+This is disclosed here rather than silently corrected because the original text above (the
+"Functional check" line claiming "positive control — all PASS, no regressions") was based on a
+narrower check than what a real benchmark run would need, and turned out to be an incomplete
+verification, not a wrong one — a useful, concrete illustration of exactly the gap this benchmark's
+own methodology (Research.md's "functional correctness != architecture correctness", extended here
+to "a narrow unit test != true end-to-end functional correctness") exists to catch.
 - No validator required fixing after the first pass for this task.
 
 ---

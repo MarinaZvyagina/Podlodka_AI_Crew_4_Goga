@@ -1,21 +1,24 @@
 # STATUS.md
 
-Last updated: 2026-08-25
+Last updated: 2026-08-26
 
 ```
 Phase 0 — Goga research:            COMPLETE  (GOGA_RESEARCH.md, TREATMENT_DESIGN.md)
-Phase 1 — Environment:              PARTIAL   (experiment.yaml drafted; model pin/timeout/network policy still TBD;
-                                                build toolchain now proven: JDK 26 + Android SDK cmdline-tools +
-                                                CocoaPods installed and validated against real builds)
+Phase 1 — Environment:              COMPLETE  (experiment.yaml fully resolved: model, timeout, budget,
+                                                permissions, seed; JDK 21 pinned; Android SDK, CocoaPods ready)
 Phase 2 — Repository selection:     COMPLETE  (REPOSITORY_SELECTION.md, repos.yaml — 10/10)
 Phase 3 — Task design:              COMPLETE  (tasks/R01-R10, 40 tasks + metadata + recon notes)
-Phase 4 — Runnable validators:      COMPLETE  (179 validator scripts across 40 tasks, ≥4 per task)
+Phase 4 — Runnable architecture validators: COMPLETE (179 scripts across 40 tasks, ≥4 per task)
+Phase 4.5 — Runnable functional validators: COMPLETE (40 scripts + 38 fixtures, unplanned phase — see notes;
+                                                        found + fixed a real bug in R06 Task A's positive control)
 Phase 5 — Positive/negative controls: COMPLETE (80 real diffs; 40/40 tasks CONFIRMED DISCRIMINATING)
 Phase 6 — Pilot:                    COMPLETE  (4 real autonomous runs, R01-TA + R06-TA x2 reps, Baseline only;
                                                 excluded from main 800-run sample; see pilot/PILOT_REPORT.md)
-Phase 7 — Protocol freeze:          COMPLETE  (PROTOCOL.md + experiment.yaml frozen; git tag benchmark-v1)
+Phase 7 — Protocol freeze:          COMPLETE  (PROTOCOL.md + experiment.yaml frozen; git tag benchmark-v1;
+                                                2 amendments logged post-freeze, see PROTOCOL.md)
 Phase 8 — Goga architecture prep:   COMPLETE  (10/10 repos, 92 CODEMANIFEST files, 9,524 lines,
                                                 all goga-lint-clean, ARCHITECTURE_CONTRACTS.md written)
+Phase 9 — Randomization:            COMPLETE  (experiment_plan.csv, 800 rows, seed=42, immutable)
 
 Goga configurations prepared: 10/10
 
@@ -27,7 +30,7 @@ Tasks validated: 40/40  (positive control passes functional+all architecture che
                          functional but fails ≥1 architecture check — verified for every task, in most cases via
                          real test/build execution, not just static review)
 
-Experimental cells prepared: 0/80
+Experimental cells prepared: 80/80 (plan generated; execution not started)
 
 Runs completed: 0/800
 Runs valid: 0/800
@@ -52,11 +55,22 @@ Final report: no
 - [x] `pilot/PILOT_REPORT.md` + `pilot/raw/*.{json,diff}` — Phase 6 pilot. 4 real, autonomous `claude -p` runs (bypassPermissions, isolated git worktrees) against R01-TA and R06-TA (Baseline only — Goga artifacts don't exist yet per phase ordering). All infrastructure confirmed working: agent launch, session isolation, metrics capture (tokens/cost/turns/duration natively in JSON output), and Phase 4/5 validators scored real (not hand-authored) model output correctly, including one MANUAL REVIEW REQUIRED flag that was manually followed up and confirmed a genuine, reproducible test regression in one run. Pilot runs excluded from the 800-run sample.
 - [x] `PROTOCOL.md` (FROZEN, `benchmark-v1` tag) + `experiment.yaml` (all TBDs resolved: model `claude-sonnet-5`, timeout 3600s, `--max-budget-usd 8`/run, `bypassPermissions`, random seed 42, JDK 21 pinned) — Phase 7.
 - [x] `architecture/R01-R10/**/CODEMANIFEST` (92 files, 9,524 lines, all `goga lint`-clean) + per-repo `SCOPE.md`/`SETUP_COST.md`/`PLAUSIBILITY_CHECK.md` + shared `architecture/ARCHITECTURE_CONTRACTS.md` pointer template — Phase 8, the actual Goga-condition treatment artifact. See "Phase 8 process notes" below for the significant methodology finding this phase produced.
-- [ ] Phase 9+ (randomization, execution, analysis, report) — not started.
+- [x] `experiment_plan.csv` — Phase 9. All 800 runs generated deterministically (seed=42): 400 Baseline / 400 Goga, exactly 10 repetitions per each of the 80 cells, blocked-randomized Baseline↔Goga order per pair, overall execution order also shuffled to avoid temporal confounds. Immutable from this point per `PROTOCOL.md` §13/§31.
+- [x] `tasks/R01-R10/validators/*_functional.sh` (40 scripts) + fixtures (38 files) + `tasks/R01-R10/FUNCTIONAL_VALIDATORS.md` (10 files) — **Phase 4.5**, an unplanned but necessary phase discovered while preparing for execution: `functional_check_command` in the metadata was prose guidance, not a runnable script, unlike the architecture checks. Built standalone, implementation-agnostic functional validators for all 40 tasks (logged as `PROTOCOL.md` Amendment 2). Found and fixed a real end-to-end bug in R06 Task A's positive control in the process (see Amendment 2 and `tasks/R06/CONTROL_RESULTS.md`'s correction note).
+- [ ] Phase 10+ (execution, validation, aggregation, analysis, report) — not started.
 
 ## Phase 6 headline finding
 
 Two independent pilot repetitions of the exact same task (R01-TA, freqtrade "reject conflicting capital-sizing config") produced two different architectural solutions to the same subtlety (validate the user's raw config vs. the schema-defaulted config) — one correct, one that empirically broke 4 existing tests (confirmed via a real `pytest` run). This is a live, small-scale preview of the "same task, same model, different architecture" instability the full 800-run study exists to measure — see `pilot/PILOT_REPORT.md` for the full writeup. Cost varied 3× across runs of the same task/repo ($0.73–$2.27), which should inform the budget line in `experiment.yaml` before Phase 10.
+
+## Phase 4.5 process notes (unplanned phase, discovered while preparing for Phase 10)
+
+- **Why this phase exists**: while preparing to actually execute the 800 runs, it became clear that `metadata_X.yaml`'s `functional_check_command` field (used throughout Phase 5) is prose guidance for a human/agent to interpret ("construct a conf dict with...", "manually run vmagent and confirm...") — not a runnable script, unlike the 179 Phase 4 architecture-check scripts. Without a real script, `functional_success` and the primary metric (Dangerous Success = functional_success AND NOT full_architecture_conformance) could not be computed automatically at 800-run scale. The user chose to build real functional validators before proceeding, mirroring Phase 4's rigor rather than falling back to an LLM judge or manual review.
+- **Design constraint that matters most**: each of the 40 functional validators had to be **implementation-agnostic** — testing observable behavior through a stable, real public entry point, not internal helper names specific to the one Phase-5 reference implementation — since these scripts will grade many structurally different real AI-agent solutions during the actual 800 runs, not just the already-known controls.
+- **A genuinely more rigorous measurement emerged**: for several tasks (R02 A/B/C, R05 A/B/C, and others), the new black-box functional tests correctly FAIL the negative control functionally, not only architecturally — Phase 5's original functional check often only re-ran the trap's own narrowly-scoped test file, which its author naturally wrote to pass. This narrows, for those specific tasks, the population of possible "Dangerous Success" outcomes (a trap that fails outright is not a dangerous success, just a failure) — a real, disclosed finding, not a defect.
+- **A genuine defect was found and fixed**: R06 Task A's Phase-5-blessed positive control did not actually work end-to-end (`EtcdServer.UserAdd` hashes an empty password into a valid, non-empty hash before the store-layer emptiness check ever runs — a real, subtle bug that only a black-box gRPC-level test catches, not a direct-call unit test). Fixed in `server/etcdserver/v3_server.go`, re-verified clean against the new functional validator and all 5 existing architecture checks. Logged transparently as `PROTOCOL.md` Amendment 2 and as a dated correction appended to (not silently editing) `tasks/R06/CONTROL_RESULTS.md`.
+- Of the 10 parallel per-repo agents, 6 hit at least one transport failure or the account's session-usage limit mid-task (the usage limit — "resets 2pm Europe/Moscow" — is a new failure mode not seen in earlier phases; unlike transport failures, resuming immediately did not help until enough time had passed). All were eventually resumed successfully with no lost work (partial files were always intact).
+- R09 (firefox-ios) and R10 (Signal-iOS) both correctly used `MANUAL REVIEW REQUIRED` (never a fabricated PASS) for the Client-app-scoped tasks that remain genuinely unbuildable in this environment (missing Mozilla-internal `nimbus-fml.sh` tooling; Signal-iOS's disk/build-time cost) — consistent with the same honesty standard applied throughout Phase 5.
 
 ## Phase 8 process notes (for reproducibility) — includes a real methodology adaptation
 
@@ -96,10 +110,9 @@ Conclusion: the design, as instantiated against the real 10-repository sample, s
 
 ## Next steps (require explicit go-ahead — see reminder below)
 
-1. Phase 9 — randomization: generate the immutable `experiment_plan.csv` for all 800 runs with the fixed random seed (42) already recorded in `experiment.yaml`, using blocked randomization of Baseline↔Goga execution order per `PROTOCOL.md` §13.
-2. Phase 10 — execution: the actual 800 runs, applying each repository's frozen `architecture/R0X/**/CODEMANIFEST` forest + the shared `ARCHITECTURE_CONTRACTS.md` pointer into a fresh clone/worktree for every Condition-B run (Condition A gets neither). Given the pilot's observed cost range ($0.73-$2.27 per single-task Baseline run) and that the real 40 tasks include the more complex B/C/D categories, budget meaningfully above the pilot's numbers before starting — this is the single most expensive and time-consuming remaining phase by a wide margin.
-3. Phase 11-14 — validation, aggregation, statistical analysis, and the final report, per `PROTOCOL.md` §14/§19.
+1. **Phase 10 — execution: the actual 800 runs.** For each row of the now-immutable `experiment_plan.csv`: fresh worktree at the repo's pinned commit; if `condition=goga`, overlay that repository's frozen `architecture/R0X/**/CODEMANIFEST` forest + the shared `ARCHITECTURE_CONTRACTS.md` pointer (Condition A gets neither); launch `claude -p` per the pinned `experiment.yaml` settings; capture the JSON result + git diff; run that task's functional validator (`tasks/R0X/validators/task_Y_functional.sh`) and all its architecture validators (`task_Y_AC*.sh`); append a row to `results/runs.csv`; clean up. This is the single most expensive and time-consuming remaining phase by a wide margin — budget meaningfully above the pilot's per-task-A cost range ($0.73-$2.27), since the real 40 tasks include the harder B/C/D categories, and expect the run to span a long wall-clock window (rate limits, session-usage limits observed during Phase 4.5, and realistic per-run durations of 5-60+ minutes for 800 runs even with meaningful parallelism).
+2. Phase 11-14 — validation, aggregation, statistical analysis, and the final report, per `PROTOCOL.md` §14/§19.
 
 ## Explicit reminder
 
-Per `Research.md` §68: **do not start the 800-run benchmark without explicit request.** Phases 0-8 are now complete: repositories selected, 40 tasks designed and validated with real positive/negative controls, a real 4-run pilot confirmed the execution infrastructure end-to-end, the protocol is frozen (`benchmark-v1`), and all 10 repositories have a real, `goga lint`-clean, drift-checked CODEMANIFEST forest ready to serve as the Goga condition. Only Phase 9 (randomization — cheap, mechanical) and Phase 10 (the actual 800 runs — the single largest remaining time/cost commitment in this project) remain before analysis and the final report. Phase 10 should only proceed once the user has explicitly approved starting the main run at its budgeted cost.
+Per `Research.md` §68: **do not start the 800-run benchmark without explicit request.** Phases 0-9 are now complete: repositories selected, 40 tasks designed and validated with real positive/negative controls (both architectural AND functional, the latter added in the unplanned Phase 4.5), a real 4-run pilot confirmed the execution infrastructure end-to-end, the protocol is frozen (`benchmark-v1`, 2 amendments logged), all 10 repositories have a real, `goga lint`-clean, drift-checked CODEMANIFEST forest ready to serve as the Goga condition, and the immutable 800-row `experiment_plan.csv` is generated. **Only Phase 10 (the actual 800 runs) remains before analysis and the final report** — this is the single largest remaining time/cost commitment in this entire project and should only proceed once the user has explicitly approved starting the main run at its budgeted cost.

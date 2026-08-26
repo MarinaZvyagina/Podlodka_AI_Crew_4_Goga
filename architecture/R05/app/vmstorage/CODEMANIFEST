@@ -1,0 +1,108 @@
+Imports:
+  - Types:
+      - Storage
+      - MetricRow
+      - OpenOptions
+    From: lib/storage
+
+Usages:
+  thin_wrapper: |
+    Of the three storage-facing app packages (vminsert does protocol parsing/relabeling/routing,
+    vmselect does query planning/merging, vmstorage is this cell), vmstorage is the thinnest:
+    nearly every meaningful exported operation (WriteRows, SearchMetricNames, DeleteSeries,
+    LabelValues, TSDBStatus, snapshot management) is a near 1:1 pass-through to the
+    corresponding lib/storage.Storage method, wrapped only by request-draining
+    (WaitGroup Add/Done for graceful shutdown) and, for vmselect-facing calls, a tenant-ID
+    validation/prefixing wrapper. In this pinned commit, app/vmstorage is a library (package
+    vmstorage, not package main) consumed by the single-node app/victoria-metrics binary's
+    main(), not an independently built entry point of its own — cluster deployments still
+    package it as a separately named "vmstorage" artifact built from the same underlying source.
+
+Annotations: |
+  This cell is the direct network/admin-facing wrapper around one `Storage` instance: it opens
+  the engine at startup, exposes package-level function variables (VMInsertAPI, VMSelectAPI,
+  GetSearch/PutSearch) that other components call to reach the storage engine, and — only
+  when a -vmselectAddr flag is configured — starts an RPC server so a networked vmselect process
+  can reach this instance's data.
+
+  Use `thin_wrapper` to understand how little independent logic lives in this cell versus how
+  much is pure delegation to `Storage`.
+
+  Use `MetricRow` and `OpenOptions` from Imports to see the two lib/storage types this cell's
+  own contract is expressed in terms of.
+
+---
+
+"Init(vmselectMaxConcurrentRequests: int, vmselectMaxQueueDuration: time.Duration, resetCacheIfNeeded: CacheResetCallback)":
+  location: main.go
+  annotations: |
+    Configure and open the storage engine, then (only if a vmselect-facing network address is
+    configured) start an RPC server for it.
+
+    `resetCacheIfNeeded`: callback the caller (query layer) supplies to invalidate its own
+    result caches when new data invalidates them
+
+    Algorithm:
+    1. Apply all storage.Set*/mergeset.Set* package-level tuning knobs from CLI flags
+    2. Build an `OpenOptions` from CLI flags (retention, max daily/hourly series limits, etc.)
+       and call the `Storage` factory to open the engine at the configured data path
+    3. Wrap the opened `Storage` in this cell's own `VMStorage`, exposing it via the
+       package-level VMInsertAPI/VMSelectAPI/GetSearch/PutSearch variables
+    4. If -vmselectAddr is set, start a vmselect-facing RPC server backed by a tenant-scoped
+       wrapper around the same `VMStorage`
+
+"Stop()":
+  location: main.go
+  annotations: |
+    Stop any running vmselect RPC server, drain in-flight requests, close the underlying
+    `Storage`, and stop background maintenance (e.g. the stale-snapshot remover).
+
+"DataPath() -> path:string":
+  location: main.go
+  annotations: |
+    Return the configured on-disk data directory for this storage instance.
+
+"VMStorage(s: Storage)":
+  location: vmstorage.go
+  annotations: |
+    Wraps one `Storage` instance and implements the API surface consumed by both the insert side
+    and the select side of the system (see `thin_wrapper`). Constructed once at `Init` time and
+    referenced only through the package-level VMInsertAPI/VMSelectAPI variables afterward.
+
+    Snapshot administration (create/list/delete) is handled directly in this cell's own admin
+    HTTP endpoints (main.go) by calling the wrapped `Storage`'s snapshot methods inline — it is
+    not exposed as a method of this type.
+  methods:
+    "WriteRows(rows: []MetricRow) -> err:error": |
+      Forward `rows` to the underlying `Storage`'s AddRows method.
+    "IsReadOnly() -> readOnly:bool": |
+      Forward to `Storage`'s IsReadOnly method.
+    "SearchMetricNames(qt: QueryTracer, sq: SearchQuery, deadline: uint64) -> names:[]string, err:error": |
+      Resolve `sq`'s tag filters and forward to `Storage`'s SearchMetricNames method.
+    "DeleteSeries(qt: QueryTracer, sq: SearchQuery, deadline: uint64) -> deleted:int, err:error": |
+      Resolve `sq`'s tag filters and forward to `Storage`'s DeleteSeries method.
+    "TSDBStatus(qt: QueryTracer, sq: SearchQuery, focusLabel: string, topN: int, deadline: uint64) -> status:TSDBStatus, err:error": |
+      Resolve `sq`'s tag filters and forward to `Storage`'s GetTSDBStatus method.
+    "Stop()": |
+      Drain in-flight requests, stop this wrapper's own background goroutine (stale-snapshot
+      removal), then close the underlying `Storage`.
+
+"VMStorage::VMStorageWithTenantID(accountID: uint32, projectID: uint32)":
+  location: vmstorage_with_tenant_id.go
+  annotations: |
+    Tenant-scoping specialization of `VMStorage`, installed as the API implementation handed to
+    the vmselect-facing RPC server. Every method validates the caller's tenant token (against
+    the configured `accountID`/`projectID` or a request-supplied multi-tenant token) before
+    delegating to the wrapped `VMStorage`, and re-marshals results with tenant-ID-prefixed
+    metric names/blocks.
+
+---
+
+Author: Goga
+CreatedAt: 26/08/26
+Description: |
+  Storage-node wrapper: opens and exposes one lib/storage.Storage instance to the rest of the
+  process (and, optionally, to a networked vmselect). Sourced by direct reading of main.go,
+  vmstorage.go, vmstorage_with_tenant_id.go, and by grepping app/victoria-metrics/main.go to
+  confirm this cell is consumed as a library rather than built as its own package main in this
+  pinned commit.

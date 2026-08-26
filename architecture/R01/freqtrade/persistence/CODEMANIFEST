@@ -1,0 +1,259 @@
+Usages:
+  orm_pattern: |
+    Trade/Order are SQLAlchemy 2.0 declarative-mapped entities (ModelBase). LocalTrade is a
+    plain-Python twin of Trade with identical fields, used when the database is disabled
+    (backtesting/hyperopt) via `FtNoDBContext`. Trade mutates LocalTrade to add persistence.
+
+Annotations: |
+  This cell is the trading-domain model: the persisted record of trades, orders, pair locks,
+  and small per-trade key/value extensions. Every other cell that needs to know what a trade
+  or order *is* imports its types from here; this cell imports nothing else in the spine.
+
+  Use `orm_pattern` to decide whether new fields belong on `LocalTrade` (always) or need an
+  explicit `Trade`-only override (only if the SQLAlchemy column type must differ).
+
+---
+
+"LocalTrade(**kwargs)":
+  location: trade_model.py
+  annotations: |
+    In-memory (non-persisted) representation of one trade, used directly during backtesting/
+    hyperopt (no DB) and as the base fields definition that `Trade` mirrors as ORM columns.
+
+    kwargs: keyword-only field initializers matching the properties below.
+  properties:
+    "pair -> str": |
+      Traded pair, e.g. "ETH/USDT".
+    "is_open -> bool": |
+      True while the trade has no closing order filled yet.
+    "amount -> float": |
+      Current position size in base currency.
+    "open_rate -> float": |
+      Weighted-average entry price.
+    "close_rate -> float | None": |
+      Weighted-average exit price, set once the trade is closed.
+    "stake_amount -> float": |
+      Capital committed to the trade in stake currency.
+    "stop_loss -> float": |
+      Current absolute stoploss price.
+    "is_short -> bool": |
+      True for short positions (leveraged/futures trading).
+    "leverage -> float": |
+      Leverage multiplier applied to the position.
+    "orders -> list[Order]": |
+      All orders (entry, exit, partial adjustments) associated with this trade, oldest first.
+  methods:
+    "adjust_stop_loss(current_price: float, stoploss: float | None, initial: bool, allow_refresh: bool)": |
+      Recompute and, if it improves protection, raise stop_loss given a new reference price.
+
+      `current_price`: latest known price for the pair
+      `stoploss`: fractional stoploss distance to apply; when omitted, reuses the last one
+      `initial`: True when setting the very first stoploss at trade open
+      `allow_refresh`: permits recalculating an already-adjusted stoploss
+
+      Algorithm:
+      1. Compute the candidate stop price from `current_price` and `stoploss`
+      2. Only replace the stored stop_loss if the candidate is more protective
+      3. Track whether the stoploss originates from a custom strategy callback
+    "update_trade(order: Order, recalculating: bool)": |
+      Apply a filled/updated `Order` to this trade's aggregate state (amount, open_rate, fees).
+
+      `order`: the `Order` whose fill data must be folded into the trade
+      `recalculating`: True when replaying all orders after a correction rather than a live fill
+    "close(rate: float, show_msg: bool)": |
+      Mark the trade closed at `rate` and freeze its final profit figures.
+
+      `rate`: the exit fill price
+      `show_msg`: whether to emit the standard close log/notification
+    "calc_close_trade_value(rate: float, amount: float | None) -> value:float": |
+      Compute the gross stake-currency value of closing (or partially closing) at `rate`.
+
+      `rate`: hypothetical or actual close price
+      amount: quantity to value; defaults to the full remaining position
+      `value`: resulting stake-currency amount before profit/fees are netted out
+    "calc_profit(rate: float, amount: float | None, open_rate: float | None) -> profit:float": |
+      Compute absolute profit/loss in stake currency for a close at `rate`.
+
+      `rate`: hypothetical or actual close price
+      amount: quantity to evaluate; defaults to the full remaining position
+      open_rate: override for the entry price; defaults to open_rate
+      `profit`: signed stake-currency profit, fees included
+    "calc_profit_ratio(rate: float, amount: float | None, open_rate: float | None) -> ratio:float": |
+      Same as calc_profit but expressed as a fraction of stake_amount.
+
+      `ratio`: signed fractional profit
+    "recalc_trade_from_orders(is_closing: bool)": |
+      Rebuild amount, open_rate, and fee totals from scratch by replaying orders.
+
+      `is_closing`: True when the recalculation happens as part of closing the trade
+    "get_trades_proxy(pair: str | None, is_open: bool | None, open_date: datetime | None, close_date: datetime | None) -> trades:list[LocalTrade]": |
+      Query in-memory trades matching the given filters (DB-disabled equivalent of Trade.get_trades).
+
+      trades: matching `LocalTrade` instances
+    "from_json(json_str: str) -> trade:LocalTrade": |
+      Reconstruct a `LocalTrade` (with its `Order`s) from the JSON produced by Order.to_json/trade export.
+
+      `json_str`: serialized trade payload
+      `trade`: reconstructed instance
+
+"LocalTrade::Trade(**kwargs)":
+  location: trade_model.py
+  annotations: |
+    SQLAlchemy-persisted counterpart of `LocalTrade`; same field set, backed by the trades
+    table. Used whenever the database is enabled (live/dry-run trading, and any historical
+    query against previously recorded trades).
+  methods:
+    "delete()": |
+      Remove this trade (and its orders, via cascade) from the database.
+    "commit()": |
+      Flush the current DB session, persisting all pending trade/order changes.
+    "rollback()": |
+      Discard pending, uncommitted changes in the current DB session.
+    "get_trades_query(trade_filter: list[Any] | None, include_orders: bool) -> query:Select": |
+      Build (without executing) the SQLAlchemy `Select` for trades matching `trade_filter`.
+
+      `trade_filter`: list of SQLAlchemy filter clauses to AND together
+      `include_orders`: eager-load orders when True
+      `query`: composable `Select` statement
+    "get_trades(trade_filter: list[Any] | None, include_orders: bool) -> trades:list[Trade]": |
+      Execute get_trades_query and return the resulting rows.
+
+      trades: matching persisted `Trade` rows
+    "get_overall_performance(start_date: datetime | None) -> performance:list[dict[str, Any]]": |
+      Aggregate closed-trade profit grouped by pair, optionally limited to trades closed on or
+      after `start_date`.
+    "get_enter_tag_performance(pair: str | None) -> performance:list[dict[str, Any]]": |
+      Aggregate closed-trade profit grouped by entry tag.
+    "get_exit_reason_performance(pair: str | None) -> performance:list[dict[str, Any]]": |
+      Aggregate closed-trade profit grouped by exit reason.
+    "get_mix_tag_performance(pair: str | None) -> performance:list[dict[str, Any]]": |
+      Aggregate closed-trade profit grouped by the combined entry-tag/exit-reason pair.
+
+"Order(**kwargs)":
+  location: trade_model.py
+  annotations: |
+    One exchange order (entry, exit, or partial adjustment) belonging to a `Trade`/`LocalTrade`.
+    Mirrors the subset of a ccxt order response that freqtrade persists and reasons about.
+  properties:
+    "order_date_utc -> datetime": |
+      order_date normalized to UTC.
+    "safe_amount -> float": |
+      amount, falling back to the originally requested amount if the exchange omitted it.
+    "safe_price -> float": |
+      Best-known fill price, preferring average then price.
+    "safe_filled -> float": |
+      Filled quantity, defaulting to 0 when the exchange hasn't reported it yet.
+    "safe_cost -> float": |
+      Total cost of the filled portion in quote currency.
+    "safe_remaining -> float": |
+      Quantity still unfilled.
+    "stake_amount -> float": |
+      Portion of safe_cost attributable to stake currency (excludes leverage-borrowed funds).
+  methods:
+    "update_from_ccxt_object(order: dict[str, Any])": |
+      Overwrite this `Order`'s fields from a raw ccxt order dict returned by the exchange.
+
+      `order`: raw ccxt order response
+    "to_ccxt_object(stop_price_name: str) -> order:dict[str, Any]": |
+      Render this `Order` back into ccxt's order-dict shape, e.g. for dry-run simulation.
+
+      `stop_price_name`: key name ccxt expects for the stop price on this exchange
+      `order`: ccxt-shaped dict
+    "to_json(entry_side: str, minified: bool) -> order:dict[str, Any]": |
+      Serialize this `Order` for the RPC/API layer or trade export.
+
+      `entry_side`: "buy" or "sell", used to compute side-relative fields
+      `minified`: omit verbose fields when True (used for compact exports)
+    "parse_from_ccxt_object(order: dict[str, Any], pair: str, side: str, amount: float | None, price: float | None) -> order:Order": |
+      Build a brand-new `Order` from a raw ccxt order dict (used for orders freqtrade didn't
+      originate, e.g. externally placed or imported orders). `amount`/`price` exist only to
+      let tests override the exchange-reported values.
+
+      `order`: raw ccxt order response
+    "get_open_orders() -> orders:list[Order]": |
+      Fetch every `Order` across all trades that is still open (ft_is_open true).
+    "order_by_id(order_id: str, pair: str | None) -> order:Order | None": |
+      Look up a single `Order` by the exchange's order id, optionally scoped to `pair`.
+
+"PairLock()":
+  location: pairlock.py
+  annotations: |
+    A persisted lock preventing entries (and optionally exits) on a pair, or globally, until
+    lock_end_time. Populated by plugins/protections and by manual /stopbuy-style commands.
+  properties:
+    "lock_end_time_utc -> datetime": |
+      lock_end_time normalized to UTC.
+  methods:
+    "query_pair_locks(pair: str | None, now: datetime, side: str | None) -> locks:list[PairLock]": |
+      Fetch currently-active locks, optionally filtered to one `pair`/`side`.
+    "get_all_locks() -> locks:list[PairLock]": |
+      Fetch every lock ever recorded, active or expired.
+    "to_json() -> lock:dict[str, Any]": |
+      Serialize this lock for the RPC/API layer.
+
+"PairLocks()":
+  location: pairlock_middleware.py
+  annotations: |
+    Thin façade over `PairLock` that also supports an in-memory (no-DB) mode via the
+    use_db class flag toggled by `FtNoDBContext`. This is the API the rest of the codebase
+    calls; nothing outside this cell should query `PairLock` directly.
+  methods:
+    "lock_pair(pair: str, until: datetime, reason: str | None, now: datetime | None, side: str) -> lock:PairLock": |
+      Create (and persist, if use_db) a lock on `pair` until `until`.
+    "get_pair_locks(pair: str | None, now: datetime | None, side: str) -> locks:list[PairLock]": |
+      Return active locks, optionally filtered to `pair`/`side`.
+    "is_pair_locked(pair: str, now: datetime | None, side: str) -> locked:bool": |
+      Convenience boolean form of get_pair_locks for a single pair.
+    "is_global_lock(now: datetime | None, side: str) -> locked:bool": |
+      True if a lock with no specific pair (a global stop) is currently active.
+
+"CustomDataWrapper()":
+  location: custom_data.py
+  annotations: |
+    Arbitrary strategy-defined key/value data attached to a specific trade (e.g. custom
+    indicators or state a strategy wants to remember across candles for one trade).
+  methods:
+    "get_custom_data(trade_id: int, key: str | None) -> data:list[Any]": |
+      Fetch custom-data rows for `trade_id`, optionally filtered to one `key`.
+    "set_custom_data(trade_id: int, key: str, value: Any)": |
+      Upsert one custom-data value for `trade_id` under `key`.
+
+"KeyValueStore()":
+  location: key_value_store.py
+  annotations: |
+    Small global (not per-trade) persisted key/value store, e.g. for bot-restart bookkeeping.
+  methods:
+    "store_value(key: str, value: Any)": |
+      Persist `value` under `key`, overwriting any previous value.
+    "get_value(key: str) -> value:Any | None": |
+      Fetch the current value for `key`, or `None` if never set.
+
+"FtNoDBContext(timeframe: str)":
+  location: usedb_context.py
+  annotations: |
+    Context manager used by backtesting/hyperopt to switch `Trade`, `PairLocks`, and
+    `CustomDataWrapper` into their in-memory (`LocalTrade`-only) mode for the duration of a
+    with block, then restore normal database use on exit.
+
+    `timeframe`: timeframe string recorded for the duration of the disabled-DB block
+
+"disable_database_use(timeframe: str)":
+  location: usedb_context.py
+  annotations: |
+    Switch Trade.use_db, PairLocks.use_db, and CustomDataWrapper.use_db to False so
+    reads/writes go through the in-memory `LocalTrade` path instead of SQLAlchemy.
+
+    `timeframe`: timeframe string stored for the duration of the disabled-DB period
+
+"enable_database_use()":
+  location: usedb_context.py
+  annotations: |
+    Restore Trade.use_db, PairLocks.use_db, and CustomDataWrapper.use_db to True.
+
+---
+
+Author: Goga
+CreatedAt: 25/08/26
+Description: |
+  Core trading domain model: trades, orders, pair locks, and small per-trade key/value
+  extensions. Foundational cell with no dependencies on the rest of the architectural spine.

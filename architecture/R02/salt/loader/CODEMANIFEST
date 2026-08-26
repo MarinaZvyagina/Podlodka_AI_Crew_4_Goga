@@ -1,0 +1,194 @@
+Annotations: |
+  This cell is salt/loader — Salt's dynamic plugin-loading mechanism, the architectural spine
+  that every one of the ~25 loader-managed plugin categories (execution modules, states, runners,
+  returners, grains, beacons, engines, cache, wheels, outputters, renderers, roster, sdb, and
+  more) is built on. Nothing in this codebase imports a plugin file by its dotted Python path;
+  instead, `LazyLoader` walks a set of directories at runtime, evaluates each candidate module's
+  __virtual__() gate, and exposes the surviving functions as a dict-like object keyed
+  "<module>.<function>". salt/loader/__init__.py provides one factory routine per plugin
+  category, each just a differently-tagged, differently-packed `LazyLoader` construction.
+
+---
+
+"LazyLoader(module_dirs: list[str], opts: dict[str, object], tag: str, loaded_base_name: str | None, mod_type_check: object | None, pack: dict[str, object] | None, whitelist: list[str] | None, virtual_enable: bool, static_modules: list[str] | None, proxy: LazyLoader | None, virtual_funcs: list[str] | None, extra_module_dirs: list[str] | None, pack_self: str | None)":
+  location: lazy.py
+  annotations: |
+    A dict-like object whose keys are "<module>.<function>" names and whose values are the
+    actual functions, imported from disk and validated on first access (or eagerly, if iterated).
+    One `LazyLoader` instance backs every plugin category (`tag` distinguishes them: "module"
+    for execution modules, "states", "returner", "runners", "grains", "cache", ...).
+
+    `module_dirs`: directories to scan for candidate plugin files, most specific first
+    `opts`: the Salt options dict; copy-on-write wrapped internally so many loaders can share one
+    options tree cheaply
+    `tag`: the plugin category name; used for per-category disable_<tag>s config and for
+    namespacing generated sys.modules entries
+    pack: mapping of dunder name (e.g. __salt__, __opts__, __utils__) to the value that
+    gets injected as a `NamedLoaderContext`-backed attribute into every module this loader loads
+    `whitelist`: restricts which module names may load at all
+    `virtual_enable`: when false, every candidate module loads unconditionally, bypassing
+    __virtual__() entirely
+    `static_modules`: pre-supplied modules to register without touching disk
+    `proxy`: an optional sibling `LazyLoader` (the proxy-minion connection modules) made available
+    to __virtual__() checks that need to inspect it
+    `virtual_funcs`: extra gate-function names (beyond __virtual__) that must also pass
+    `extra_module_dirs`: additional import search paths made available while loading (used to let
+    execution/state modules import sibling salt/utils files that aren't on sys.path)
+    pack_self: when set, this loader packs *itself* into every module it loads under this dunder
+    name (e.g. "__salt__", "__states__", "__executors__"), letting a module call back into
+    its own sibling functions
+  methods:
+    "__getitem__(key: str) -> value:object": |
+      Load (if not already loaded) and return the function registered under `key`
+      ("<module>.<function>"), wrapped so it always runs inside this loader's context.
+    "missing_fun_string(function_name: str) -> message:str": |
+      Return a human-readable explanation for why `function_name` is unavailable: either the
+      module was never found, or its __virtual__() rejected it (with the rejection reason, if
+      one was given).
+    "run(_func_or_method: object, ...args: object, ...kwargs: object) -> result:object": |
+      Invoke `_func_or_method` with this loader established as the active loader context for the
+      duration of the call, so any dunder access inside it resolves against this loader's pack.
+    "_process_virtual(mod: object, module_name: str, virtual_func: str) -> loadable:bool": |
+      Implements the __virtual__ extension-point convention: calls mod.__virtual__() (or the
+      function named by `virtual_func`) and interprets its result.
+
+      `mod`: the freshly-imported candidate module object
+      `module_name`: the name the module would be registered under by default
+      `virtual_func`: the gate-function name to call, normally "__virtual__"
+
+      Algorithm:
+      1. Call the gate function; a falsy return value (False, None, or (False, reason))
+         rejects the module — it is recorded in missing_modules and none of its functions are
+         registered
+      2. A True return accepts the module under its default name
+      3. A `str` return accepts the module but re-registers it under that string as the effective
+         module name instead (the mechanism several OS-specific pkg/service-style modules use
+         to all present themselves as the same virtual name, e.g. pkg)
+      4. Compare the resolved name against the module's own __virtualname__, if declared, and
+         log a mismatch
+    "clean_modules()": |
+      Remove this loader's tag-specific entries from sys.modules, without touching shared base
+      stub namespaces or other loaders' entries.
+  properties:
+    "opts -> dict[str, object]": |
+      This loader's copy-on-write options tree, as passed to every module it loads.
+    "missing_modules -> dict[str, str]": |
+      Maps a rejected module name to the reason it was rejected (typically the __virtual__()
+      failure message).
+    "loaded_modules -> set[str]": |
+      Names of modules that have successfully loaded and registered at least one function so far.
+
+"LoaderContext()":
+  location: context.py
+  annotations: |
+    Injected as <loaded module>.__salt_loader__; the indirection point through which a loaded
+    module's `NamedLoaderContext` dunders (see `NamedLoaderContext`) find "the currently active
+    `LazyLoader`" without holding a direct reference to it (important because the active loader
+    changes across threads and across nested loader calls).
+  methods:
+    "loader() -> loader:LazyLoader": |
+      Return the `LazyLoader` currently active in this execution context. Raises AttributeError
+      if no loader context has been established (i.e. called from outside any loader-run call).
+    "named_context(name: str, default: object, ctx_class: type) -> context:NamedLoaderContext": |
+      Build a `NamedLoaderContext` bound to this `LoaderContext`, for a dunder named name.
+
+"NamedLoaderContext(name: str, loader_context: LoaderContext, default: object)":
+  location: context.py
+  annotations: |
+    A lazy proxy for one dunder (__salt__, __utils__, __opts__, __grains__, __pillar__,
+    __context__, ...). Modules reference the dunder as if it were a plain injected value;
+    resolution against the actual, currently-active `LazyLoader` happens on every access via
+    value(), so the same proxy object correctly reflects whichever loader/thread is currently
+    running.
+  methods:
+    "value() -> value:object": |
+      Resolve and return the live value this dunder currently refers to, by asking loader_context
+      for the active `LazyLoader` and reading its pack (or the loader itself, if name matches
+      that loader's pack_self). Raises a loader error if no packed value exists for name.
+    "loader() -> loader:LazyLoader | None": |
+      Return the active `LazyLoader`, or None if no loader context is established (unlike
+      LoaderContext.loader, this does not raise).
+    "with_default(default: object) -> context:NamedLoaderContext": |
+      Return a copy of this proxy with a different fallback `default`, used when no loader context
+      is active at all.
+
+"minion_mods(opts: dict[str, object], context: dict[str, object] | None, utils: LazyLoader | None, whitelist: list[str] | None, loaded_base_name: str | None, notify: bool, static_modules: list[str] | None, proxy: LazyLoader | None, pillar: dict[str, object] | None, file_client: object | None) -> functions:LazyLoader":
+  location: __init__.py
+  annotations: |
+    Build the execution-modules `LazyLoader` (tag "module") — the object every minion, and every
+    state function, calls __salt__['<module>.<function>'] against. This is the single most
+    widely consumed loader-category in the codebase.
+
+    `opts`: the Salt options dictionary
+    `context`: shared context dict injected as __context__ into every loaded module
+    `utils`: a `LazyLoader` (from `utils`) injected as __utils__
+    `whitelist`: restrict which execution modules may load
+    `notify`: when true, fire a MINION_MOD_REFRESH_COMPLETE event once loading finishes
+    `functions`: the resulting execution-modules `LazyLoader`, conventionally bound as __salt__
+
+"states(opts: dict[str, object], functions: LazyLoader, utils: LazyLoader, serializers: LazyLoader, whitelist: list[str] | None, proxy: LazyLoader | None, context: dict[str, object] | None, loaded_base_name: str | None, file_client: object | None, minion_mods: LazyLoader | None) -> state_funcs:LazyLoader":
+  location: __init__.py
+  annotations: |
+    Build the state-modules `LazyLoader` (tag "states"), conventionally bound as __states__.
+
+    `functions`: the execution-modules `LazyLoader` (from `minion_mods`) packed as __salt__ so
+    state functions can delegate to execution modules
+    `utils`: packed as __utils__
+    `serializers`: packed as __serializers__
+    `minion_mods`: when given, packed as __minion__ — an escape hatch back to the managing
+    minion's own execution modules for state functions running in a resource context
+    `state_funcs`: the resulting state-modules `LazyLoader`
+
+"runner(opts: dict[str, object], utils: LazyLoader | None, context: dict[str, object] | None, whitelist: list[str] | None, loaded_base_name: str | None) -> runner_funcs:LazyLoader":
+  location: __init__.py
+  annotations: |
+    Build the master-side runners `LazyLoader` (tag "runners"), packed as __salt__ (a distinct
+    dict from the minion-side __salt__ produced by `minion_mods`; runners only ever run on a
+    master and never receive minion dunders like __grains__).
+
+"returners(opts: dict[str, object], functions: LazyLoader, whitelist: list[str] | None, context: dict[str, object] | None, proxy: LazyLoader | None, loaded_base_name: str | None) -> returner_funcs:LazyLoader":
+  location: __init__.py
+  annotations: |
+    Build the returners `LazyLoader` (tag "returner"), invoked whenever a minion or master needs
+    to persist job/event data to a configured backend (local_cache, a SQL returner, syslog, ...).
+
+    `functions`: packed as __salt__ so a returner can call back into execution modules
+
+"utils(opts: dict[str, object], whitelist: list[str] | None, context: dict[str, object] | None, proxy: LazyLoader | None, file_client: object | None, pillar: dict[str, object] | None, pack_self: str | None, loaded_base_name: str | None) -> util_funcs:LazyLoader":
+  location: __init__.py
+  annotations: |
+    Build the __utils__ `LazyLoader` (tag "utils") over the same salt/utils directory
+    documented in the salt/utils cell, exposing a subset of it via dynamic
+    __utils__['<file>.<function>'] lookup in addition to static import salt.utils.<file>.
+
+"grains(opts: dict[str, object], force_refresh: bool, proxy: LazyLoader | None, context: dict[str, object] | None, loaded_base_name: str | None) -> grain_data:dict[str, object]":
+  location: __init__.py
+  annotations: |
+    Compute the full grains dict for this minion: loads the grains `LazyLoader`
+    (grain_funcs, tag "grains"), runs core.* grain functions first, then every other grains
+    module, deep-merges the results, applies any grains_blacklist, and (unless `force_refresh`
+    or grains_cache is disabled) reads/writes a disk cache at <cachedir>/grains.cache.p.
+
+    `force_refresh`: bypass the on-disk grains cache and recompute
+    `proxy`: for proxy minions, the connection-module `LazyLoader` grain functions may need to
+    reach the controlled device
+    `grain_data`: the merged, decoded grains dict (grain functions run before __salt__ exists,
+    so they never receive it — only __opts__, previously-computed __grains__, and `proxy`)
+
+"cache(opts: dict[str, object], loaded_base_name: str | None) -> cache_funcs:LazyLoader":
+  location: __init__.py
+  annotations: |
+    Build the cache-backend `LazyLoader` (tag "cache") — the dynamically-dispatched driver
+    layer that salt/cache's Cache facade delegates to via its modules property.
+
+---
+
+Author: Goga
+CreatedAt: 26/08/26
+Description: |
+  The dynamic plugin-loading mechanism (`LazyLoader`, `LoaderContext`/`NamedLoaderContext`, and
+  the per-category factory routines in salt/loader/__init__.py). This is the repository's real
+  architectural spine: every plugin-category cell in this forest (`salt/modules`, `salt/states`,
+  `salt/runners`, `salt/returners`, salt/cache, `salt/grains`) is a directory of files this
+  mechanism discovers and loads, and the root `salt` cell's `Minion`/`Master` classes are the
+  composition root that calls these factory routines at daemon startup.

@@ -1,0 +1,131 @@
+Usages:
+  merge_semantics: |
+    Table never interprets item contents. On every background merge of parts, it invokes the
+    caller-supplied PrepareBlockCallback with the raw sorted byte-string items about to be
+    written, letting the caller transform, deduplicate, or drop items before they hit disk.
+    This is the only domain-specific hook in the whole engine — everything else operates on
+    opaque, lexicographically-sortable byte slices.
+
+Annotations: |
+  This cell is a generic, storage-domain-agnostic merge-sorted key-value engine — a lightweight
+  LSM-tree: items are buffered in-memory, converted into immutable compressed parts, and
+  background-merged using a size-tiered strategy, with sorted iteration/prefix-seek search over
+  the merged view. It has no knowledge of tags, metric IDs, or time series.
+
+  Use `merge_semantics` to understand how a caller (e.g. an inverted index) layers
+  domain-specific merge behavior on top without this cell's involvement.
+
+---
+
+"Table(path: string, flushInterval: time.Duration, prepareBlock: PrepareBlockCallback, isReadOnly: bool)":
+  location: table.go
+  annotations: |
+    Obtained via the MustOpenTable factory. Owns the full lifecycle of ingested items: an
+    in-memory buffer, background conversion to compressed on-disk/in-memory parts, background
+    merging of parts, and snapshotting.
+
+    `path`: on-disk directory for this table's parts
+    `flushInterval`: how often buffered in-memory data is force-flushed
+    `prepareBlock`: see `merge_semantics`
+    `isReadOnly`: when true, disables background merging (e.g. during a read-only replica mode)
+  methods:
+    "AddItems(items: [][]byte)": |
+      Ingest new sorted-key items into the table's in-memory buffer.
+    "UpdateMetrics(m: TableMetrics)": |
+      Populate `m` with the table's current size/throughput counters.
+    "DebugFlush()": |
+      Force all buffered in-memory data to become searchable immediately (used by tests and
+      admin endpoints, not the hot path).
+    "MustCreateSnapshotAt(dstDir: string)": |
+      Hard-link all current parts into `dstDir`, producing a consistent point-in-time snapshot.
+    "Path() -> path:string": |
+      Return the table's on-disk directory.
+    "MustClose()": |
+      Stop all background merge/flush goroutines and release resources.
+
+"TableMetrics()":
+  location: table.go
+  annotations: |
+    Plain snapshot of table-level counters (items added, in-memory/file part counts, data-block
+    cache size, etc.), populated in place by `Table`'s own UpdateMetrics method.
+  methods:
+    "TotalItemsCount() -> count:uint64": |
+      Sum of items currently held across in-memory and on-disk parts.
+
+"Item(start: uint32, end: uint32)":
+  location: encoding.go
+  annotations: |
+    A lightweight offset-pair view into a shared byte buffer — the unit `Table` and
+    `PrepareBlockCallback` operate on. Avoids per-item allocation: many `Item`s reference slices
+    of one larger buffer.
+  methods:
+    "Bytes(data: []byte) -> value:[]byte": |
+      Resolve this item's byte range against the shared buffer `data`.
+    "String(data: []byte) -> value:string": |
+      Same as this type's own Bytes method, returned as a string.
+
+"PrepareBlockCallback(data: []byte, items: []Item) -> data:[]byte, items:[]Item":
+  location: merge.go
+  annotations: |
+    Caller-supplied hook invoked during every background merge of parts, before the merged
+    block is written out.
+
+    `data`: shared backing buffer for `items`
+    `items`: sorted `Item`s about to be merged into one block
+
+    Use `merge_semantics` for what implementations of this callback are expected to do.
+
+    Requirements:
+    - Returned `items` must remain sorted and reference valid ranges of the returned `data`
+
+"TableSearch(tb: Table, sparse: bool)":
+  location: table_search.go
+  annotations: |
+    Reusable cursor for sorted iteration and prefix-seek search over a `Table`.
+
+    `sparse`: when true, uses a lighter-weight index-block cache suited for infrequent,
+    full-table scans instead of hot repeated lookups.
+  properties:
+    "Item -> []byte": |
+      The item at the cursor's current position; valid only right after a successful call to
+      this type's own NextItem or FirstItemWithPrefix method.
+  methods:
+    "Seek(k: []byte)": |
+      Position the cursor at the first item greater than or equal to `k`.
+    "FirstItemWithPrefix(prefix: []byte) -> err:error": |
+      Position the cursor at the first item starting with `prefix`.
+    "NextItem() -> found:bool": |
+      Advance the cursor; `found` is false once no more items are available.
+    "Error() -> err:error": |
+      Return any error encountered during iteration.
+    "MustClose()": |
+      Release resources held by this cursor.
+
+"SetIndexBlocksCacheSize(size: int)":
+  location: part.go
+  annotations: |
+    Set the process-wide cache size (in bytes) for decoded index blocks shared across all
+    tables in the process.
+
+"SetDataBlocksCacheSize(size: int)":
+  location: part.go
+  annotations: |
+    Set the process-wide cache size (in bytes) for decoded data blocks used by hot,
+    repeated (non-sparse) searches.
+
+"SetDataBlocksSparseCacheSize(size: int)":
+  location: part.go
+  annotations: |
+    Set the process-wide cache size (in bytes) for decoded data blocks used by sparse,
+    infrequent (e.g. full-scan) searches; see `TableSearch`'s sparse parameter.
+
+---
+
+Author: Goga
+CreatedAt: 26/08/26
+Description: |
+  Generic merge-sorted key-value storage primitive underlying `lib/storage`'s inverted index
+  (indexDB). Confirmed by source reading and import-graph analysis to have exactly one
+  production caller in the whole repository (`lib/storage/index_db.go`) plus a config-only
+  touch from `app/vmstorage` (cache-size flags) — genuinely a self-contained, reusable building
+  block, not storage-specific logic duplicated elsewhere.

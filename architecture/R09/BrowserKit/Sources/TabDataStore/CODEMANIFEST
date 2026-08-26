@@ -1,0 +1,154 @@
+Imports:
+  - Types:
+      - Logger
+    From: BrowserKit/Sources/Common/Logger
+
+Usages:
+  backup_on_write: |
+    Before a window's data file is overwritten, the previous copy is saved as a backup file, so
+    that a read failure on the primary file can fall back to the last known-good backup instead
+    of losing all tab state for that window.
+  throttled_writes: |
+    Non-forced window-data saves are throttled: a save is scheduled to run once, a fixed delay
+    after the throttle window opens, and any additional non-forced save requests that arrive
+    while a save is already scheduled are coalesced into that one pending write rather than
+    triggering a new disk write each time.
+
+Annotations: |
+  This cell owns on-disk persistence of open tabs and windows, so they can be restored after the
+  app is killed and relaunched: `WindowData`/`TabData` are the persisted shapes, `TabDataStore`
+  persists whole windows (lists of tabs), `TabSessionStore` persists one tab's WebKit session
+  restoration blob separately (keyed by tab id, not bundled into `WindowData`), and
+  `TabFileManager` is the file-system abstraction both stores are built on.
+
+  Use `backup_on_write` and `throttled_writes` when reasoning about `TabDataStore`'s save path.
+
+---
+
+"TabData(id: UUID, title: String?, siteUrl: String, faviconURL: String?, isPrivate: Bool, lastUsedTime: Date, createdAtTime: Date, temporaryDocumentSession: TemporaryDocumentSession?)":
+  location: TabData.swift
+  annotations: |
+    Persisted snapshot of one tab.
+
+    `id`: stable identifier of the tab
+    `title`: page title at the time of saving
+    `siteUrl`: URL of the tab's current page
+    `faviconURL`: URL of the tab's favicon
+    `isPrivate`: whether this is a private-browsing tab
+    `lastUsedTime`: when the tab was last the active tab
+    `createdAtTime`: when the tab was created
+    `temporaryDocumentSession`: map of locally-downloaded temporary document file locations to
+    their original source URL, for tabs viewing a downloaded document
+
+"WindowData(id: UUID, activeTabId: UUID, tabData: [TabData])":
+  location: WindowData.swift
+  annotations: |
+    Persisted snapshot of one browser window: which tab is active and the full list of tabs.
+
+    `id`: stable identifier of the window
+    `activeTabId`: identifier of the currently selected tab in the window's tab list
+    `tabData`: every tab currently open in this window
+
+"TabFileManager()":
+  location: TabFileManager.swift
+  annotations: |
+    File-system operations `TabDataStore`/`TabSessionStore` need, kept behind a protocol so
+    persistence logic is testable without touching the real disk.
+  methods:
+    "tabSessionDataDirectory() -> url:URL?": |
+      Directory used to store per-tab session-restoration files.
+    "windowDataDirectory(isBackup: Bool) -> url:URL?": |
+      Directory used to store window-data files.
+
+      `isBackup`: whether to return the backup directory instead of the primary one
+    "contentsOfDirectory(at path: URL) -> urls:[URL]": |
+      List the files at `path`.
+    "copyItem(at sourceURL: URL, to destinationURL: URL)": |
+      Copy a file, overwriting any existing file at the destination.
+    "removeAllFilesAt(directory: URL)": |
+      Delete every file directly inside `directory`.
+    "fileExists(atPath pathURL: URL) -> exists:Bool": |
+      Whether a file exists at `pathURL`.
+    "createDirectoryAtPath(path: URL)": |
+      Create `path`, including any missing intermediate directories.
+    "getWindowDataFromPath(path: URL) -> windowData:WindowData?": |
+      Decode a `WindowData` value from the JSON file at `path`.
+    "writeWindowData(windowData: WindowData, to url: URL)": |
+      Encode `windowData` as JSON and write it atomically to `url`.
+    "removeFileAt(path: URL)": |
+      Delete the file at `path`.
+
+"TabFileManager::DefaultTabFileManager(fileManager: FileManager, logger: Logger)":
+  location: TabFileManager.swift
+  annotations: |
+    Concrete `TabFileManager` backed by the platform's file manager, rooted under the app
+    group's shared container so the main app and its extensions see the same tab data.
+
+    `fileManager`: defaults to the platform's default file manager
+    `logger`: diagnostic logger; defaults to the app-wide `Logger` singleton
+
+"TabSessionStore()":
+  location: TabSessionStore.swift
+  annotations: |
+    Persists the WebKit session-restoration blob for one tab, separately from `WindowData` so
+    large session payloads don't bloat the window-data file.
+  methods:
+    "saveTabSession(tabID: UUID, sessionData: Data)": |
+      Write `sessionData` to the file for `tabID`, creating the containing directory if needed.
+    "fetchTabSession(tabID: UUID) -> data:Data?": |
+      Read the previously saved session data for `tabID`, if any.
+    "deleteUnusedTabSessionData(keeping: [UUID])": |
+      Delete every stored session file whose tab id is not in `keeping`.
+
+      `keeping`: ids of tabs that are still open
+
+"TabSessionStore::DefaultTabSessionStore(fileManager: TabFileManager, logger: Logger)":
+  location: TabSessionStore.swift
+  annotations: |
+    Concrete `TabSessionStore`, using `TabFileManager` for disk access.
+
+    `fileManager`: defaults to `DefaultTabFileManager`
+    `logger`: diagnostic logger; defaults to the app-wide `Logger` singleton
+
+"TabDataStore()":
+  location: TabDataStore.swift
+  annotations: |
+    Persists and restores whole-window tab lists.
+  methods:
+    "fetchWindowData(uuid: UUID) -> window:WindowData?": |
+      Load the previously saved `WindowData` for `uuid`, falling back to the backup file if the
+      primary file is missing or fails to parse.
+
+      Use `backup_on_write` for why a backup file exists to fall back to.
+    "saveWindowData(window: WindowData, forced: Bool)": |
+      Persist `window`.
+
+      `forced`: when true, write immediately; when false, use the throttled path
+
+      Use `throttled_writes` and `backup_on_write` for the save/backup behavior.
+    "clearAllWindowsData()": |
+      Delete every saved window-data file, including backups.
+    "fetchWindowDataUUIDs() -> uuids:[WindowUUID]": |
+      List the UUIDs of every window with saved data on disk, without decoding any of them.
+      Cheaper than fetching full `WindowData` when only the id list is needed.
+    "removeWindowData(forUUIDs: [WindowUUID])": |
+      Delete the saved data for exactly the given window UUIDs, leaving others untouched.
+
+"TabDataStore::DefaultTabDataStore(logger: Logger, fileManager: TabFileManager, throttleTime: UInt64)":
+  location: TabDataStore.swift
+  annotations: |
+    Concrete `TabDataStore`, using `TabFileManager` for disk access and `Logger` for diagnostics
+    of save/fetch failures.
+
+    `logger`: diagnostic logger; defaults to the app-wide `Logger` singleton
+    `fileManager`: disk-access abstraction; defaults to `DefaultTabFileManager`
+    `throttleTime`: delay, in nanoseconds, used by the throttled-save path (see
+    `throttled_writes`); defaults to two seconds
+
+---
+
+Author: Goga
+CreatedAt: 26/08/26
+Description: |
+  On-disk persistence for open tabs/windows and per-tab session-restoration data. Depends only
+  on `Common/Logger`.

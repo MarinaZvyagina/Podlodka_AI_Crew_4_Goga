@@ -1,0 +1,90 @@
+Imports:
+  - Types:
+      - Backend
+    From: server/storage/backend
+
+Usages:
+  callback_decoupling: |
+    This cell's own comments state the reason for its two function-type extension points
+    (RangeDeleter, Checkpointer): "defined here to avoid circular dependency with mvcc". The
+    mvcc cell and the etcdserver cell each push a closure into this cell (SetRangeDeleter,
+    SetCheckpointer) rather than this cell importing them — keep new cross-cutting lease
+    behavior on this same pattern instead of adding a new outbound import.
+
+Annotations: |
+  This cell owns TTL-based key expiration grouped under lease IDs: granting/revoking/renewing/
+  checkpointing leases, tracking which keys are attached to which lease, and running a
+  background loop that finds expired leases and due checkpoints on a fixed tick. It persists
+  lease metadata directly against the imported `Backend`. It decouples itself from the two
+  callers that must react to lease events (the mvcc cell, which deletes the actual keys on
+  expiry/revocation, and the etcdserver cell, which turns a checkpoint into a proposed raft
+  request) via `callback_decoupling`, rather than importing either of them.
+
+  Use `Backend` for lease persistence exactly as the imported contract describes.
+
+---
+
+"Lessor(be Backend, cfg LessorConfig)":
+  location: lessor.go
+  annotations: |
+    Owns every lease: grants, revocations, renewals, checkpointing, and the attach/detach
+    relationship between leases and the keys backed by them.
+
+    `be`: the imported `Backend` used to persist lease records.
+    `cfg`: minimum TTL, checkpoint interval, and checkpoint-persistence settings.
+  methods:
+    "Grant(id int64, ttlSeconds int64) -> lease:Lease, err:error": |
+      Create a new lease that expires at least `ttlSeconds` from now.
+    "Revoke(id int64) -> err:error": |
+      Revoke a lease immediately, invoking the registered range-deleter callback (see
+      `callback_decoupling`) to delete every key attached to it.
+    "Renew(id int64) -> ttlSeconds:int64, err:error": |
+      Reset a lease's expiry to a full TTL from now.
+    "Lookup(id int64) -> lease:Lease": |
+      Return the lease for `id`, or nil if it does not exist or has expired.
+    "Attach(id int64, items []LeaseItem) -> err:error": |
+      Associate `items` (keys) with an existing lease.
+    "Detach(id int64, items []LeaseItem) -> err:error": |
+      Remove the association between `items` and a lease, without revoking the lease itself.
+    "Promote(extend Duration)": |
+      Become the primary lessor responsible for expiring and renewing leases, extending every
+      existing lease's TTL by `extend` to smooth over the leadership transition.
+    "Demote()": |
+      Stop acting as the primary lessor (e.g. on loss of raft leadership).
+    "Checkpoint(id int64, remainingTTL int64) -> err:error": |
+      Apply a previously-agreed remaining TTL to a lease, used after the registered
+      checkpointer callback (see `callback_decoupling`) round-trips a checkpoint through raft
+      consensus.
+    "ExpiredLeasesC() -> leases:[]Lease": |
+      Delivered as a channel of expired-lease batches in the real implementation; consumed by
+      the caller to drive revocation.
+    "SetRangeDeleter(rangeDeleter RangeDeleterFunc)": |
+      Register the callback used to delete keys on lease revocation/expiry. See
+      `callback_decoupling`.
+    "SetCheckpointer(checkpointer CheckpointerFunc)": |
+      Register the callback used to propose a checkpoint through raft consensus. See
+      `callback_decoupling`.
+
+"Lease()":
+  location: lease.go
+  annotations: |
+    One granted lease: its ID, remaining TTL, and the set of keys currently attached to it.
+  properties:
+    "ID -> int64": |
+      Unique lease identifier.
+  methods:
+    "TTL() -> ttlSeconds:int64": |
+      The full TTL this lease was granted or last renewed with.
+    "Remaining() -> remaining:Duration": |
+      Time remaining until this lease expires.
+    "Keys() -> keys:[]string": |
+      Every key currently attached to this lease.
+
+---
+
+Author: Goga
+CreatedAt: 26/08/26
+Description: |
+  TTL-based key-expiration subsystem. Depends only on `server/storage/backend` for persistence;
+  decouples from the mvcc/etcdserver cells that react to its events via injected callbacks
+  rather than an outbound import.

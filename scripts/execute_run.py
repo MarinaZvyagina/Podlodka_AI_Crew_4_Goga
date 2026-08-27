@@ -179,13 +179,58 @@ def run_validators(worktree, repo_id, task_letter, env):
     return results
 
 
+def free_disk_gb():
+    total, used, free = shutil.disk_usage("/")
+    return free / (1024 ** 3)
+
+
+def clean_xcode_caches():
+    """
+    Xcode DerivedData/CoreSimulator regrow every time an R09/R10 (Swift) run does a real
+    build, and are by far the largest recurring disk consumer on this machine (repeatedly
+    observed at 15-25GB each). The user explicitly approved clearing these as the standing
+    fix for low disk space; automate it here so the 800-run batch is self-sufficient rather
+    than needing a manual cleanup pass every time a Swift-heavy run pushes disk to the edge.
+    Safe: DerivedData/simulator state is a rebuildable cache, never the user's own data.
+    """
+    subprocess.run(["rm", "-rf", os.path.expanduser("~/Library/Developer/Xcode/DerivedData")],
+                    check=False)
+    subprocess.run(["xcrun", "simctl", "delete", "unavailable"], check=False, capture_output=True)
+
+
+def wait_for_disk_space(min_gb=3.0, max_wait_s=1800, poll_s=30):
+    """
+    Running two heavy batches concurrently (or one very large repo mid-checkout) can
+    exhaust disk fast enough to corrupt an in-flight `git worktree add` (observed: a real
+    "No space left on device" mid-checkout failure). Rather than starting a run that's
+    likely to fail this way, pause and let concurrent cleanup (other runs finishing) free
+    space back up, for up to max_wait_s before proceeding anyway.
+    """
+    if free_disk_gb() < min_gb:
+        print(f"Low disk ({free_disk_gb():.1f}GB free) -- clearing Xcode DerivedData/simulator caches...")
+        clean_xcode_caches()
+    waited = 0
+    while free_disk_gb() < min_gb and waited < max_wait_s:
+        print(f"Low disk ({free_disk_gb():.1f}GB free, need >{min_gb}GB) -- waiting {poll_s}s...")
+        time.sleep(poll_s)
+        waited += poll_s
+
+
 def main():
+    wait_for_disk_space(min_gb=6.0)
     run_number = int(sys.argv[1])
     row = load_plan_row(run_number)
     repo_id = row["repository"]
     task_letter = row["task"]
     condition = row["condition"]
     run_id = row["run_id"]
+
+    # Optional replacement-run suffix (PROTOCOL.md §15): if an original run went INVALID
+    # due to an infrastructure problem, re-run the exact same experiment_plan.csv row under
+    # a new run_id rather than silently overwriting/deleting the invalid record.
+    if len(sys.argv) > 2 and sys.argv[2] == "--replacement":
+        suffix = sys.argv[3] if len(sys.argv) > 3 else "1"
+        run_id = f"{run_id}-RETRY{suffix}"
 
     run_dir = BENCH_ROOT / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -207,7 +252,13 @@ def main():
     func_res = {}
     arch_res = {}
     try:
-        # 1. Clean-room worktree
+        # 1. Clean-room worktree. Self-heal first: if a previous run for this exact run_id
+        # was SIGKILLed mid-flight (e.g. the batch process was force-stopped), Python's
+        # `finally` cleanup below never got to run, leaving a stale "registered but missing"
+        # worktree entry that would otherwise make `git worktree add` fail here every time.
+        sh(["git", "worktree", "prune"], cwd=base_clone, check=False)
+        if worktree.exists():
+            shutil.rmtree(worktree, ignore_errors=True)
         sh(["git", "worktree", "add", "--detach", str(worktree), commit], cwd=base_clone)
         link_shared_deps(worktree, base_clone)
 
@@ -226,26 +277,65 @@ def main():
         prompt_text = prompt_path.read_text()
         (run_dir / "prompt.txt").write_text(prompt_text)
 
-        # 4. Launch claude -p
+        # 4. Launch claude -p. If the account's own usage/session limit is hit, this fails
+        # instantly with zero cost/tokens consumed -- nothing real was attempted, so this is
+        # an infrastructure block, not a data point. Retry with backoff (up to ~5.5 hours,
+        # comfortably past the observed 5-hour rolling window) rather than recording a
+        # spurious $0 ERROR row that would otherwise need a manual replacement run.
         env = build_env(repo_id)
-        t0 = time.time()
-        proc = subprocess.run(
-            ["claude", "-p", prompt_text,
-             "--model", MODEL,
-             "--permission-mode", "bypassPermissions",
-             "--output-format", "json",
-             "--no-session-persistence",
-             "--max-budget-usd", MAX_BUDGET_USD],
-            cwd=worktree, env=env, capture_output=True, text=True, timeout=TIMEOUT_SECONDS,
-        )
-        agent_time = time.time() - t0
+        max_retries = 66
+        retry_wait_s = 300
+        for attempt in range(max_retries):
+            t0 = time.time()
+            proc = subprocess.run(
+                ["claude", "-p", prompt_text,
+                 "--model", MODEL,
+                 "--permission-mode", "bypassPermissions",
+                 "--output-format", "json",
+                 "--no-session-persistence",
+                 "--max-budget-usd", MAX_BUDGET_USD],
+                cwd=worktree, env=env, capture_output=True, text=True, timeout=TIMEOUT_SECONDS,
+            )
+            agent_time = time.time() - t0
+            try:
+                agent_json = json.loads(proc.stdout)
+            except json.JSONDecodeError:
+                agent_json = {"is_error": True, "result": "PARSE_ERROR", "raw_stdout_tail": proc.stdout[-2000:]}
+
+            result_text = str(agent_json.get("result", "")).lower()
+            hit_rate_limit = (
+                agent_json.get("is_error")
+                and agent_json.get("total_cost_usd", 0) == 0
+                and ("session limit" in result_text or agent_json.get("api_error_status") == 429)
+            )
+            # "Connection closed mid-response" is a transport-level failure seen throughout
+            # this whole benchmark project (affecting subagents in every prior phase too) --
+            # an infrastructure hiccup unrelated to the model's actual task performance, not
+            # a real attempt at the task. Unlike the rate-limit case this can strike with
+            # real cost already incurred; reset the worktree to a clean state before retrying
+            # so the retried attempt is still a genuine, independent clean-room run.
+            hit_transport_error = (
+                agent_json.get("is_error")
+                and ("connection closed" in result_text or "api error" in result_text)
+                and not hit_rate_limit
+            )
+            max_transport_retries = 3
+            if hit_rate_limit and attempt < max_retries - 1:
+                print(f"[{run_id}] hit session/usage limit ('{agent_json.get('result')}'), "
+                      f"waiting {retry_wait_s}s before retry {attempt + 1}/{max_retries}...")
+                time.sleep(retry_wait_s)
+                continue
+            if hit_transport_error and attempt < max_transport_retries:
+                print(f"[{run_id}] transport error ('{agent_json.get('result')}'), "
+                      f"resetting worktree and retrying ({attempt + 1}/{max_transport_retries})...")
+                sh(["git", "checkout", "--", "."], cwd=worktree, check=False)
+                sh(["git", "clean", "-fd"], cwd=worktree, check=False)
+                time.sleep(20)
+                continue
+            break
+
         (run_dir / "agent.log").write_text(proc.stdout)
         (run_dir / "stderr.log").write_text(proc.stderr)
-
-        try:
-            agent_json = json.loads(proc.stdout)
-        except json.JSONDecodeError:
-            agent_json = {"is_error": True, "result": "PARSE_ERROR", "raw_stdout_tail": proc.stdout[-2000:]}
 
         # 5. Capture diff/status. Stage everything first so untracked new files (the norm,
         # not the exception, for real coding tasks) show up in the diff too -- `git diff`

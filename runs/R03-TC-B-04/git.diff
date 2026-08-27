@@ -1,0 +1,358 @@
+diff --git a/packages/common/constants.ts b/packages/common/constants.ts
+index 71f2768..86e902d 100644
+--- a/packages/common/constants.ts
++++ b/packages/common/constants.ts
+@@ -42,6 +42,7 @@ export const RESPONSE_PASSTHROUGH_METADATA = '__responsePassthrough__';
+ export const SSE_METADATA = '__sse__';
+ export const VERSION_METADATA = '__version__';
+ export const INJECTABLE_WATERMARK = '__injectable__';
++export const MAINTENANCE_MODE_METADATA = '__maintenanceMode__';
+ export const CONTROLLER_WATERMARK = '__controller__';
+ export const CATCH_WATERMARK = '__catch__';
+ export const ENTRY_PROVIDER_WATERMARK = '__entryProvider__';
+diff --git a/packages/common/decorators/core/index.ts b/packages/common/decorators/core/index.ts
+index df92e2d..5761505 100644
+--- a/packages/common/decorators/core/index.ts
++++ b/packages/common/decorators/core/index.ts
+@@ -5,6 +5,7 @@ export * from './dependencies.decorator.js';
+ export * from './exception-filters.decorator.js';
+ export * from './inject.decorator.js';
+ export * from './injectable.decorator.js';
++export * from './maintenance-mode.decorator.js';
+ export * from './optional.decorator.js';
+ export * from './set-metadata.decorator.js';
+ export * from './use-guards.decorator.js';
+diff --git a/packages/common/decorators/core/maintenance-mode.decorator.ts b/packages/common/decorators/core/maintenance-mode.decorator.ts
+new file mode 100644
+index 0000000..7988795
+--- /dev/null
++++ b/packages/common/decorators/core/maintenance-mode.decorator.ts
+@@ -0,0 +1,34 @@
++import { MAINTENANCE_MODE_METADATA } from '../../constants.js';
++
++/**
++ * Decorator that marks a controller or an individual handler (HTTP route
++ * handler or WebSocket message handler) as affected by maintenance mode.
++ *
++ * When `@MaintenanceMode()` is used at the controller/gateway level, every
++ * handler declared on that class is affected.
++ *
++ * When it's used on an individual method, only that handler is affected.
++ *
++ * Marking a handler does not, by itself, reject any calls. It only flags the
++ * handler so that `MaintenanceModeGuard` can reject calls to it while
++ * maintenance mode is toggled on (via `MaintenanceModeService`); handlers
++ * that aren't marked are always let through.
++ *
++ * @see [Guards](https://docs.nestjs.com/guards)
++ *
++ * @publicApi
++ */
++export function MaintenanceMode(): MethodDecorator & ClassDecorator {
++  return (
++    target: any,
++    key?: string | symbol,
++    descriptor?: TypedPropertyDescriptor<any>,
++  ) => {
++    if (descriptor) {
++      Reflect.defineMetadata(MAINTENANCE_MODE_METADATA, true, descriptor.value);
++      return descriptor;
++    }
++    Reflect.defineMetadata(MAINTENANCE_MODE_METADATA, true, target);
++    return target;
++  };
++}
+diff --git a/packages/common/guards/index.ts b/packages/common/guards/index.ts
+new file mode 100644
+index 0000000..03a8c00
+--- /dev/null
++++ b/packages/common/guards/index.ts
+@@ -0,0 +1 @@
++export * from './maintenance-mode.guard.js';
+diff --git a/packages/common/guards/maintenance-mode.guard.ts b/packages/common/guards/maintenance-mode.guard.ts
+new file mode 100644
+index 0000000..e32d9ea
+--- /dev/null
++++ b/packages/common/guards/maintenance-mode.guard.ts
+@@ -0,0 +1,40 @@
++import { MAINTENANCE_MODE_METADATA } from '../constants.js';
++import { Injectable } from '../decorators/core/injectable.decorator.js';
++import { ServiceUnavailableException } from '../exceptions/service-unavailable.exception.js';
++import { CanActivate } from '../interfaces/features/can-activate.interface.js';
++import { ExecutionContext } from '../interfaces/features/execution-context.interface.js';
++import { MaintenanceModeService } from '../services/maintenance-mode.service.js';
++
++/**
++ * Rejects calls to handlers marked with `@MaintenanceMode()` while
++ * `MaintenanceModeService` reports maintenance mode as enabled; every other
++ * handler is let through untouched.
++ *
++ * Works identically for HTTP route handlers and WebSocket message handlers —
++ * bind it wherever `@UseGuards` is accepted (a controller, a gateway, an
++ * individual handler, or globally via `APP_GUARD`).
++ *
++ * @publicApi
++ */
++@Injectable()
++export class MaintenanceModeGuard implements CanActivate {
++  constructor(
++    private readonly maintenanceModeService: MaintenanceModeService,
++  ) {}
++
++  canActivate(context: ExecutionContext): boolean {
++    const isHandlerAffected =
++      Reflect.getMetadata(MAINTENANCE_MODE_METADATA, context.getHandler()) ??
++      Reflect.getMetadata(MAINTENANCE_MODE_METADATA, context.getClass());
++
++    if (!isHandlerAffected) {
++      return true;
++    }
++    if (this.maintenanceModeService.isEnabled()) {
++      throw new ServiceUnavailableException(
++        'This endpoint is temporarily unavailable due to maintenance.',
++      );
++    }
++    return true;
++  }
++}
+diff --git a/packages/common/index.ts b/packages/common/index.ts
+index c8a55c8..e12ff38 100644
+--- a/packages/common/index.ts
++++ b/packages/common/index.ts
+@@ -10,6 +10,7 @@ export * from './decorators/index.js';
+ export * from './enums/index.js';
+ export * from './exceptions/index.js';
+ export * from './file-stream/index.js';
++export * from './guards/index.js';
+ export {
+   Abstract,
+   ArgumentMetadata,
+diff --git a/packages/common/services/index.ts b/packages/common/services/index.ts
+index 34ba8f1..09e9e87 100644
+--- a/packages/common/services/index.ts
++++ b/packages/common/services/index.ts
+@@ -1,3 +1,4 @@
+ export * from './console-logger.service.js';
+ export * from './logger.service.js';
++export * from './maintenance-mode.service.js';
+ export * from './utils/filter-log-levels.util.js';
+diff --git a/packages/common/services/maintenance-mode.service.ts b/packages/common/services/maintenance-mode.service.ts
+new file mode 100644
+index 0000000..76a7347
+--- /dev/null
++++ b/packages/common/services/maintenance-mode.service.ts
+@@ -0,0 +1,39 @@
++import { Injectable } from '../decorators/core/index.js';
++
++/**
++ * Holds the runtime on/off state of maintenance mode.
++ *
++ * Injecting this service (it's a singleton by default) and calling
++ * `enable()`/`disable()` — for example from an admin endpoint — toggles
++ * maintenance mode for the whole running application, without a redeploy.
++ *
++ * `MaintenanceModeGuard` reads `isEnabled()` to decide whether to reject
++ * calls to handlers marked with `@MaintenanceMode()`.
++ *
++ * @publicApi
++ */
++@Injectable()
++export class MaintenanceModeService {
++  private isMaintenanceModeEnabled = false;
++
++  /**
++   * Turns maintenance mode on. Marked handlers start rejecting calls.
++   */
++  enable(): void {
++    this.isMaintenanceModeEnabled = true;
++  }
++
++  /**
++   * Turns maintenance mode off. Marked handlers resume working normally.
++   */
++  disable(): void {
++    this.isMaintenanceModeEnabled = false;
++  }
++
++  /**
++   * Returns whether maintenance mode is currently on.
++   */
++  isEnabled(): boolean {
++    return this.isMaintenanceModeEnabled;
++  }
++}
+diff --git a/packages/common/test/decorators/maintenance-mode.decorator.spec.ts b/packages/common/test/decorators/maintenance-mode.decorator.spec.ts
+new file mode 100644
+index 0000000..4e61873
+--- /dev/null
++++ b/packages/common/test/decorators/maintenance-mode.decorator.spec.ts
+@@ -0,0 +1,38 @@
++import { MAINTENANCE_MODE_METADATA } from '../../constants.js';
++import { MaintenanceMode } from '../../decorators/core/maintenance-mode.decorator.js';
++
++describe('@MaintenanceMode', () => {
++  @MaintenanceMode()
++  class TestController {}
++
++  class TestControllerWithMethod {
++    @MaintenanceMode()
++    public static affected() {}
++
++    public static unaffected() {}
++  }
++
++  it('should mark the class with maintenance mode metadata', () => {
++    const metadata = Reflect.getMetadata(
++      MAINTENANCE_MODE_METADATA,
++      TestController,
++    );
++    expect(metadata).toBe(true);
++  });
++
++  it('should mark the decorated method with maintenance mode metadata', () => {
++    const metadata = Reflect.getMetadata(
++      MAINTENANCE_MODE_METADATA,
++      TestControllerWithMethod.affected,
++    );
++    expect(metadata).toBe(true);
++  });
++
++  it('should leave an undecorated method without metadata', () => {
++    const metadata = Reflect.getMetadata(
++      MAINTENANCE_MODE_METADATA,
++      TestControllerWithMethod.unaffected,
++    );
++    expect(metadata).toBeUndefined();
++  });
++});
+diff --git a/packages/common/test/guards/maintenance-mode.guard.spec.ts b/packages/common/test/guards/maintenance-mode.guard.spec.ts
+new file mode 100644
+index 0000000..8777cee
+--- /dev/null
++++ b/packages/common/test/guards/maintenance-mode.guard.spec.ts
+@@ -0,0 +1,95 @@
++import { MaintenanceMode } from '../../decorators/core/maintenance-mode.decorator.js';
++import { ServiceUnavailableException } from '../../exceptions/service-unavailable.exception.js';
++import { MaintenanceModeGuard } from '../../guards/maintenance-mode.guard.js';
++import { ExecutionContext } from '../../interfaces/features/execution-context.interface.js';
++import { MaintenanceModeService } from '../../services/maintenance-mode.service.js';
++
++class AffectedController {
++  @MaintenanceMode()
++  static affectedHandler() {}
++
++  static unaffectedHandler() {}
++}
++
++@MaintenanceMode()
++class FullyAffectedController {
++  static handler() {}
++}
++
++const createContext = (handler: Function, clazz: Function): ExecutionContext =>
++  ({
++    getHandler: () => handler,
++    getClass: () => clazz,
++  }) as ExecutionContext;
++
++describe('MaintenanceModeGuard', () => {
++  let maintenanceModeService: MaintenanceModeService;
++  let guard: MaintenanceModeGuard;
++
++  beforeEach(() => {
++    maintenanceModeService = new MaintenanceModeService();
++    guard = new MaintenanceModeGuard(maintenanceModeService);
++  });
++
++  describe('when the handler is not marked with @MaintenanceMode', () => {
++    it('should allow the call through regardless of maintenance mode state', () => {
++      const context = createContext(
++        AffectedController.unaffectedHandler,
++        AffectedController,
++      );
++      maintenanceModeService.enable();
++
++      expect(guard.canActivate(context)).toBe(true);
++    });
++  });
++
++  describe('when the handler is marked with @MaintenanceMode', () => {
++    it('should allow the call through while maintenance mode is off', () => {
++      const context = createContext(
++        AffectedController.affectedHandler,
++        AffectedController,
++      );
++
++      expect(guard.canActivate(context)).toBe(true);
++    });
++
++    it('should reject the call while maintenance mode is on', () => {
++      const context = createContext(
++        AffectedController.affectedHandler,
++        AffectedController,
++      );
++      maintenanceModeService.enable();
++
++      expect(() => guard.canActivate(context)).toThrow(
++        ServiceUnavailableException,
++      );
++    });
++
++    it('should allow the call through again after maintenance mode is switched back off', () => {
++      const context = createContext(
++        AffectedController.affectedHandler,
++        AffectedController,
++      );
++      maintenanceModeService.enable();
++      expect(() => guard.canActivate(context)).toThrow();
++
++      maintenanceModeService.disable();
++
++      expect(guard.canActivate(context)).toBe(true);
++    });
++  });
++
++  describe('when the whole controller/gateway class is marked with @MaintenanceMode', () => {
++    it('should reject calls to its handlers while maintenance mode is on', () => {
++      const context = createContext(
++        FullyAffectedController.handler,
++        FullyAffectedController,
++      );
++      maintenanceModeService.enable();
++
++      expect(() => guard.canActivate(context)).toThrow(
++        ServiceUnavailableException,
++      );
++    });
++  });
++});
+diff --git a/packages/common/test/services/maintenance-mode.service.spec.ts b/packages/common/test/services/maintenance-mode.service.spec.ts
+new file mode 100644
+index 0000000..5949e46
+--- /dev/null
++++ b/packages/common/test/services/maintenance-mode.service.spec.ts
+@@ -0,0 +1,24 @@
++import { MaintenanceModeService } from '../../services/maintenance-mode.service.js';
++
++describe('MaintenanceModeService', () => {
++  let service: MaintenanceModeService;
++
++  beforeEach(() => {
++    service = new MaintenanceModeService();
++  });
++
++  it('should be disabled by default', () => {
++    expect(service.isEnabled()).toBe(false);
++  });
++
++  it('should report enabled after enable() is called', () => {
++    service.enable();
++    expect(service.isEnabled()).toBe(true);
++  });
++
++  it('should report disabled after disable() is called', () => {
++    service.enable();
++    service.disable();
++    expect(service.isEnabled()).toBe(false);
++  });
++});

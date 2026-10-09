@@ -1,0 +1,63 @@
+# R03-TA-GC-09
+
+Condition: goga_native_architecture
+Base tag: condition-c-r03-v1
+Functional success: False
+Full architecture conformance: False
+ACR: 0.25
+Dangerous success: False
+Goga engagement signal: True
+Cost: $1.2269931
+Duration: 148271ms, turns: 39
+
+## Agent's own summary
+
+# Change Plan
+
+## Task Classification
+**Feature (extension)** — adds a new sibling type to an existing, well-established family of concrete `HttpException` subclasses. No modification to existing types' behavior.
+
+## Affected Cells
+
+| Cell | Files to Modify | What Changes |
+|---|---|---|
+| `packages/common/exceptions` | `too-many-requests.exception.ts` (new), `index.ts`, `CODEMANIFEST` | New class added; new export line added; new manifest entry added |
+| (non-cell) `packages/common/utils` | `http-error-by-code.util.ts` | New import, new union member, new record entry |
+| (non-cell) `packages/common/test` | `test/exceptions/too-many-requests.exception.spec.ts` (new), `test/utils/http-error-by-code.util.spec.ts` | New spec file; existing spec's `expectedCodes` array extended |
+
+## Root Cause Analysis
+HTTP 429 has no dedicated exception class even though `HttpStatus.TOO_MANY_REQUESTS` already exists in the enum. Every other common status code (400–505) has a purpose-built subclass following one fixed constructor/JSDoc template; 429 is the sole gap in that family, forcing callers to hand-construct the generic base `HttpException(message, 429)`.
+
+## Trace Summary
+`TooManyRequestsException` constructor → `HttpException.extractDescriptionAndOptionsFrom(descriptionOrOptions)` → `HttpException.createBody(objectOrError, description, HttpStatus.TOO_MANY_REQUESTS)` → `super(body, HttpStatus.TOO_MANY_REQUESTS, httpExceptionOptions)`. Export flows `too-many-requests.exception.ts` → `exceptions/index.ts` (wildcard) → `packages/common/index.ts` (wildcard, no edit needed) → consumed directly by application code, and separately by `http-error-by-code.util.ts`'s `HttpErrorByCode` lookup table.
+
+## Change Strategy
+1. Create `too-many-requests.exception.ts`: copy `conflict.exception.ts` structure verbatim, rename class to `TooManyRequestsException`, swap `HttpStatus.CONFLICT` → `HttpStatus.TOO_MANY_REQUESTS`, swap default message/description literal `'Conflict'` → `'Too Many Requests'`, update JSDoc text (`@example`, status code `429`, default message description) to match.
+2. Add one alphabetically-ordered export line to `index.ts`.
+3. Add one CODEMANIFEST body entry, signature `"HttpException::TooManyRequestsException(objectOrError: any, descriptionOrOptions: string | Object<string, any>)"`, `location: too-many-requests.exception.ts`, annotation text: "429 Too Many Requests, constructed identically to `BadRequestException`. Default message: 'Too Many Requests'." — placed adjacent to the other 4xx entries (after `UnprocessableEntityException`/422, before `NotImplementedException`/501) to track the file's loose numeric-then-append convention.
+4. Update `http-error-by-code.util.ts`: import `TooManyRequestsException`, add `HttpStatus.TOO_MANY_REQUESTS` to the `ErrorHttpStatusCode` union (alphabetically among the union members) and to `HttpErrorByCode` (alphabetically between `ServiceUnavailableException` and `UnauthorizedException` entries).
+5. Create `too-many-requests.exception.spec.ts` mirroring `conflict.exception.spec.ts` line-for-line, substituting 409→429, `'Conflict'`→`'Too Many Requests'`, `ConflictException`→`TooManyRequestsException`.
+6. Update `http-error-by-code.util.spec.ts`'s `expectedCodes` array to include `HttpStatus.TOO_MANY_REQUESTS` (alphabetically placed) so the count/mapping assertions remain accurate.
+
+## Specification Impact
+`packages/common/exceptions/CODEMANIFEST` body gains exactly one new type entry (`TooManyRequestsException`), following the identical annotation template already used by all 20 sibling 4xx/5xx entries. No existing entry text changes. Header (`Annotations`, `Imports`, `Usages`) and footer (`Author`/`CreatedAt`/`Description`) are untouched — the generic top-level `Annotations` paragraph already generically covers "one concrete subclass per common HTTP status code," which now includes this one without needing rewording.
+
+## Usage Impact
+No `.usages` files exist for this cell (confirmed via `goga schema` — `"usages": []`), so there is no usage-file impact.
+
+## Compatibility Verification
+**Backward compatible.** No existing class, export, union member, or record entry is modified or removed — all changes are pure additions. Existing call sites, response shapes, and status-code mappings are unaffected. The only existing file whose assertions change is the pre-existing count-based test (`http-error-by-code.util.spec.ts`), and that change is required specifically because the test intentionally enumerates every mapped code — adding a new mapped code is the expected, correct maintenance of that same test, not a behavior break.
+
+## Test Strategy
+- New `too-many-requests.exception.spec.ts` covers: default status 429, default message `'Too Many Requests'`, custom string message (with `error: 'Too Many Requests'`), custom object body override, `cause` option propagation, `instanceof HttpException`/`Error` checks — matching exactly the six cases already covered per sibling class.
+- Extend `http-error-by-code.util.spec.ts`'s `expectedCodes` list so its three generic assertions (entry count, `extends HttpException` check, correct status-code-per-entry check) automatically cover the new entry without needing new test bodies.
+
+## Risk Assessment
+
+| Risk | Likelihood | Impact | Mitigation |
+|---|---|---|---|
+| CODEMANIFEST entry placed out of the file's existing (already inexact) ordering | Low | Low (cosmetic only, no functional effect) | Place near other 4xx entries; file already isn't strictly numeric (e.g., 421 after 418), so exact position is non-critical |
+| Forgetting to update `http-error-by-code.util.spec.ts` causes CI failure | Medium if skipped | Medium (breaks existing green test) | Explicitly included as step 6 in this plan |
+| Alphabetical placement mismatch in `index.ts` or `HttpErrorByCode` causing lint/style nit | Low | Low | Follow exact existing alphabetical ordering conventions observed in both files during implementation |
+
+Do you approve the plan? Proceed to implementation?

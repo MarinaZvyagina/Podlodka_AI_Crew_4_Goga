@@ -1,0 +1,262 @@
+diff --git a/salt/cache/sqlite3_cache.py b/salt/cache/sqlite3_cache.py
+new file mode 100644
+index 0000000..45c7873
+--- /dev/null
++++ b/salt/cache/sqlite3_cache.py
+@@ -0,0 +1,256 @@
++"""
++Minion data cache plugin for SQLite3.
++
++.. versionadded:: 3009.0
++
++This cache driver persists cached data (minion grains, mine data, job
++returns, etc.) in a single ordinary SQLite database file on disk, using only
++the ``sqlite3`` module that ships with a standard Python installation. It is
++meant for small, single-node deployments that want the cache to survive a
++restart of the master without standing up a separate database service such
++as Redis or MySQL.
++
++To use this cache backend, set the master ``cache`` config value to
++``sqlite3``:
++
++.. code-block:: yaml
++
++    cache: sqlite3
++
++By default the database file is created as ``cache.sqlite3`` inside the
++master's ``cachedir``. Optionally the following values can be set in the
++master config to change that:
++
++.. code-block:: yaml
++
++    sqlite3.database_file: /var/cache/salt/master/cache.sqlite3
++    sqlite3.table_name: cache
++    sqlite3.timeout: 30
++"""
++
++import logging
++import os
++import threading
++import time
++
++import salt.payload
++import salt.syspaths
++import salt.utils.path
++from salt.exceptions import SaltCacheError
++
++try:
++    import sqlite3
++
++    HAS_SQLITE3 = True
++except ImportError:
++    HAS_SQLITE3 = False
++
++log = logging.getLogger(__name__)
++
++__virtualname__ = "sqlite3"
++__func_alias__ = {"list_": "list"}
++
++_DEFAULT_DATABASE_FILE = "cache.sqlite3"
++_DEFAULT_TABLE_NAME = "cache"
++_DEFAULT_TIMEOUT = 30
++
++# {database_file: (sqlite3.Connection, threading.Lock, table_name)}
++_connections = {}
++_connections_lock = threading.Lock()
++
++
++def __virtual__():
++    if not HAS_SQLITE3:
++        return False, "The python sqlite3 module could not be loaded."
++    return __virtualname__
++
++
++def _cachedir(kwargs=None):
++    if kwargs and kwargs.get("cachedir"):
++        return kwargs["cachedir"]
++    return __opts__.get("cachedir", salt.syspaths.CACHE_DIR)
++
++
++def init_kwargs(kwargs):
++    return {"cachedir": _cachedir(kwargs)}
++
++
++def _database_file(cachedir=None):
++    configured = __opts__.get("sqlite3.database_file")
++    if configured:
++        return configured
++    if not cachedir:
++        cachedir = __opts__.get("cachedir", salt.syspaths.CACHE_DIR)
++    return salt.utils.path.join(cachedir, _DEFAULT_DATABASE_FILE)
++
++
++def _table_name():
++    return __opts__.get("sqlite3.table_name", _DEFAULT_TABLE_NAME)
++
++
++def get_storage_id(kwargs):
++    return ("sqlite3", _database_file(_cachedir(kwargs)))
++
++
++def _connect(cachedir=None):
++    """
++    Return the cached (connection, lock, table_name) tuple for the
++    database file backing ``cachedir``, opening and initializing it the
++    first time it is needed.
++    """
++    path = _database_file(cachedir)
++    with _connections_lock:
++        entry = _connections.get(path)
++        if entry is not None:
++            return entry
++
++        directory = os.path.dirname(path)
++        if directory:
++            try:
++                os.makedirs(directory, exist_ok=True)
++            except OSError as exc:
++                raise SaltCacheError(
++                    f'Unable to create the directory for the sqlite3 cache file "{directory}": {exc}'
++                )
++
++        timeout = __opts__.get("sqlite3.timeout", _DEFAULT_TIMEOUT)
++        table = _table_name()
++        try:
++            conn = sqlite3.connect(
++                path,
++                timeout=timeout,
++                isolation_level=None,
++                check_same_thread=False,
++            )
++            # WAL allows readers and a writer to proceed concurrently, and
++            # a busy_timeout makes concurrent writers from other master
++            # worker processes wait rather than fail immediately.
++            conn.execute("PRAGMA journal_mode=WAL")
++            conn.execute("PRAGMA synchronous=NORMAL")
++            conn.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
++            conn.execute(
++                f'CREATE TABLE IF NOT EXISTS "{table}" ('
++                "bank TEXT NOT NULL, "
++                "ckey TEXT NOT NULL, "
++                "data BLOB, "
++                "last_update INTEGER NOT NULL, "
++                "PRIMARY KEY (bank, ckey))"
++            )
++        except sqlite3.Error as exc:
++            raise SaltCacheError(
++                f'Unable to open the sqlite3 cache file "{path}": {exc}'
++            )
++
++        entry = (conn, threading.Lock(), table)
++        _connections[path] = entry
++        return entry
++
++
++def store(bank, key, data, cachedir):
++    """
++    Store a key value.
++    """
++    conn, lock, table = _connect(cachedir)
++    payload = salt.payload.dumps(data)
++    now = int(time.time())
++    with lock:
++        try:
++            conn.execute(
++                f'REPLACE INTO "{table}" (bank, ckey, data, last_update) VALUES (?, ?, ?, ?)',
++                (bank, key, payload, now),
++            )
++        except sqlite3.Error as exc:
++            raise SaltCacheError(f'Error storing "{bank}/{key}": {exc}')
++
++
++def fetch(bank, key, cachedir):
++    """
++    Fetch a key value.
++    """
++    conn, lock, table = _connect(cachedir)
++    with lock:
++        try:
++            row = conn.execute(
++                f'SELECT data FROM "{table}" WHERE bank=? AND ckey=?', (bank, key)
++            ).fetchone()
++        except sqlite3.Error as exc:
++            raise SaltCacheError(f'Error fetching "{bank}/{key}": {exc}')
++    if row is None:
++        return {}
++    return salt.payload.loads(row[0])
++
++
++def updated(bank, key, cachedir):
++    """
++    Return the Unix epoch of the last time the specified key was updated,
++    or None if the key does not exist.
++    """
++    conn, lock, table = _connect(cachedir)
++    with lock:
++        try:
++            row = conn.execute(
++                f'SELECT last_update FROM "{table}" WHERE bank=? AND ckey=?',
++                (bank, key),
++            ).fetchone()
++        except sqlite3.Error as exc:
++            raise SaltCacheError(f'Error reading the update time for "{bank}/{key}": {exc}')
++    if row is None:
++        return None
++    return int(row[0])
++
++
++def flush(bank, key=None, cachedir=None):
++    """
++    Remove the key from the cache bank with all the key content. If no
++    key is specified, remove the entire bank.
++    """
++    conn, lock, table = _connect(cachedir)
++    with lock:
++        try:
++            if key is None:
++                cur = conn.execute(f'DELETE FROM "{table}" WHERE bank=?', (bank,))
++            else:
++                cur = conn.execute(
++                    f'DELETE FROM "{table}" WHERE bank=? AND ckey=?', (bank, key)
++                )
++        except sqlite3.Error as exc:
++            raise SaltCacheError(f'Error removing "{bank}/{key}": {exc}')
++        deleted = cur.rowcount
++    return deleted > 0
++
++
++def list_(bank, cachedir):
++    """
++    Return an iterable object containing all entries stored in the
++    specified bank.
++    """
++    conn, lock, table = _connect(cachedir)
++    with lock:
++        try:
++            rows = conn.execute(
++                f'SELECT ckey FROM "{table}" WHERE bank=?', (bank,)
++            ).fetchall()
++        except sqlite3.Error as exc:
++            raise SaltCacheError(f'Error listing "{bank}": {exc}')
++    return [row[0] for row in rows]
++
++
++def contains(bank, key, cachedir):
++    """
++    Checks if the specified bank contains the specified key.
++    """
++    conn, lock, table = _connect(cachedir)
++    with lock:
++        try:
++            if key is None:
++                row = conn.execute(
++                    f'SELECT 1 FROM "{table}" WHERE bank=? LIMIT 1', (bank,)
++                ).fetchone()
++            else:
++                row = conn.execute(
++                    f'SELECT 1 FROM "{table}" WHERE bank=? AND ckey=? LIMIT 1',
++                    (bank, key),
++                ).fetchone()
++        except sqlite3.Error as exc:
++            raise SaltCacheError(f'Error checking "{bank}/{key}": {exc}')
++    return row is not None

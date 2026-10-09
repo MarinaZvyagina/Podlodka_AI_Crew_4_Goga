@@ -1,0 +1,609 @@
+diff --git a/server/etcdserver/v3_server.go b/server/etcdserver/v3_server.go
+index a357705..3d5a5fe 100644
+--- a/server/etcdserver/v3_server.go
++++ b/server/etcdserver/v3_server.go
+@@ -146,7 +146,17 @@ func (s *EtcdServer) Range(ctx context.Context, r *pb.RangeRequest) (*pb.RangeRe
+ 		return s.authStore.IsRangePermitted(ai, r.Key, r.RangeEnd)
+ 	}
+ 
+-	get := func() { resp, _, err = txn.Range(ctx, s.Logger(), s.KV(), r, true) }
++	get := func() {
++		rc := s.KV().RangeCache()
++		if cached, seq, hit := rc.Get(r); hit {
++			resp = cached
++		} else {
++			resp, _, err = txn.Range(ctx, s.Logger(), s.KV(), r, true)
++			if err == nil {
++				rc.Put(r, resp, seq)
++			}
++		}
++	}
+ 	if serr := s.doSerialize(ctx, chk, get); serr != nil {
+ 		err = serr
+ 		return nil, err
+diff --git a/server/storage/mvcc/kv.go b/server/storage/mvcc/kv.go
+index 4162027..3b91824 100644
+--- a/server/storage/mvcc/kv.go
++++ b/server/storage/mvcc/kv.go
+@@ -139,6 +139,11 @@ type KV interface {
+ type WatchableKV interface {
+ 	KV
+ 	Watchable
++
++	// RangeCache returns the cache of Range responses for this store. It
++	// is kept coherent with the store's data: entries are invalidated as
++	// soon as an overlapping write commits.
++	RangeCache() *RangeCache
+ }
+ 
+ // Watchable is the interface that wraps the NewWatchStream function.
+diff --git a/server/storage/mvcc/range_cache.go b/server/storage/mvcc/range_cache.go
+new file mode 100644
+index 0000000..4680d30
+--- /dev/null
++++ b/server/storage/mvcc/range_cache.go
+@@ -0,0 +1,174 @@
++// Copyright 2025 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package mvcc
++
++import (
++	"sync"
++
++	"google.golang.org/protobuf/proto"
++	"k8s.io/utils/lru"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/pkg/v3/adt"
++)
++
++// DefaultRangeCacheSize bounds the number of distinct Range requests cached
++// by a RangeCache.
++const DefaultRangeCacheSize = 2048
++
++// RangeCache caches RangeResponses for repeated Range requests pinned to the
++// current revision (Revision == 0), so that identical requests issued in
++// quick succession don't have to redo the underlying range scan.
++//
++// A cached response is only ever handed out while it is guaranteed to be
++// identical to what a fresh, uncached read would return: entries are removed
++// the instant a write commits to an overlapping key range (see Invalidate),
++// and a response is only cached in the first place if no such write raced
++// ahead of the read that produced it (see the seq check in Put). Requests
++// with an explicit historical Revision are never cached, since compaction
++// can retroactively invalidate them without touching any key.
++type RangeCache struct {
++	mu  sync.Mutex
++	lru *lru.Cache
++
++	// ranges is a reverse index from requested key range to cache keys,
++	// used to find and evict entries overlapping a write.
++	ranges adt.IntervalTree
++
++	// seq counts every Invalidate call. Put() only stores a response if
++	// seq hasn't moved since the caller observed a cache miss, so that a
++	// write racing with an in-flight read can never be papered over by a
++	// stale response landing in the cache after the fact.
++	seq int64
++}
++
++// NewRangeCache returns an empty RangeCache with the default size bound.
++func NewRangeCache() *RangeCache {
++	return &RangeCache{
++		lru:    lru.New(DefaultRangeCacheSize),
++		ranges: adt.NewIntervalTree(),
++	}
++}
++
++// cacheKey returns a canonical cache key for r. Serializable is normalized
++// away: the data at a given revision doesn't depend on how the caller chose
++// to become confident it is caught up to that revision.
++func cacheKey(r *pb.RangeRequest) string {
++	if r.Serializable {
++		clone := proto.Clone(r).(*pb.RangeRequest)
++		clone.Serializable = false
++		r = clone
++	}
++	b, err := proto.Marshal(r)
++	if err != nil {
++		panic(err)
++	}
++	return string(b)
++}
++
++// Get looks up the cached response for r. Requests with an explicit
++// historical Revision are always misses. On a miss, the returned seq must be
++// passed to a subsequent Put for the same request.
++func (c *RangeCache) Get(r *pb.RangeRequest) (resp *pb.RangeResponse, seq int64, hit bool) {
++	if r.Revision != 0 {
++		return nil, 0, false
++	}
++
++	key := cacheKey(r)
++
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	if v, ok := c.lru.Get(key); ok {
++		return proto.Clone(v.(*pb.RangeResponse)).(*pb.RangeResponse), 0, true
++	}
++	return nil, c.seq, false
++}
++
++// Put caches resp as the response for r, unless r pins a historical revision
++// or a write has been observed (via Invalidate) since seq was obtained from
++// Get, in which case resp may already be stale and is dropped instead.
++func (c *RangeCache) Put(r *pb.RangeRequest, resp *pb.RangeResponse, seq int64) {
++	if r.Revision != 0 {
++		return
++	}
++
++	key := cacheKey(r)
++
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	if c.seq != seq {
++		return
++	}
++
++	c.lru.Add(key, proto.Clone(resp).(*pb.RangeResponse))
++
++	var ivl adt.Interval
++	if len(r.RangeEnd) != 0 {
++		ivl = adt.NewStringAffineInterval(string(r.Key), string(r.RangeEnd))
++	} else {
++		ivl = adt.NewStringAffinePoint(string(r.Key))
++	}
++	if iv := c.ranges.Find(ivl); iv != nil {
++		iv.Val.(map[string]struct{})[key] = struct{}{}
++	} else {
++		c.ranges.Insert(ivl, map[string]struct{}{key: {}})
++	}
++}
++
++// Invalidate evicts every cached response whose requested range intersects
++// [key, end). It must be called for every committed write, on every node, so
++// that a subsequent read never observes data older than what an uncached
++// read would have returned at that point in time.
++func (c *RangeCache) Invalidate(key, end []byte) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	c.seq++
++
++	var ivl adt.Interval
++	if len(end) == 0 {
++		ivl = adt.NewStringAffinePoint(string(key))
++	} else {
++		ivl = adt.NewStringAffineInterval(string(key), string(end))
++	}
++
++	for _, iv := range c.ranges.Stab(ivl) {
++		for k := range iv.Val.(map[string]struct{}) {
++			c.lru.Remove(k)
++		}
++		c.ranges.Delete(iv.Ivl)
++	}
++}
++
++// Reset drops every cached entry. It is used when the underlying data is
++// replaced wholesale (e.g. restoring from a snapshot) rather than through an
++// incremental write that Invalidate can precisely account for.
++func (c *RangeCache) Reset() {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	c.seq++
++	c.lru = lru.New(DefaultRangeCacheSize)
++	c.ranges = adt.NewIntervalTree()
++}
++
++// Size returns the number of responses currently cached.
++func (c *RangeCache) Size() int {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return c.lru.Len()
++}
+diff --git a/server/storage/mvcc/range_cache_test.go b/server/storage/mvcc/range_cache_test.go
+new file mode 100644
+index 0000000..0fad26a
+--- /dev/null
++++ b/server/storage/mvcc/range_cache_test.go
+@@ -0,0 +1,194 @@
++// Copyright 2025 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package mvcc
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"go.uber.org/zap/zaptest"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/server/v3/lease"
++	betesting "go.etcd.io/etcd/server/v3/storage/backend/testing"
++)
++
++func TestRangeCacheHitAfterPut(t *testing.T) {
++	c := NewRangeCache()
++	req := &pb.RangeRequest{Key: []byte("foo")}
++	resp := &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: 5}}
++
++	_, seq, hit := c.Get(req)
++	require.False(t, hit)
++
++	c.Put(req, resp, seq)
++
++	got, _, hit := c.Get(req)
++	require.True(t, hit)
++	assert.Equal(t, int64(5), got.Header.Revision)
++	// The returned response must be a copy: mutating it must not corrupt
++	// the cached entry (the RPC layer fills in header fields in place).
++	got.Header.Revision = 99
++	got2, _, hit2 := c.Get(req)
++	require.True(t, hit2)
++	assert.Equal(t, int64(5), got2.Header.Revision)
++}
++
++func TestRangeCacheSerializableSharesEntryWithLinearizable(t *testing.T) {
++	c := NewRangeCache()
++	linReq := &pb.RangeRequest{Key: []byte("foo")}
++	resp := &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: 1}}
++
++	_, seq, _ := c.Get(linReq)
++	c.Put(linReq, resp, seq)
++
++	serReq := &pb.RangeRequest{Key: []byte("foo"), Serializable: true}
++	_, _, hit := c.Get(serReq)
++	require.True(t, hit, "a serializable request for the same key should reuse the cached entry")
++}
++
++func TestRangeCacheNeverCachesExplicitRevision(t *testing.T) {
++	c := NewRangeCache()
++	req := &pb.RangeRequest{Key: []byte("foo"), Revision: 3}
++	resp := &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: 3}}
++
++	_, seq, hit := c.Get(req)
++	require.False(t, hit)
++
++	c.Put(req, resp, seq)
++
++	_, _, hit = c.Get(req)
++	require.False(t, hit, "requests pinned to a historical revision must never be cached")
++	assert.Equal(t, 0, c.Size())
++}
++
++func TestRangeCacheInvalidateIsScopedToOverlappingRange(t *testing.T) {
++	c := NewRangeCache()
++
++	reqA := &pb.RangeRequest{Key: []byte("a")}
++	reqB := &pb.RangeRequest{Key: []byte("b")}
++	resp := &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: 1}}
++
++	_, seqA, _ := c.Get(reqA)
++	c.Put(reqA, resp, seqA)
++	_, seqB, _ := c.Get(reqB)
++	c.Put(reqB, resp, seqB)
++
++	c.Invalidate([]byte("a"), nil)
++
++	_, _, hitA := c.Get(reqA)
++	assert.False(t, hitA, "write to key a must evict the cache entry for key a")
++
++	_, _, hitB := c.Get(reqB)
++	assert.True(t, hitB, "write to key a must not evict an unrelated cache entry for key b")
++}
++
++func TestRangeCacheInvalidateCoversOverlappingRangeRequest(t *testing.T) {
++	c := NewRangeCache()
++
++	req := &pb.RangeRequest{Key: []byte("a"), RangeEnd: []byte("z")}
++	resp := &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: 1}}
++
++	_, seq, _ := c.Get(req)
++	c.Put(req, resp, seq)
++
++	c.Invalidate([]byte("m"), nil)
++
++	_, _, hit := c.Get(req)
++	assert.False(t, hit, "a write to a key inside a cached range must evict that range")
++}
++
++// TestRangeCachePutRejectsRaceWithConcurrentWrite verifies that a response
++// computed from a read that started before a concurrent write committed is
++// not cached once that write's invalidation has already been observed -
++// otherwise the stale response would sit in the cache with nothing left to
++// evict it.
++func TestRangeCachePutRejectsRaceWithConcurrentWrite(t *testing.T) {
++	c := NewRangeCache()
++	req := &pb.RangeRequest{Key: []byte("foo")}
++
++	_, seq, hit := c.Get(req)
++	require.False(t, hit)
++
++	// A write to the same key commits and invalidates while the read that
++	// produced staleResp is still in flight.
++	c.Invalidate([]byte("foo"), nil)
++
++	staleResp := &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: 1}}
++	c.Put(req, staleResp, seq)
++
++	_, _, hit = c.Get(req)
++	assert.False(t, hit, "a response racing with a concurrent write must not be cached")
++}
++
++func TestRangeCacheReset(t *testing.T) {
++	c := NewRangeCache()
++	req := &pb.RangeRequest{Key: []byte("foo")}
++	resp := &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: 1}}
++
++	_, seq, _ := c.Get(req)
++	c.Put(req, resp, seq)
++	require.Equal(t, 1, c.Size())
++
++	c.Reset()
++
++	_, _, hit := c.Get(req)
++	assert.False(t, hit)
++	assert.Equal(t, 0, c.Size())
++}
++
++func TestWatchableStoreInvalidatesRangeCacheOnPut(t *testing.T) {
++	b, _ := betesting.NewDefaultTmpBackend(t)
++	s := New(zaptest.NewLogger(t), b, &lease.FakeLessor{}, StoreConfig{})
++	defer cleanup(s, b)
++
++	rc := s.RangeCache()
++	reqFoo := &pb.RangeRequest{Key: []byte("foo")}
++	reqBar := &pb.RangeRequest{Key: []byte("bar")}
++	resp := &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: 1}}
++
++	_, seqFoo, _ := rc.Get(reqFoo)
++	rc.Put(reqFoo, resp, seqFoo)
++	_, seqBar, _ := rc.Get(reqBar)
++	rc.Put(reqBar, resp, seqBar)
++
++	s.Put([]byte("foo"), []byte("baz"), lease.NoLease)
++
++	_, _, hitFoo := rc.Get(reqFoo)
++	assert.False(t, hitFoo, "a Put to foo must invalidate the cached entry for foo")
++
++	_, _, hitBar := rc.Get(reqBar)
++	assert.True(t, hitBar, "a Put to foo must not invalidate the cached entry for bar")
++}
++
++func TestWatchableStoreInvalidatesRangeCacheOnRestore(t *testing.T) {
++	b, _ := betesting.NewDefaultTmpBackend(t)
++	s := New(zaptest.NewLogger(t), b, &lease.FakeLessor{}, StoreConfig{})
++	defer cleanup(s, b)
++
++	rc := s.RangeCache()
++	req := &pb.RangeRequest{Key: []byte("foo")}
++	resp := &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: 1}}
++
++	_, seq, _ := rc.Get(req)
++	rc.Put(req, resp, seq)
++	require.Equal(t, 1, rc.Size())
++
++	require.NoError(t, s.Restore(b))
++
++	_, _, hit := rc.Get(req)
++	assert.False(t, hit, "Restore must drop all cached entries")
++}
+diff --git a/server/storage/mvcc/watchable_store.go b/server/storage/mvcc/watchable_store.go
+index 7d2e5b6..d567d00 100644
+--- a/server/storage/mvcc/watchable_store.go
++++ b/server/storage/mvcc/watchable_store.go
+@@ -73,6 +73,9 @@ type watchableStore struct {
+ 
+ 	stopc chan struct{}
+ 	wg    sync.WaitGroup
++
++	// rangeCache caches Range responses; see RangeCache for details.
++	rangeCache *RangeCache
+ }
+ 
+ var _ WatchableKV = (*watchableStore)(nil)
+@@ -94,11 +97,12 @@ func newWatchableStore(lg *zap.Logger, b backend.Backend, le lease.Lessor, cfg S
+ 		lg = zap.NewNop()
+ 	}
+ 	s := &watchableStore{
+-		store:    NewStore(lg, b, le, cfg),
+-		victimc:  make(chan struct{}, 1),
+-		unsynced: newWatcherGroup(),
+-		synced:   newWatcherGroup(),
+-		stopc:    make(chan struct{}),
++		store:      NewStore(lg, b, le, cfg),
++		victimc:    make(chan struct{}, 1),
++		unsynced:   newWatcherGroup(),
++		synced:     newWatcherGroup(),
++		stopc:      make(chan struct{}),
++		rangeCache: NewRangeCache(),
+ 	}
+ 	s.store.ReadView = &readView{s}
+ 	s.store.WriteView = &writeView{s}
+@@ -217,9 +221,17 @@ func (s *watchableStore) Restore(b backend.Backend) error {
+ 		s.unsynced.add(wa)
+ 	}
+ 	s.synced = newWatcherGroup()
++	// The backend was replaced wholesale, so incremental invalidation
++	// can't account for what changed; drop everything instead.
++	s.rangeCache.Reset()
+ 	return nil
+ }
+ 
++// RangeCache returns the cache of Range responses for this store.
++func (s *watchableStore) RangeCache() *RangeCache {
++	return s.rangeCache
++}
++
+ // syncWatchersLoop syncs the watcher in the unsynced map every 100ms.
+ func (s *watchableStore) syncWatchersLoop() {
+ 	defer s.wg.Done()
+diff --git a/server/storage/mvcc/watchable_store_txn.go b/server/storage/mvcc/watchable_store_txn.go
+index 42eb6ca..f4913ef 100644
+--- a/server/storage/mvcc/watchable_store_txn.go
++++ b/server/storage/mvcc/watchable_store_txn.go
+@@ -42,6 +42,9 @@ func (tw *watchableStoreTxnWrite) End() {
+ 	// when asynchronous event posting checks the current store revision
+ 	tw.s.mu.Lock()
+ 	tw.s.notify(rev, evs)
++	for _, change := range changes {
++		tw.s.rangeCache.Invalidate(change.Key, nil)
++	}
+ 	tw.TxnWrite.End()
+ 	tw.s.mu.Unlock()
+ }
+diff --git a/tests/integration/v3_range_cache_test.go b/tests/integration/v3_range_cache_test.go
+new file mode 100644
+index 0000000..0ff5563
+--- /dev/null
++++ b/tests/integration/v3_range_cache_test.go
+@@ -0,0 +1,120 @@
++// Copyright 2025 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package integration
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/require"
++
++	clientv3 "go.etcd.io/etcd/client/v3"
++	"go.etcd.io/etcd/tests/v3/framework/integration"
++)
++
++// TestV3RangeRepeatedReadsNeverStale exercises the server-side Range cache:
++// repeated identical reads of the same key must never observe a value older
++// than what an equivalent uncached read would have returned at the time it
++// was made, for both linearizable and serializable requests.
++func TestV3RangeRepeatedReadsNeverStale(t *testing.T) {
++	integration.BeforeTest(t)
++
++	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 1})
++	defer clus.Terminate(t)
++
++	client := clus.RandClient()
++	key := "cached-key"
++
++	getOpts := []clientv3.OpOption{}
++	serializableOpts := []clientv3.OpOption{clientv3.WithSerializable()}
++
++	assertRepeatedGetsSee := func(t *testing.T, opts []clientv3.OpOption, want string) {
++		t.Helper()
++		for i := 0; i < 20; i++ {
++			resp, err := client.Get(t.Context(), key, opts...)
++			require.NoError(t, err)
++			require.Len(t, resp.Kvs, 1)
++			require.Equal(t, want, string(resp.Kvs[0].Value))
++		}
++	}
++
++	_, err := client.Put(t.Context(), key, "v1")
++	require.NoError(t, err)
++	assertRepeatedGetsSee(t, getOpts, "v1")
++	assertRepeatedGetsSee(t, serializableOpts, "v1")
++
++	// A write that commits must be reflected immediately, not after some
++	// fixed delay: interleave writes and reads to a tight loop, and require
++	// every single read to observe the value from the most recent write.
++	for i := 0; i < 20; i++ {
++		val := "v" + string(rune('a'+i))
++		_, err := client.Put(t.Context(), key, val)
++		require.NoError(t, err)
++
++		resp, err := client.Get(t.Context(), key, getOpts...)
++		require.NoError(t, err)
++		require.Len(t, resp.Kvs, 1)
++		require.Equal(t, val, string(resp.Kvs[0].Value))
++
++		resp, err = client.Get(t.Context(), key, serializableOpts...)
++		require.NoError(t, err)
++		require.Len(t, resp.Kvs, 1)
++		require.Equal(t, val, string(resp.Kvs[0].Value))
++	}
++
++	_, err = client.Delete(t.Context(), key)
++	require.NoError(t, err)
++
++	resp, err := client.Get(t.Context(), key, getOpts...)
++	require.NoError(t, err)
++	require.Empty(t, resp.Kvs)
++}
++
++// TestV3RangeCacheDoesNotLeakBetweenUnrelatedKeys checks that caching one
++// key's Range response and then writing an unrelated key doesn't corrupt or
++// suppress reads of either key.
++func TestV3RangeCacheDoesNotLeakBetweenUnrelatedKeys(t *testing.T) {
++	integration.BeforeTest(t)
++
++	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 1})
++	defer clus.Terminate(t)
++
++	client := clus.RandClient()
++
++	_, err := client.Put(t.Context(), "key-a", "a1")
++	require.NoError(t, err)
++	_, err = client.Put(t.Context(), "key-b", "b1")
++	require.NoError(t, err)
++
++	resp, err := client.Get(t.Context(), "key-a")
++	require.NoError(t, err)
++	require.Len(t, resp.Kvs, 1)
++	require.Equal(t, "a1", string(resp.Kvs[0].Value))
++
++	// Repeatedly write to key-b; key-a's cached response must stay correct.
++	for i := 0; i < 5; i++ {
++		_, err := client.Put(t.Context(), "key-b", "b2")
++		require.NoError(t, err)
++
++		resp, err := client.Get(t.Context(), "key-a")
++		require.NoError(t, err)
++		require.Len(t, resp.Kvs, 1)
++		require.Equal(t, "a1", string(resp.Kvs[0].Value))
++	}
++
++	resp, err = client.Get(t.Context(), "key-b")
++	require.NoError(t, err)
++	require.Len(t, resp.Kvs, 1)
++	require.Equal(t, "b2", string(resp.Kvs[0].Value))
++}

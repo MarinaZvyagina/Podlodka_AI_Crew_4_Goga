@@ -1,0 +1,339 @@
+diff --git a/server/etcdserver/api/v3rpc/audit.go b/server/etcdserver/api/v3rpc/audit.go
+new file mode 100644
+index 000000000..5c3044993
+--- /dev/null
++++ b/server/etcdserver/api/v3rpc/audit.go
+@@ -0,0 +1,166 @@
++// Copyright 2016 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package v3rpc
++
++import (
++	"context"
++	"time"
++
++	"go.uber.org/zap"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++)
++
++// auditKVServer decorates a KV server implementation so that every request it
++// handles produces a compliance audit record, regardless of which method is
++// called. Because the wrapping happens once per interface method here -
++// rather than via a log call hand-written inside each RPC handler - adding,
++// removing, or changing a KV operation cannot silently leave it unaudited:
++// any method that is not overridden below would fail to satisfy pb.KVServer
++// only if it did not already exist on the embedded implementation, and any
++// existing method goes through record() unconditionally.
++type auditKVServer struct {
++	pb.KVServer
++	ag AuthGetter
++	lg *zap.Logger
++}
++
++// NewAuditKVServer wraps kv so that every call produces a structured audit
++// record: caller identity, operation kind, key/range, duration, and outcome.
++// It never inspects or modifies the response, so it cannot change the
++// functional behavior or response content of the wrapped server.
++func NewAuditKVServer(kv pb.KVServer, ag AuthGetter, lg *zap.Logger) pb.KVServer {
++	return &auditKVServer{kv, ag, lg}
++}
++
++func (s *auditKVServer) Range(ctx context.Context, r *pb.RangeRequest) (*pb.RangeResponse, error) {
++	start := time.Now()
++	resp, err := s.KVServer.Range(ctx, r)
++	s.record(ctx, "read", start, err, r.Key, r.RangeEnd)
++	return resp, err
++}
++
++func (s *auditKVServer) RangeStream(r *pb.RangeRequest, rs pb.KV_RangeStreamServer) error {
++	start := time.Now()
++	err := s.KVServer.RangeStream(r, rs)
++	s.record(rs.Context(), "read", start, err, r.Key, r.RangeEnd)
++	return err
++}
++
++func (s *auditKVServer) Put(ctx context.Context, r *pb.PutRequest) (*pb.PutResponse, error) {
++	start := time.Now()
++	resp, err := s.KVServer.Put(ctx, r)
++	s.record(ctx, "write", start, err, r.Key, nil)
++	return resp, err
++}
++
++func (s *auditKVServer) DeleteRange(ctx context.Context, r *pb.DeleteRangeRequest) (*pb.DeleteRangeResponse, error) {
++	start := time.Now()
++	resp, err := s.KVServer.DeleteRange(ctx, r)
++	s.record(ctx, "delete", start, err, r.Key, r.RangeEnd)
++	return resp, err
++}
++
++func (s *auditKVServer) Txn(ctx context.Context, r *pb.TxnRequest) (*pb.TxnResponse, error) {
++	start := time.Now()
++	resp, err := s.KVServer.Txn(ctx, r)
++	s.recordTxn(ctx, start, err, r)
++	return resp, err
++}
++
++func (s *auditKVServer) Compact(ctx context.Context, r *pb.CompactionRequest) (*pb.CompactionResponse, error) {
++	start := time.Now()
++	resp, err := s.KVServer.Compact(ctx, r)
++	s.record(ctx, "compact", start, err, nil, nil)
++	return resp, err
++}
++
++// record emits one audit log entry for a single-key-range operation. It is
++// read-only with respect to ctx and never returns an error, so it cannot
++// affect the result already produced by the wrapped handler.
++func (s *auditKVServer) record(ctx context.Context, op string, start time.Time, err error, key, rangeEnd []byte) {
++	fields := []zap.Field{zap.ByteString("key", key)}
++	if len(rangeEnd) > 0 {
++		fields = append(fields, zap.ByteString("range-end", rangeEnd))
++	}
++	s.emit(ctx, op, start, err, fields)
++}
++
++// recordTxn emits one audit log entry covering every key and range touched
++// anywhere in a (possibly nested) transaction, by comparisons as well as by
++// the success/failure branches.
++func (s *auditKVServer) recordTxn(ctx context.Context, start time.Time, err error, r *pb.TxnRequest) {
++	var keys []string
++	collectTxnKeys(r, &keys)
++	s.emit(ctx, "transaction", start, err, []zap.Field{zap.Strings("keys", keys)})
++}
++
++func (s *auditKVServer) emit(ctx context.Context, op string, start time.Time, err error, fields []zap.Field) {
++	if s.lg == nil {
++		return
++	}
++	identity := "unauthenticated"
++	if authInfo, authErr := s.ag.AuthInfoFromCtx(ctx); authErr == nil && authInfo != nil && authInfo.Username != "" {
++		identity = authInfo.Username
++	}
++	outcome := "success"
++	if err != nil {
++		outcome = "failure"
++	}
++	allFields := append([]zap.Field{
++		zap.String("identity", identity),
++		zap.String("operation", op),
++	}, fields...)
++	allFields = append(allFields,
++		zap.Duration("duration", time.Since(start)),
++		zap.String("outcome", outcome),
++	)
++	s.lg.Info("kv audit", allFields...)
++}
++
++// collectTxnKeys walks a transaction's comparisons and both branches
++// (recursing into any nested transactions) and appends a human-readable
++// key or [key, range-end) entry for everything it finds.
++func collectTxnKeys(r *pb.TxnRequest, out *[]string) {
++	for _, c := range r.GetCompare() {
++		*out = append(*out, formatKeyRange(c.GetKey(), c.GetRangeEnd()))
++	}
++	for _, op := range r.GetSuccess() {
++		collectRequestOpKeys(op, out)
++	}
++	for _, op := range r.GetFailure() {
++		collectRequestOpKeys(op, out)
++	}
++}
++
++func collectRequestOpKeys(op *pb.RequestOp, out *[]string) {
++	switch req := op.GetRequest().(type) {
++	case *pb.RequestOp_RequestRange:
++		*out = append(*out, formatKeyRange(req.RequestRange.GetKey(), req.RequestRange.GetRangeEnd()))
++	case *pb.RequestOp_RequestPut:
++		*out = append(*out, formatKeyRange(req.RequestPut.GetKey(), nil))
++	case *pb.RequestOp_RequestDeleteRange:
++		*out = append(*out, formatKeyRange(req.RequestDeleteRange.GetKey(), req.RequestDeleteRange.GetRangeEnd()))
++	case *pb.RequestOp_RequestTxn:
++		collectTxnKeys(req.RequestTxn, out)
++	}
++}
++
++func formatKeyRange(key, rangeEnd []byte) string {
++	if len(rangeEnd) == 0 {
++		return string(key)
++	}
++	return "[" + string(key) + ", " + string(rangeEnd) + ")"
++}
+diff --git a/server/etcdserver/api/v3rpc/audit_test.go b/server/etcdserver/api/v3rpc/audit_test.go
+new file mode 100644
+index 000000000..82de1b7f4
+--- /dev/null
++++ b/server/etcdserver/api/v3rpc/audit_test.go
+@@ -0,0 +1,148 @@
++// Copyright 2016 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package v3rpc
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"go.uber.org/zap"
++	"go.uber.org/zap/zapcore"
++	"go.uber.org/zap/zaptest/observer"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/server/v3/auth"
++)
++
++// fakeAuthGetter lets tests control the identity returned to the audit
++// decorator without standing up a real EtcdServer/AuthStore.
++type fakeAuthGetter struct {
++	authInfo *auth.AuthInfo
++	err      error
++}
++
++func (f *fakeAuthGetter) AuthInfoFromCtx(context.Context) (*auth.AuthInfo, error) {
++	return f.authInfo, f.err
++}
++
++func (f *fakeAuthGetter) AuthStore() auth.AuthStore { return nil }
++
++// fakeKVServer is a bare-bones pb.KVServer used to observe what the audit
++// decorator does (and does not) change about requests/responses.
++type fakeKVServer struct {
++	pb.UnimplementedKVServer
++
++	rangeResp *pb.RangeResponse
++	putResp   *pb.PutResponse
++	delResp   *pb.DeleteRangeResponse
++	txnResp   *pb.TxnResponse
++	err       error
++}
++
++func (f *fakeKVServer) Range(context.Context, *pb.RangeRequest) (*pb.RangeResponse, error) {
++	return f.rangeResp, f.err
++}
++
++func (f *fakeKVServer) Put(context.Context, *pb.PutRequest) (*pb.PutResponse, error) {
++	return f.putResp, f.err
++}
++
++func (f *fakeKVServer) DeleteRange(context.Context, *pb.DeleteRangeRequest) (*pb.DeleteRangeResponse, error) {
++	return f.delResp, f.err
++}
++
++func (f *fakeKVServer) Txn(context.Context, *pb.TxnRequest) (*pb.TxnResponse, error) {
++	return f.txnResp, f.err
++}
++
++func (f *fakeKVServer) Compact(context.Context, *pb.CompactionRequest) (*pb.CompactionResponse, error) {
++	return nil, f.err
++}
++
++func newObservedAuditServer(kv pb.KVServer, ag AuthGetter) (pb.KVServer, *observer.ObservedLogs) {
++	core, logs := observer.New(zapcore.InfoLevel)
++	return NewAuditKVServer(kv, ag, zap.New(core)), logs
++}
++
++func TestAuditKVServerRecordsEveryOperationKind(t *testing.T) {
++	wantResp := &pb.RangeResponse{}
++	fake := &fakeKVServer{rangeResp: wantResp, putResp: &pb.PutResponse{}, delResp: &pb.DeleteRangeResponse{}, txnResp: &pb.TxnResponse{}}
++	ag := &fakeAuthGetter{authInfo: &auth.AuthInfo{Username: "alice"}}
++	s, logs := newObservedAuditServer(fake, ag)
++
++	resp, err := s.Range(context.Background(), &pb.RangeRequest{Key: []byte("a"), RangeEnd: []byte("z")})
++	require.NoError(t, err)
++	assert.Same(t, wantResp, resp, "audit wrapper must not alter the response")
++
++	_, err = s.Put(context.Background(), &pb.PutRequest{Key: []byte("k")})
++	require.NoError(t, err)
++
++	_, err = s.DeleteRange(context.Background(), &pb.DeleteRangeRequest{Key: []byte("k")})
++	require.NoError(t, err)
++
++	_, err = s.Txn(context.Background(), &pb.TxnRequest{
++		Compare: []*pb.Compare{{Key: []byte("c")}},
++		Success: []*pb.RequestOp{{Request: &pb.RequestOp_RequestPut{RequestPut: &pb.PutRequest{Key: []byte("s")}}}},
++	})
++	require.NoError(t, err)
++
++	_, err = s.Compact(context.Background(), &pb.CompactionRequest{})
++	require.NoError(t, err)
++
++	entries := logs.All()
++	require.Len(t, entries, 5)
++
++	ops := make([]string, len(entries))
++	for i, e := range entries {
++		ctx := e.ContextMap()
++		assert.Equal(t, "alice", ctx["identity"])
++		assert.Equal(t, "success", ctx["outcome"])
++		ops[i] = ctx["operation"].(string)
++	}
++	assert.Equal(t, []string{"read", "write", "delete", "transaction", "compact"}, ops)
++
++	txnCtx := entries[3].ContextMap()
++	keys, ok := txnCtx["keys"].([]any)
++	require.True(t, ok)
++	assert.ElementsMatch(t, []any{"c", "s"}, keys)
++}
++
++func TestAuditKVServerUnauthenticatedWhenNoIdentity(t *testing.T) {
++	fake := &fakeKVServer{putResp: &pb.PutResponse{}}
++	ag := &fakeAuthGetter{}
++	s, logs := newObservedAuditServer(fake, ag)
++
++	_, err := s.Put(context.Background(), &pb.PutRequest{Key: []byte("k")})
++	require.NoError(t, err)
++
++	require.Len(t, logs.All(), 1)
++	assert.Equal(t, "unauthenticated", logs.All()[0].ContextMap()["identity"])
++}
++
++func TestAuditKVServerRecordsFailureOutcome(t *testing.T) {
++	wantErr := errors.New("boom")
++	fake := &fakeKVServer{err: wantErr}
++	ag := &fakeAuthGetter{}
++	s, logs := newObservedAuditServer(fake, ag)
++
++	_, err := s.Put(context.Background(), &pb.PutRequest{Key: []byte("k")})
++	assert.Equal(t, wantErr, err, "audit wrapper must propagate the underlying error unchanged")
++
++	require.Len(t, logs.All(), 1)
++	assert.Equal(t, "failure", logs.All()[0].ContextMap()["outcome"])
++}
+diff --git a/server/etcdserver/api/v3rpc/grpc.go b/server/etcdserver/api/v3rpc/grpc.go
+index 91863e294..1303d3285 100644
+--- a/server/etcdserver/api/v3rpc/grpc.go
++++ b/server/etcdserver/api/v3rpc/grpc.go
+@@ -77,7 +77,7 @@ func Server(s *etcdserver.EtcdServer, tls *tls.Config, interceptor grpc.UnarySer
+ 
+ 	grpcServer := grpc.NewServer(append(opts, gopts...)...)
+ 
+-	pb.RegisterKVServer(grpcServer, NewQuotaKVServer(s))
++	pb.RegisterKVServer(grpcServer, NewAuditKVServer(NewQuotaKVServer(s), s, s.Logger()))
+ 	pb.RegisterWatchServer(grpcServer, NewWatchServer(s))
+ 	pb.RegisterLeaseServer(grpcServer, NewQuotaLeaseServer(s))
+ 	pb.RegisterClusterServer(grpcServer, NewClusterServer(s))

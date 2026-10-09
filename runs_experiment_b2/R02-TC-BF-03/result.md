@@ -1,0 +1,68 @@
+# R02-TC-BF-03
+
+Condition: goga_forced_workflow
+Functional success: False
+Full architecture conformance: False
+ACR: 0.8
+Dangerous success: False
+Goga engagement signal: True
+Cost: $2.1033228000000004
+Duration: 372365ms, turns: 58
+
+## Agent's own summary
+
+# Change Plan
+
+## Task Classification
+**Feature** (additive extension) — new opt-in cache backend driver; no existing behavior modified.
+
+## Affected Cells
+
+| Cell | Files to Modify | What Changes |
+|---|---|---|
+| `salt/cache` | `salt/cache/sqlite3_cache.py` (new) | New driver module implementing the `store/fetch/flush/list_/contains/updated/init_kwargs/get_storage_id` contract using stdlib `sqlite3`, WAL mode, busy-timeout, per-db-file connection+lock cache |
+| *(non-cell, project hygiene)* | `doc/ref/cache/all/index.rst`, `doc/ref/cache/all/salt.cache.sqlite3_cache.rst` (new), `doc/ref/configuration/master.rst`, `changelog/<N>.added.md` (new) | Documentation/changelog completeness to match every existing sibling driver |
+| *(non-cell, tests)* | `tests/pytests/unit/cache/test_sqlite3_cache.py` (new), `tests/pytests/unit/cache/test_cache_backends.py` | Driver-specific unit coverage + parameterized contract-suite parity with `localfs`/`mmap_cache` |
+
+## Root Cause Analysis
+Not a bugfix — additive. Investigation confirmed `salt/cache`'s architecture (directory-scanned `LazyLoader`, duck-typed per-driver function contract, `Cache.kwargs`/`TypeError`-fallback for `expires`) is deliberately open for new backend modules with zero changes to `Cache`, `MemCache`, or `salt/loader`. The draft module was checked function-by-function against `localfs.py`/`mysql_cache.py` and matches the contract.
+
+## Trace Summary
+`salt.cache.factory(opts)` → `Cache.__init__` (sets `self.driver = opts.get("cache", "localfs")`) → `Cache.modules` (`salt.loader.cache(opts)`, directory-scans `salt/cache/*.py`) → `Cache.store/fetch/flush/list/contains/updated` dispatch to `f"{driver}.{name}"` with `**self.kwargs` (from `driver.init_kwargs(self._kwargs)`, always carrying `cachedir`). No file in this path enumerates driver names — becoming selectable requires only that `sqlite3_cache.py` exist under `salt/cache/` and that `__virtual__()` not return `False`, plus an operator setting `cache: sqlite3`.
+
+## Change Strategy
+1. **Finalize `salt/cache/sqlite3_cache.py`** (already drafted, reviewed against `localfs.py`/`mysql_cache.py`): keep as-is — `__virtual__` guards on `HAS_SQLITE3` (defensive for non-standard builds), `_cachedir`/`init_kwargs`/`_database_file`/`_table_name` mirror `localfs`'s kwarg-threading, `_connect` lazily creates the DB file + table + WAL pragmas + per-path `(conn, lock, table)` cached in a module-level dict guarded by `_connections_lock`, and every public function wraps `sqlite3.Error` in `SaltCacheError` (matching `mysql_cache`'s convention). No `expires` param on `store()`, so `Cache.store`'s manual-expiry envelope fallback applies automatically, identically to `localfs`/`mysql`.
+2. **Docs**: add `sqlite3_cache` to the `doc/ref/cache/all/index.rst` autosummary list (alphabetical slot: after `redis_cache`, i.e. list stays `consul, etcd3_cache, etcd_cache, localfs, localfs_key, mmap_cache, mmap_key, mysql_cache, redis_cache, sqlite3_cache`); add a matching `salt.cache.sqlite3_cache.rst` stub (title + `automodule`); update the `cache` master-config option doc to mention `sqlite3` as a driver choice, framed as the "no extra service" single-file option.
+3. **Changelog**: add one `changelog/<N>.added.md` fragment, one sentence, `added` type per `pyproject.toml` towncrier config.
+4. **Tests**:
+   - `tests/pytests/unit/cache/test_sqlite3_cache.py` — real `tmp_path`-backed SQLite file (no mocking needed, unlike `mysql_cache`), covering `_connect` table/pragma creation, `store`/`fetch` round-trip, `flush` true/false semantics, `list_`, `contains` (key and bank-only), `updated`, `get_storage_id`, `init_kwargs`, and `SaltCacheError` wrapping on a forced `sqlite3.Error`.
+   - Extend `test_cache_backends.py`'s parameterized `backend` fixture with a third `"sqlite3"` param (`_make_sqlite3(tmp_path)` + `_sqlite3_store/_fetch/_updated/_flush/_list/_contains` helpers calling the module functions with an explicit `cachedir`), so the entire existing 30+ test contract suite (store/fetch round-trips of all data shapes, `updated`, `flush`, `list`, `contains` semantics) runs against `sqlite3_cache` for parity with `localfs`/`mmap_cache`, reusing `sqlite3_cache._connections.clear()` in a cleanup step so cached connections don't leak across parametrized test runs (same pattern as `mmap_cache._caches.clear()`).
+
+## Specification Impact
+**None.** `salt/cache/CODEMANIFEST` requires no edit — confirmed in Investigation: it documents exactly one representative driver (`Cache::LocalFSBackend`) by explicit design ("the driver is a plain module of same-named functions dynamically dispatched... not a Python subclass"), and 8 other real drivers (`mysql_cache`, `redis_cache`, `consul`, `etcd_cache`, `etcd3_cache`, `mmap_cache`, `mmap_key`, `localfs_key`) already exist unmanifested under that same precedent. Adding a 9th unmanifested sibling is consistent, not a drift.
+
+`salt/loader/CODEMANIFEST` / implementation: **no edit**. `salt.loader.cache()` discovery is generic directory-scan; confirmed no registry exists.
+
+## Usage Impact
+**None.** No `.usages` files exist anywhere in the repository (`goga schema` shows `usages: []` on every cell); nothing to update.
+
+## Compatibility Verification
+**Backward compatible.** No existing function, file, output format, or return-value semantic changes. `opts["cache"]` default (`"localfs"`) is untouched. Deployments not setting `cache: sqlite3` load and execute exactly as before — the new module is inert unless explicitly selected. Confirmed via the Investigation's Breaking Change Assessment (all 6 questions answered NO).
+
+## Test Strategy
+- **Unit-level, driver-specific**: exercise `sqlite3_cache.py` internals directly (connection/table creation idempotency, error wrapping, storage-id derivation) the way `test_mysql_cache.py`/`test_redis_cache.py` do for their drivers.
+- **Contract-level, shared**: reuse the existing `test_cache_backends.py` parameterized suite by adding `sqlite3` as a third backend param — this is the strongest guarantee of behavioral parity with `localfs` (same store/fetch/updated/flush/list/contains semantics for dicts, strings, lists, nested structures, unicode, bytes, integers, `None`, missing keys/banks, overwrites, independent keys/banks, nested bank paths).
+- Rationale: sqlite3 needs no external service/mock, so tests run everywhere in CI without new dependencies — matching the task's own "no extra services" requirement.
+
+## Risk Assessment
+
+| Risk | Likelihood | Impact | Mitigation |
+|---|---|---|---|
+| Concurrent writers from multiple master worker processes hit `sqlite3.OperationalError: database is locked` | Low-Medium | Medium (write fails) | WAL journal mode + `PRAGMA busy_timeout` (default 30s) already in draft, making writers wait instead of failing immediately, matching the "single-node" scope this feature targets |
+| Cross-thread use of one cached `sqlite3.Connection` without serialization | Low | Medium (corruption/errors) | Draft opens with `check_same_thread=False` but serializes *all* access to a given connection through a per-connection `threading.Lock()`, so it's safe even if a single process handles cache calls from multiple threads |
+| Test-run connection/file-descriptor leakage from the module-level `_connections` cache across parametrized test runs | Low | Low (CI noise only) | Cleanup step clearing `sqlite3_cache._connections` (closing connections) between parametrized runs, mirroring the existing `mmap_cache._caches.clear()` pattern |
+| Doc/changelog omission leaves the feature "invisible" to operators | Low | Low | Explicit doc/changelog steps included in this plan |
+
+---
+
+Do you approve the plan? Proceed to implementation?

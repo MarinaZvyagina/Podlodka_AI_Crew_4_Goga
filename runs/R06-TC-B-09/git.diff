@@ -1,0 +1,401 @@
+diff --git a/server/etcdserver/api/v3rpc/grpc.go b/server/etcdserver/api/v3rpc/grpc.go
+index 91863e294..a462896c5 100644
+--- a/server/etcdserver/api/v3rpc/grpc.go
++++ b/server/etcdserver/api/v3rpc/grpc.go
+@@ -52,6 +52,7 @@ func Server(s *etcdserver.EtcdServer, tls *tls.Config, interceptor grpc.UnarySer
+ 
+ 	chainUnaryInterceptors := []grpc.UnaryServerInterceptor{
+ 		newLogUnaryInterceptor(s),
++		newAuditUnaryInterceptor(s),
+ 		serverMetrics.UnaryServerInterceptor(),
+ 		newUnaryInterceptor(s),
+ 	}
+diff --git a/server/etcdserver/api/v3rpc/key.go b/server/etcdserver/api/v3rpc/key.go
+index 4f87716a7..196df9f31 100644
+--- a/server/etcdserver/api/v3rpc/key.go
++++ b/server/etcdserver/api/v3rpc/key.go
+@@ -17,6 +17,7 @@ package v3rpc
+ 
+ import (
+ 	"context"
++	"time"
+ 
+ 	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/status"
+@@ -32,6 +33,10 @@ type kvServer struct {
+ 	hdr header
+ 	kv  etcdserver.RaftKV
+ 	aa  *AuthAdmin
++	// srv is used to emit the audit record for RangeStream, the one KV
++	// request that is server-streaming and therefore not covered by
++	// newAuditUnaryInterceptor (see grpc.go).
++	srv *etcdserver.EtcdServer
+ 	// maxTxnOps is the max operations per txn.
+ 	// e.g suppose maxTxnOps = 128.
+ 	// Txn.Success can have at most 128 operations,
+@@ -42,7 +47,7 @@ type kvServer struct {
+ }
+ 
+ func NewKVServer(s *etcdserver.EtcdServer) pb.KVServer {
+-	return &kvServer{hdr: newHeader(s), kv: s, aa: &AuthAdmin{s}, maxTxnOps: s.Cfg.MaxTxnOps}
++	return &kvServer{hdr: newHeader(s), kv: s, aa: &AuthAdmin{s}, srv: s, maxTxnOps: s.Cfg.MaxTxnOps}
+ }
+ 
+ func (s *kvServer) Range(ctx context.Context, r *pb.RangeRequest) (*pb.RangeResponse, error) {
+@@ -63,7 +68,13 @@ func (s *kvServer) RangeStream(r *pb.RangeRequest, rs pb.KV_RangeStreamServer) e
+ 	if err := checkRangeStreamRequest(r); err != nil {
+ 		return err
+ 	}
++
++	// RangeStream is server-streaming, so its decoded request never reaches
++	// newAuditUnaryInterceptor; audit it directly with the same helper so
++	// the record has the same shape as every other KV request.
++	start := time.Now()
+ 	err := s.kv.RangeStream(r, &headerFillingRangeStream{KV_RangeStreamServer: rs, hdr: &s.hdr})
++	auditKVRequest(s.srv, rs.Context(), kvOperationKind(kvServiceMethodPrefix+"RangeStream"), r, start, err)
+ 	if err != nil {
+ 		return togRPCError(err)
+ 	}
+diff --git a/server/etcdserver/api/v3rpc/kv_audit.go b/server/etcdserver/api/v3rpc/kv_audit.go
+new file mode 100644
+index 000000000..f74a3de37
+--- /dev/null
++++ b/server/etcdserver/api/v3rpc/kv_audit.go
+@@ -0,0 +1,196 @@
++// Copyright 2025 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package v3rpc
++
++import (
++	"context"
++	"strings"
++	"time"
++
++	"go.uber.org/zap"
++	"google.golang.org/grpc"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/server/v3/etcdserver"
++)
++
++// kvServiceMethodPrefix is the gRPC FullMethod prefix shared by every method
++// of the KV service. Gating on this prefix, rather than on an enumerated
++// list of method names, is what makes coverage uniform: any request type
++// added to the KV service in the future is audited automatically because it
++// is routed through this same interceptor, with no per-method registration
++// required.
++const kvServiceMethodPrefix = "/etcdserverpb.KV/"
++
++// kvOperationKinds maps a KV service FullMethod to the audit "operation
++// kind" required by the compliance record. Methods that are not listed here
++// (for example a method added after this table was written) still produce
++// an audit record via the fallback in kvOperationKind: coverage does not
++// depend on this table being kept exhaustive.
++var kvOperationKinds = map[string]string{
++	kvServiceMethodPrefix + "Range":       "read",
++	kvServiceMethodPrefix + "RangeStream": "read",
++	kvServiceMethodPrefix + "Put":         "write",
++	kvServiceMethodPrefix + "DeleteRange": "delete",
++	kvServiceMethodPrefix + "Txn":         "transaction",
++	kvServiceMethodPrefix + "Compact":     "compact",
++}
++
++// isKVServiceMethod reports whether fullMethod belongs to the KV gRPC
++// service, i.e. it is a key-value read, write, delete, or transaction
++// request that must be audited.
++func isKVServiceMethod(fullMethod string) bool {
++	return strings.HasPrefix(fullMethod, kvServiceMethodPrefix)
++}
++
++// kvOperationKind derives a human readable operation kind from a KV service
++// FullMethod. Unknown/future methods fall back to their bare method name so
++// that they still get a (less precisely labeled) audit record instead of
++// being silently skipped.
++func kvOperationKind(fullMethod string) string {
++	if kind, ok := kvOperationKinds[fullMethod]; ok {
++		return kind
++	}
++	return strings.TrimPrefix(fullMethod, kvServiceMethodPrefix)
++}
++
++// newAuditUnaryInterceptor returns an interceptor that produces a uniform
++// audit record for every unary key-value request (Range, Put, DeleteRange,
++// Txn, Compact, ...) handled by the server, regardless of which handler
++// eventually services it. Because it is keyed off the gRPC service name
++// rather than a per-request-type call inserted by hand, any KV request type
++// added later is covered automatically.
++func newAuditUnaryInterceptor(s *etcdserver.EtcdServer) grpc.UnaryServerInterceptor {
++	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
++		if !isKVServiceMethod(info.FullMethod) {
++			return handler(ctx, req)
++		}
++
++		start := time.Now()
++		resp, err := handler(ctx, req)
++		auditKVRequest(s, ctx, kvOperationKind(info.FullMethod), req, start, err)
++		return resp, err
++	}
++}
++
++// auditKVRequest emits a single audit record describing a key-value
++// request. It is shared by the unary interceptor above and by the
++// server-streaming RangeStream call site (server/etcdserver/api/v3rpc/key.go),
++// which -- unlike unary RPCs -- does not expose its decoded request to a
++// generic stream interceptor, so it records the audit event directly using
++// this same helper to keep the record shape identical.
++func auditKVRequest(s *etcdserver.EtcdServer, ctx context.Context, operation string, req any, start time.Time, err error) {
++	lg := s.Logger()
++	if lg == nil {
++		return
++	}
++
++	outcome := "success"
++	if err != nil {
++		outcome = "failure"
++	}
++
++	lg.Info("kv audit",
++		zap.String("identity", auditIdentity(s, ctx)),
++		zap.String("operation", operation),
++		zap.String("key", auditKeyRange(req)),
++		zap.Duration("duration", time.Since(start)),
++		zap.String("outcome", outcome),
++	)
++}
++
++// auditIdentity returns the authenticated caller identity for the request,
++// or "unauthenticated" if auth is disabled or no identity could be
++// determined.
++func auditIdentity(s *etcdserver.EtcdServer, ctx context.Context) string {
++	authInfo, err := s.AuthInfoFromCtx(ctx)
++	if err != nil || authInfo == nil || authInfo.Username == "" {
++		return "unauthenticated"
++	}
++	return authInfo.Username
++}
++
++// keyGetter and keyRangeGetter match the generated accessors that every
++// current (and, by protobuf convention, future) KV request message with a
++// key or key range exposes. Matching on these interfaces instead of a type
++// switch over concrete request types means a new request message picks up
++// key/range auditing automatically as long as it follows the same
++// convention, without editing this file.
++type keyGetter interface {
++	GetKey() []byte
++}
++
++type keyRangeGetter interface {
++	GetKey() []byte
++	GetRangeEnd() []byte
++}
++
++// auditKeyRange renders the key or key range a request operates over. Value
++// fields are never inspected here, only keys, so auditing cannot change what
++// data is returned to callers or leak values into logs.
++func auditKeyRange(req any) string {
++	switch r := req.(type) {
++	case *pb.TxnRequest:
++		return formatKeyRanges(txnKeyRanges(r))
++	case keyRangeGetter:
++		return formatKeyRange(r.GetKey(), r.GetRangeEnd())
++	case keyGetter:
++		return formatKeyRange(r.GetKey(), nil)
++	default:
++		return ""
++	}
++}
++
++func formatKeyRange(key, rangeEnd []byte) string {
++	if len(rangeEnd) == 0 {
++		return string(key)
++	}
++	return "[" + string(key) + ", " + string(rangeEnd) + ")"
++}
++
++func formatKeyRanges(ranges []string) string {
++	return strings.Join(ranges, "; ")
++}
++
++// txnKeyRanges collects the key/range of every comparison and operation
++// referenced by a (possibly nested) Txn request, so the audit record can
++// describe which keys a transaction touched even though TxnRequest itself
++// has no single top-level key field.
++func txnKeyRanges(r *pb.TxnRequest) []string {
++	var ranges []string
++	for _, c := range r.GetCompare() {
++		ranges = append(ranges, formatKeyRange(c.GetKey(), c.GetRangeEnd()))
++	}
++	ranges = append(ranges, requestOpKeyRanges(r.GetSuccess())...)
++	ranges = append(ranges, requestOpKeyRanges(r.GetFailure())...)
++	return ranges
++}
++
++func requestOpKeyRanges(ops []*pb.RequestOp) []string {
++	var ranges []string
++	for _, op := range ops {
++		switch v := op.GetRequest().(type) {
++		case *pb.RequestOp_RequestRange:
++			ranges = append(ranges, formatKeyRange(v.RequestRange.GetKey(), v.RequestRange.GetRangeEnd()))
++		case *pb.RequestOp_RequestPut:
++			ranges = append(ranges, formatKeyRange(v.RequestPut.GetKey(), nil))
++		case *pb.RequestOp_RequestDeleteRange:
++			ranges = append(ranges, formatKeyRange(v.RequestDeleteRange.GetKey(), v.RequestDeleteRange.GetRangeEnd()))
++		case *pb.RequestOp_RequestTxn:
++			ranges = append(ranges, txnKeyRanges(v.RequestTxn)...)
++		}
++	}
++	return ranges
++}
+diff --git a/server/etcdserver/api/v3rpc/kv_audit_test.go b/server/etcdserver/api/v3rpc/kv_audit_test.go
+new file mode 100644
+index 000000000..58c8c8a89
+--- /dev/null
++++ b/server/etcdserver/api/v3rpc/kv_audit_test.go
+@@ -0,0 +1,135 @@
++// Copyright 2025 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package v3rpc
++
++import (
++	"testing"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++)
++
++func TestIsKVServiceMethod(t *testing.T) {
++	tests := []struct {
++		fullMethod string
++		want       bool
++	}{
++		{"/etcdserverpb.KV/Range", true},
++		{"/etcdserverpb.KV/Put", true},
++		{"/etcdserverpb.KV/DeleteRange", true},
++		{"/etcdserverpb.KV/Txn", true},
++		{"/etcdserverpb.KV/Compact", true},
++		{"/etcdserverpb.KV/SomeFutureMethod", true},
++		{"/etcdserverpb.Watch/Watch", false},
++		{"/etcdserverpb.Lease/LeaseGrant", false},
++		{"/etcdserverpb.Auth/Authenticate", false},
++	}
++	for _, tt := range tests {
++		if got := isKVServiceMethod(tt.fullMethod); got != tt.want {
++			t.Errorf("isKVServiceMethod(%q) = %v, want %v", tt.fullMethod, got, tt.want)
++		}
++	}
++}
++
++func TestKVOperationKind(t *testing.T) {
++	tests := []struct {
++		fullMethod string
++		want       string
++	}{
++		{"/etcdserverpb.KV/Range", "read"},
++		{"/etcdserverpb.KV/RangeStream", "read"},
++		{"/etcdserverpb.KV/Put", "write"},
++		{"/etcdserverpb.KV/DeleteRange", "delete"},
++		{"/etcdserverpb.KV/Txn", "transaction"},
++		{"/etcdserverpb.KV/Compact", "compact"},
++		// A hypothetical future KV method still yields a non-empty kind
++		// derived from its name, instead of being skipped.
++		{"/etcdserverpb.KV/Watch", "Watch"},
++	}
++	for _, tt := range tests {
++		if got := kvOperationKind(tt.fullMethod); got != tt.want {
++			t.Errorf("kvOperationKind(%q) = %q, want %q", tt.fullMethod, got, tt.want)
++		}
++	}
++}
++
++func TestAuditKeyRange(t *testing.T) {
++	tests := []struct {
++		name string
++		req  any
++		want string
++	}{
++		{
++			name: "range with end",
++			req:  &pb.RangeRequest{Key: []byte("a"), RangeEnd: []byte("z")},
++			want: "[a, z)",
++		},
++		{
++			name: "range single key",
++			req:  &pb.RangeRequest{Key: []byte("a")},
++			want: "a",
++		},
++		{
++			name: "put",
++			req:  &pb.PutRequest{Key: []byte("foo"), Value: []byte("secret")},
++			want: "foo",
++		},
++		{
++			name: "delete range",
++			req:  &pb.DeleteRangeRequest{Key: []byte("a"), RangeEnd: []byte("b")},
++			want: "[a, b)",
++		},
++		{
++			name: "compact has no key",
++			req:  &pb.CompactionRequest{Revision: 5},
++			want: "",
++		},
++		{
++			name: "txn collects compare and op keys, including nested txn",
++			req: &pb.TxnRequest{
++				Compare: []*pb.Compare{{Key: []byte("c1")}},
++				Success: []*pb.RequestOp{
++					{Request: &pb.RequestOp_RequestPut{RequestPut: &pb.PutRequest{Key: []byte("p1")}}},
++					{Request: &pb.RequestOp_RequestTxn{RequestTxn: &pb.TxnRequest{
++						Success: []*pb.RequestOp{
++							{Request: &pb.RequestOp_RequestRange{RequestRange: &pb.RangeRequest{Key: []byte("r1"), RangeEnd: []byte("r2")}}},
++						},
++					}}},
++				},
++				Failure: []*pb.RequestOp{
++					{Request: &pb.RequestOp_RequestDeleteRange{RequestDeleteRange: &pb.DeleteRangeRequest{Key: []byte("d1")}}},
++				},
++			},
++			want: "c1; p1; [r1, r2); d1",
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if got := auditKeyRange(tt.req); got != tt.want {
++				t.Errorf("auditKeyRange(%v) = %q, want %q", tt.req, got, tt.want)
++			}
++		})
++	}
++}
++
++// TestAuditKeyRangeNeverIncludesValue guards against a regression where a
++// future edit accidentally logs request values (e.g. Put.Value) instead of
++// just keys, which would turn the audit log into a data leak.
++func TestAuditKeyRangeNeverIncludesValue(t *testing.T) {
++	req := &pb.PutRequest{Key: []byte("k"), Value: []byte("top-secret-value")}
++	got := auditKeyRange(req)
++	if got != "k" {
++		t.Errorf("auditKeyRange(%v) = %q, want %q (must not contain the value)", req, got, "k")
++	}
++}

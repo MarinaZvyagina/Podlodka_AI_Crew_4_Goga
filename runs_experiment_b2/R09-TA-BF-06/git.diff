@@ -1,0 +1,142 @@
+diff --git a/BrowserKit/Sources/TabDataStore/CODEMANIFEST b/BrowserKit/Sources/TabDataStore/CODEMANIFEST
+index 0b6c3f2..e59ad28 100644
+--- a/BrowserKit/Sources/TabDataStore/CODEMANIFEST
++++ b/BrowserKit/Sources/TabDataStore/CODEMANIFEST
+@@ -132,7 +132,8 @@ Annotations: |
+       List the UUIDs of every window with saved data on disk, without decoding any of them.
+       Cheaper than fetching full `WindowData` when only the id list is needed.
+     "removeWindowData(forUUIDs: [WindowUUID])": |
+-      Delete the saved data for exactly the given window UUIDs, leaving others untouched.
++      Delete the saved data for exactly the given window UUIDs, including their backup files,
++      leaving other windows (and their backups) untouched.
+ 
+ "TabDataStore::DefaultTabDataStore(logger: Logger, fileManager: TabFileManager, throttleTime: UInt64)":
+   location: TabDataStore.swift
+diff --git a/BrowserKit/Sources/TabDataStore/TabDataStore.swift b/BrowserKit/Sources/TabDataStore/TabDataStore.swift
+index e07e6fd..50f366f 100644
+--- a/BrowserKit/Sources/TabDataStore/TabDataStore.swift
++++ b/BrowserKit/Sources/TabDataStore/TabDataStore.swift
+@@ -252,8 +252,16 @@ public actor DefaultTabDataStore: TabDataStore {
+     }
+ 
+     public func removeWindowData(forUUIDs uuids: [WindowUUID]) async {
+-        guard let directoryURL = fileManager.windowDataDirectory(isBackup: false) else { return }
++        if let directoryURL = fileManager.windowDataDirectory(isBackup: false) {
++            removeWindowDataFiles(forUUIDs: uuids, inDirectory: directoryURL)
++        }
++
++        if let backupDirectoryURL = fileManager.windowDataDirectory(isBackup: true) {
++            removeWindowDataFiles(forUUIDs: uuids, inDirectory: backupDirectoryURL)
++        }
++    }
+ 
++    private func removeWindowDataFiles(forUUIDs uuids: [WindowUUID], inDirectory directoryURL: URL) {
+         let fileURLs = fileManager.contentsOfDirectory(at: directoryURL)
+ 
+         for url in fileURLs {
+diff --git a/BrowserKit/Tests/TabDataStoreTests/Mocks/MockTabFileManager.swift b/BrowserKit/Tests/TabDataStoreTests/Mocks/MockTabFileManager.swift
+index a933275..ea432c2 100644
+--- a/BrowserKit/Tests/TabDataStoreTests/Mocks/MockTabFileManager.swift
++++ b/BrowserKit/Tests/TabDataStoreTests/Mocks/MockTabFileManager.swift
+@@ -11,6 +11,8 @@ final class MockTabFileManager: TabFileManager, @unchecked Sendable {
+     var tabSessionDataDirectoryCalledCount = 0
+     var windowDataDirectoryCalledCount = 0
+     var pathContents: [URL]?
++    var primaryPathContents: [URL]?
++    var backupPathContents: [URL]?
+     var contentsOfDirectoryCalledCount = 0
+     var windowData: WindowData?
+     var getWindowDataFromPathCalledCount = 0
+@@ -22,6 +24,7 @@ final class MockTabFileManager: TabFileManager, @unchecked Sendable {
+     var removeFileAtCalledCount = 0
+     var removeAllFilesAtCalledCount = 0
+     var removeFileAtPathCalledCount = 0
++    var removedFileURLs = [URL]()
+ 
+     func tabSessionDataDirectory() -> URL? {
+         tabSessionDataDirectoryCalledCount += 1
+@@ -38,6 +41,12 @@ final class MockTabFileManager: TabFileManager, @unchecked Sendable {
+ 
+     func contentsOfDirectory(at path: URL) -> [URL] {
+         contentsOfDirectoryCalledCount += 1
++        if path == backupDirectoryURL, let backupPathContents {
++            return backupPathContents
++        }
++        if path == primaryDirectoryURL, let primaryPathContents {
++            return primaryPathContents
++        }
+         return pathContents ?? []
+     }
+ 
+@@ -51,6 +60,7 @@ final class MockTabFileManager: TabFileManager, @unchecked Sendable {
+ 
+     func removeFileAt(path: URL) {
+         removeFileAtPathCalledCount += 1
++        removedFileURLs.append(path)
+     }
+ 
+     func fileExists(atPath pathURL: URL) -> Bool {
+diff --git a/BrowserKit/Tests/TabDataStoreTests/TabDataStoreTests.swift b/BrowserKit/Tests/TabDataStoreTests/TabDataStoreTests.swift
+index aa02381..8b5f8a0 100644
+--- a/BrowserKit/Tests/TabDataStoreTests/TabDataStoreTests.swift
++++ b/BrowserKit/Tests/TabDataStoreTests/TabDataStoreTests.swift
+@@ -220,6 +220,48 @@ final class TabDataStoreTests: XCTestCase, @unchecked Sendable {
+         XCTAssertEqual(mockFileManager.removeAllFilesAtCalledCount, 2)
+     }
+ 
++    // MARK: - Removing Window Data
++    @MainActor
++    func testRemoveWindowData_removesMatchingPrimaryAndBackupFiles() async throws {
++        let subject = createSubject()
++        let uuidToRemove = defaultTestTabWindowUUID
++        let uuidToKeep = UUID(uuidString: "ABFF60DA-D1E7-407B-AA3B-130D48B31012")!
++        mockFileManager.primaryDirectoryURL = URL(string: "some/directory1")
++        mockFileManager.backupDirectoryURL = URL(string: "some/directory2")
++
++        let primaryURLToRemove = windowFileURL(directory: mockFileManager.primaryDirectoryURL!, uuid: uuidToRemove)
++        let primaryURLToKeep = windowFileURL(directory: mockFileManager.primaryDirectoryURL!, uuid: uuidToKeep)
++        let backupURLToRemove = windowFileURL(directory: mockFileManager.backupDirectoryURL!, uuid: uuidToRemove)
++        let backupURLToKeep = windowFileURL(directory: mockFileManager.backupDirectoryURL!, uuid: uuidToKeep)
++
++        mockFileManager.primaryPathContents = [primaryURLToRemove, primaryURLToKeep]
++        mockFileManager.backupPathContents = [backupURLToRemove, backupURLToKeep]
++
++        await subject.removeWindowData(forUUIDs: [uuidToRemove])
++
++        XCTAssertEqual(mockFileManager.removedFileURLs.count, 2)
++        XCTAssertTrue(mockFileManager.removedFileURLs.contains(primaryURLToRemove))
++        XCTAssertTrue(mockFileManager.removedFileURLs.contains(backupURLToRemove))
++        XCTAssertFalse(mockFileManager.removedFileURLs.contains(primaryURLToKeep))
++        XCTAssertFalse(mockFileManager.removedFileURLs.contains(backupURLToKeep))
++    }
++
++    @MainActor
++    func testRemoveWindowData_windowWithoutBackupFile_doesNotError() async throws {
++        let subject = createSubject()
++        mockFileManager.primaryDirectoryURL = URL(string: "some/directory1")
++        mockFileManager.backupDirectoryURL = URL(string: "some/directory2")
++
++        let primaryURLToRemove = windowFileURL(directory: mockFileManager.primaryDirectoryURL!,
++                                               uuid: defaultTestTabWindowUUID)
++        mockFileManager.primaryPathContents = [primaryURLToRemove]
++        mockFileManager.backupPathContents = []
++
++        await subject.removeWindowData(forUUIDs: [defaultTestTabWindowUUID])
++
++        XCTAssertEqual(mockFileManager.removedFileURLs, [primaryURLToRemove])
++    }
++
+     // MARK: - Helpers
+     @MainActor
+     func createSubject(throttleTime: UInt64 = 100) -> TabDataStore {
+@@ -244,6 +286,10 @@ final class TabDataStoreTests: XCTestCase, @unchecked Sendable {
+         return tabs
+     }
+ 
++    func windowFileURL(directory: URL, uuid: UUID) -> URL {
++        return directory.appendingPathComponent("window-\(uuid.uuidString)")
++    }
++
+     func createMockWindow(uuid: UUID) -> WindowData {
+         let tabs = createMockTabs()
+         return WindowData(id: uuid,

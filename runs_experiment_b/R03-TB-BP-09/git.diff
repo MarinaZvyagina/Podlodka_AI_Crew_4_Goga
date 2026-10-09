@@ -1,0 +1,420 @@
+diff --git a/integration/websockets/e2e/io-shutdown-notification.spec.ts b/integration/websockets/e2e/io-shutdown-notification.spec.ts
+new file mode 100644
+index 0000000..74cc162
+--- /dev/null
++++ b/integration/websockets/e2e/io-shutdown-notification.spec.ts
+@@ -0,0 +1,59 @@
++import { INestApplication } from '@nestjs/common';
++import { Test } from '@nestjs/testing';
++import { io } from 'socket.io-client';
++import { ApplicationGateway } from '../src/app.gateway.js';
++
++async function createNestApp(
++  notifyWebSocketClientsOnShutdown: boolean,
++): Promise<INestApplication> {
++  const testingModule = await Test.createTestingModule({
++    providers: [ApplicationGateway],
++  }).compile();
++  return testingModule.createNestApplication({
++    notifyWebSocketClientsOnShutdown,
++  });
++}
++
++describe('WebSocketGateway shutdown notification (IoAdapter)', () => {
++  it('should notify a connected client before disconnecting it on shutdown', async () => {
++    const app = await createNestApp(true);
++    await app.listen(3000);
++
++    const client = io('http://localhost:8080');
++    await new Promise<void>(resolve => client.on('connect', resolve));
++
++    const receivedMessage = new Promise<any>((resolve, reject) => {
++      client.once('shutdown', resolve);
++      client.once('disconnect', () =>
++        reject(new Error('disconnected before receiving a message')),
++      );
++    });
++
++    await app.close();
++
++    const message = await receivedMessage;
++    expect(message).toEqual('Server is shutting down');
++
++    client.close();
++  });
++
++  it('should not send anything when the option is disabled', async () => {
++    const app = await createNestApp(false);
++    await app.listen(3000);
++
++    const client = io('http://localhost:8080');
++    await new Promise<void>(resolve => client.on('connect', resolve));
++
++    const onShutdown = vi.fn();
++    client.on('shutdown', onShutdown);
++    const disconnected = new Promise<void>(resolve =>
++      client.once('disconnect', () => resolve()),
++    );
++
++    await app.close();
++    await disconnected;
++
++    expect(onShutdown).not.toHaveBeenCalled();
++    client.close();
++  });
++});
+diff --git a/integration/websockets/e2e/ws-shutdown-notification.spec.ts b/integration/websockets/e2e/ws-shutdown-notification.spec.ts
+new file mode 100644
+index 0000000..ba87724
+--- /dev/null
++++ b/integration/websockets/e2e/ws-shutdown-notification.spec.ts
+@@ -0,0 +1,57 @@
++import { INestApplication } from '@nestjs/common';
++import { WsAdapter } from '@nestjs/platform-ws';
++import { Test } from '@nestjs/testing';
++import WebSocket from 'ws';
++import { ApplicationGateway } from '../src/app.gateway.js';
++
++async function createNestApp(
++  notifyWebSocketClientsOnShutdown: boolean,
++): Promise<INestApplication> {
++  const testingModule = await Test.createTestingModule({
++    providers: [ApplicationGateway],
++  }).compile();
++  const app = testingModule.createNestApplication({
++    notifyWebSocketClientsOnShutdown,
++  });
++  app.useWebSocketAdapter(new WsAdapter(app) as any);
++  return app;
++}
++
++describe('WebSocketGateway shutdown notification (WsAdapter)', () => {
++  it('should notify a connected client before terminating it on shutdown', async () => {
++    const app = await createNestApp(true);
++    await app.listen(3000);
++
++    const ws = new WebSocket('ws://localhost:8080');
++    await new Promise(resolve => ws.on('open', resolve));
++
++    const receivedMessage = new Promise<any>((resolve, reject) => {
++      ws.once('message', data => resolve(JSON.parse(data.toString())));
++      ws.once('close', () =>
++        reject(new Error('connection closed before receiving a message')),
++      );
++    });
++
++    await app.close();
++
++    const message = await receivedMessage;
++    expect(message.event).toEqual('shutdown');
++  });
++
++  it('should not send anything when the option is disabled', async () => {
++    const app = await createNestApp(false);
++    await app.listen(3000);
++
++    const ws = new WebSocket('ws://localhost:8080');
++    await new Promise(resolve => ws.on('open', resolve));
++
++    const onMessage = vi.fn();
++    ws.on('message', onMessage);
++    const closed = new Promise<void>(resolve => ws.once('close', resolve));
++
++    await app.close();
++    await closed;
++
++    expect(onMessage).not.toHaveBeenCalled();
++  });
++});
+diff --git a/packages/common/interfaces/nest-application-options.interface.ts b/packages/common/interfaces/nest-application-options.interface.ts
+index 84a1357..991d78c 100644
+--- a/packages/common/interfaces/nest-application-options.interface.ts
++++ b/packages/common/interfaces/nest-application-options.interface.ts
+@@ -40,6 +40,16 @@ export interface NestApplicationOptions extends NestApplicationContextOptions {
+    * @default false
+    */
+   return503OnClosing?: boolean;
++  /**
++   * Whether to notify connected WebSocket clients (both the `ws` and `socket.io` adapters
++   * shipped with the framework) that the server is shutting down. When enabled, each
++   * currently connected client is sent a small notification immediately before its
++   * connection is closed as part of the application shutdown sequence, so clients can
++   * distinguish a graceful shutdown from a dropped connection. Applies automatically to
++   * every gateway in the application.
++   * @default false
++   */
++  notifyWebSocketClientsOnShutdown?: boolean;
+   /**
+    * Per-kind policy for overlapping HTTP routes detected at bootstrap.
+    * Distinguishes `duplicate` (identical method+path+host+version) from
+diff --git a/packages/platform-socket.io/adapters/io-adapter.ts b/packages/platform-socket.io/adapters/io-adapter.ts
+index 90c640c..451c72e 100644
+--- a/packages/platform-socket.io/adapters/io-adapter.ts
++++ b/packages/platform-socket.io/adapters/io-adapter.ts
+@@ -6,7 +6,11 @@ import { fromEvent, Observable } from 'rxjs';
+ import { filter, first, map, mergeMap, share, takeUntil } from 'rxjs/operators';
+ import { Namespace, Server, ServerOptions, Socket } from 'socket.io';
+ import { isFunction, isNil } from '@nestjs/common/internal';
+-import { DISCONNECT_EVENT } from '@nestjs/websockets/internal';
++import {
++  DISCONNECT_EVENT,
++  SHUTDOWN_EVENT,
++  SHUTDOWN_MESSAGE,
++} from '@nestjs/websockets/internal';
+ 
+ /**
+  * @publicApi
+@@ -93,6 +97,13 @@ export class IoAdapter extends AbstractWsAdapter {
+   }
+ 
+   public async close(server: Server): Promise<void> {
++    if (this.notifyClientsOnShutdown) {
++      server.emit(SHUTDOWN_EVENT, SHUTDOWN_MESSAGE);
++      // Give the just-emitted packet a chance to reach the transport before
++      // the connections are torn down below.
++      await new Promise(resolve => setImmediate(resolve));
++    }
++
+     if (this.forceCloseConnections && server.httpServer === this.httpServer) {
+       return;
+     }
+diff --git a/packages/platform-socket.io/test/io-adapter.spec.ts b/packages/platform-socket.io/test/io-adapter.spec.ts
+index 7c5520a..1f5833a 100644
+--- a/packages/platform-socket.io/test/io-adapter.spec.ts
++++ b/packages/platform-socket.io/test/io-adapter.spec.ts
+@@ -45,4 +45,53 @@ describe('IoAdapter', () => {
+       expect(messageCalls).toHaveLength(2);
+     });
+   });
++
++  describe('close', () => {
++    function createFakeServer() {
++      return {
++        emit: vi.fn(),
++        close: vi.fn(callback => callback()),
++      } as any;
++    }
++
++    it('should emit a shutdown notification to connected clients when enabled', async () => {
++      adapter.notifyClientsOnShutdown = true;
++      const server = createFakeServer();
++
++      await adapter.close(server);
++
++      expect(server.emit).toHaveBeenCalledWith(
++        'shutdown',
++        'Server is shutting down',
++      );
++      expect(server.close).toHaveBeenCalled();
++    });
++
++    it('should not emit anything when disabled', async () => {
++      adapter.notifyClientsOnShutdown = false;
++      const server = createFakeServer();
++
++      await adapter.close(server);
++
++      expect(server.emit).not.toHaveBeenCalled();
++      expect(server.close).toHaveBeenCalled();
++    });
++
++    it('should emit the notification before skipping close on a force-closed shared http server', async () => {
++      const httpServer = {};
++      adapter = new IoAdapter(httpServer);
++      adapter.notifyClientsOnShutdown = true;
++      adapter.forceCloseConnections = true;
++      const server = createFakeServer();
++      server.httpServer = httpServer;
++
++      await adapter.close(server);
++
++      expect(server.emit).toHaveBeenCalledWith(
++        'shutdown',
++        'Server is shutting down',
++      );
++      expect(server.close).not.toHaveBeenCalled();
++    });
++  });
+ });
+diff --git a/packages/platform-ws/adapters/ws-adapter.ts b/packages/platform-ws/adapters/ws-adapter.ts
+index fd75cf7..1e897ea 100644
+--- a/packages/platform-ws/adapters/ws-adapter.ts
++++ b/packages/platform-ws/adapters/ws-adapter.ts
+@@ -9,6 +9,8 @@ import {
+   CLOSE_EVENT,
+   CONNECTION_EVENT,
+   ERROR_EVENT,
++  SHUTDOWN_EVENT,
++  SHUTDOWN_MESSAGE,
+ } from '@nestjs/websockets/internal';
+ import type { MessageMappingProperties } from '@nestjs/websockets';
+ 
+@@ -198,12 +200,28 @@ export class WsAdapter extends AbstractWsAdapter {
+     );
+     if (server.clients) {
+       for (const ws of server.clients) {
++        if (this.notifyClientsOnShutdown) {
++          this.notifyClientOfShutdown(ws);
++        }
+         ws.terminate();
+       }
+     }
+     await closeEventSignal;
+   }
+ 
++  protected notifyClientOfShutdown(client: any) {
++    if (client.readyState !== READY_STATE.OPEN_STATE) {
++      return;
++    }
++    try {
++      client.send(
++        JSON.stringify({ event: SHUTDOWN_EVENT, data: SHUTDOWN_MESSAGE }),
++      );
++    } catch (err) {
++      this.logger.error(err);
++    }
++  }
++
+   public async dispose() {
+     const closeEventSignals = Array.from(this.httpServersRegistry)
+       .filter(([port]) => port !== UNDERLYING_HTTP_SERVER_PORT)
+diff --git a/packages/platform-ws/test/ws-adapter.spec.ts b/packages/platform-ws/test/ws-adapter.spec.ts
+new file mode 100644
+index 0000000..7536be2
+--- /dev/null
++++ b/packages/platform-ws/test/ws-adapter.spec.ts
+@@ -0,0 +1,68 @@
++import { WsAdapter } from '../adapters/ws-adapter.js';
++
++function createFakeClient(readyState = 1) {
++  return {
++    readyState,
++    send: vi.fn(),
++    terminate: vi.fn(),
++  };
++}
++
++function createFakeServer(clients: any[]) {
++  return {
++    clients: new Set(clients),
++    close: vi.fn(callback => callback()),
++  } as any;
++}
++
++describe('WsAdapter', () => {
++  let adapter: WsAdapter;
++
++  beforeEach(() => {
++    adapter = new WsAdapter();
++  });
++
++  describe('close', () => {
++    it('should send a shutdown notification to every open client before terminating it when enabled', async () => {
++      adapter.notifyClientsOnShutdown = true;
++      const client = createFakeClient();
++      const server = createFakeServer([client]);
++
++      await adapter.close(server);
++
++      expect(client.send).toHaveBeenCalledWith(
++        JSON.stringify({ event: 'shutdown', data: 'Server is shutting down' }),
++      );
++      expect(client.terminate).toHaveBeenCalled();
++    });
++
++    it('should not notify clients that are not open', async () => {
++      adapter.notifyClientsOnShutdown = true;
++      const client = createFakeClient(3); // CLOSED
++      const server = createFakeServer([client]);
++
++      await adapter.close(server);
++
++      expect(client.send).not.toHaveBeenCalled();
++      expect(client.terminate).toHaveBeenCalled();
++    });
++
++    it('should not send anything when disabled', async () => {
++      adapter.notifyClientsOnShutdown = false;
++      const client = createFakeClient();
++      const server = createFakeServer([client]);
++
++      await adapter.close(server);
++
++      expect(client.send).not.toHaveBeenCalled();
++      expect(client.terminate).toHaveBeenCalled();
++    });
++
++    it('should not throw when there are no connected clients', async () => {
++      adapter.notifyClientsOnShutdown = true;
++      const server = createFakeServer([]);
++
++      await expect(adapter.close(server)).resolves.toBeUndefined();
++    });
++  });
++});
+diff --git a/packages/websockets/adapters/ws-adapter.ts b/packages/websockets/adapters/ws-adapter.ts
+index 411b158..9ed6f7f 100644
+--- a/packages/websockets/adapters/ws-adapter.ts
++++ b/packages/websockets/adapters/ws-adapter.ts
+@@ -17,6 +17,7 @@ export abstract class AbstractWsAdapter<
+ > implements WebSocketAdapter<TServer, TClient, TOptions> {
+   protected readonly httpServer: any;
+   private _forceCloseConnections: boolean;
++  private _notifyClientsOnShutdown: boolean;
+ 
+   public set forceCloseConnections(value: boolean) {
+     this._forceCloseConnections = value;
+@@ -26,6 +27,14 @@ export abstract class AbstractWsAdapter<
+     return this._forceCloseConnections;
+   }
+ 
++  public set notifyClientsOnShutdown(value: boolean) {
++    this._notifyClientsOnShutdown = value;
++  }
++
++  public get notifyClientsOnShutdown(): boolean {
++    return this._notifyClientsOnShutdown;
++  }
++
+   constructor(appOrHttpServer?: INestApplicationContext | object) {
+     if (appOrHttpServer && appOrHttpServer instanceof NestApplication) {
+       this.httpServer = appOrHttpServer.getUnderlyingHttpServer();
+diff --git a/packages/websockets/constants.ts b/packages/websockets/constants.ts
+index e8b7b8e..74d650d 100644
+--- a/packages/websockets/constants.ts
++++ b/packages/websockets/constants.ts
+@@ -13,3 +13,5 @@ export const CONNECTION_EVENT = 'connection';
+ export const DISCONNECT_EVENT = 'disconnect';
+ export const CLOSE_EVENT = 'close';
+ export const ERROR_EVENT = 'error';
++export const SHUTDOWN_EVENT = 'shutdown';
++export const SHUTDOWN_MESSAGE = 'Server is shutting down';
+diff --git a/packages/websockets/socket-module.ts b/packages/websockets/socket-module.ts
+index 6a39c48..f5772ec 100644
+--- a/packages/websockets/socket-module.ts
++++ b/packages/websockets/socket-module.ts
+@@ -145,12 +145,14 @@ export class SocketModule<
+   }
+ 
+   private async initializeAdapter() {
+-    const forceCloseConnections = (this.appOptions as NestApplicationOptions)
+-      .forceCloseConnections;
++    const { forceCloseConnections, notifyWebSocketClientsOnShutdown } = this
++      .appOptions as NestApplicationOptions;
+     const adapter = this.applicationConfig.getIoAdapter();
+     if (adapter) {
+       (adapter as AbstractWsAdapter).forceCloseConnections =
+         forceCloseConnections!;
++      (adapter as AbstractWsAdapter).notifyClientsOnShutdown =
++        notifyWebSocketClientsOnShutdown!;
+       this.isAdapterInitialized = true;
+       return;
+     }
+@@ -161,6 +163,7 @@ export class SocketModule<
+     );
+     const ioAdapter = new IoAdapter(this.httpServer);
+     ioAdapter.forceCloseConnections = forceCloseConnections;
++    ioAdapter.notifyClientsOnShutdown = notifyWebSocketClientsOnShutdown;
+     this.applicationConfig.setIoAdapter(ioAdapter);
+ 
+     this.isAdapterInitialized = true;

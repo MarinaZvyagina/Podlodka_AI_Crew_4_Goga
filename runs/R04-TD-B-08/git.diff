@@ -1,0 +1,328 @@
+diff --git a/packages/excalidraw/actions/actionSnapToGrid.test.tsx b/packages/excalidraw/actions/actionSnapToGrid.test.tsx
+new file mode 100644
+index 0000000..a3628fa
+--- /dev/null
++++ b/packages/excalidraw/actions/actionSnapToGrid.test.tsx
+@@ -0,0 +1,165 @@
++import { CaptureUpdateAction } from "@excalidraw/element";
++
++import { Excalidraw } from "../index";
++import { API } from "../tests/helpers/api";
++import { Keyboard } from "../tests/helpers/ui";
++import { render } from "../tests/test-utils";
++
++import { actionSnapToGrid } from "./actionSnapToGrid";
++
++describe("snap to grid", () => {
++  beforeEach(async () => {
++    await render(<Excalidraw handleKeyboardGlobally={true} />);
++  });
++
++  it("snaps only the selected elements, each independently, to the nearest grid line", () => {
++    const rect1 = API.createElement({
++      type: "rectangle",
++      x: 12,
++      y: 33,
++      width: 40,
++      height: 40,
++    });
++    const rect2 = API.createElement({
++      type: "rectangle",
++      x: 108,
++      y: 91,
++      width: 40,
++      height: 40,
++    });
++
++    API.setElements([rect1, rect2]);
++    API.setSelectedElements([rect1]);
++
++    API.executeAction(actionSnapToGrid);
++
++    expect(API.getElement(rect1).x).toBe(20);
++    expect(API.getElement(rect1).y).toBe(40);
++    // untouched, since it wasn't part of the selection
++    expect(API.getElement(rect2).x).toBe(108);
++    expect(API.getElement(rect2).y).toBe(91);
++  });
++
++  it("snaps every element on the canvas when nothing is selected", () => {
++    const rect1 = API.createElement({
++      type: "rectangle",
++      x: 12,
++      y: 33,
++      width: 40,
++      height: 40,
++    });
++    const rect2 = API.createElement({
++      type: "rectangle",
++      x: 108,
++      y: 91,
++      width: 40,
++      height: 40,
++    });
++
++    API.setElements([rect1, rect2]);
++    API.setSelectedElements([]);
++
++    API.executeAction(actionSnapToGrid);
++
++    expect(API.getElement(rect1).x).toBe(20);
++    expect(API.getElement(rect1).y).toBe(40);
++    expect(API.getElement(rect2).x).toBe(100);
++    expect(API.getElement(rect2).y).toBe(100);
++  });
++
++  it("moves a bound text element together with its container", () => {
++    const container = API.createElement({
++      type: "rectangle",
++      x: 12,
++      y: 33,
++      width: 100,
++      height: 60,
++      boundElements: [{ type: "text", id: "bound-text" }],
++    });
++    const text = API.createElement({
++      type: "text",
++      id: "bound-text",
++      x: 22,
++      y: 43,
++      width: 80,
++      height: 25,
++      containerId: container.id,
++      text: "hello",
++    });
++
++    API.setElements([container, text]);
++    API.setSelectedElements([container]);
++
++    API.executeAction(actionSnapToGrid);
++
++    const updatedContainer = API.getElement(container);
++    const updatedText = API.getElement(text);
++
++    expect(updatedContainer.x).toBe(20);
++    expect(updatedContainer.y).toBe(40);
++    // moved by the same delta as its container (+8, +7)
++    expect(updatedText.x).toBe(30);
++    expect(updatedText.y).toBe(50);
++  });
++
++  it("undo reverts the snap for every affected element in a single step", () => {
++    const rect1 = API.createElement({
++      type: "rectangle",
++      x: 12,
++      y: 33,
++      width: 40,
++      height: 40,
++    });
++    const rect2 = API.createElement({
++      type: "rectangle",
++      x: 108,
++      y: 91,
++      width: 40,
++      height: 40,
++    });
++
++    API.updateScene({
++      elements: [rect1, rect2],
++      captureUpdate: CaptureUpdateAction.IMMEDIATELY,
++    });
++    API.setSelectedElements([]);
++
++    const undoStackBefore = API.getUndoStack().length;
++
++    API.executeAction(actionSnapToGrid);
++
++    expect(API.getElement(rect1).x).toBe(20);
++    expect(API.getElement(rect2).x).toBe(100);
++    expect(API.getUndoStack().length).toBe(undoStackBefore + 1);
++
++    Keyboard.undo();
++
++    expect(API.getElement(rect1).x).toBe(12);
++    expect(API.getElement(rect1).y).toBe(33);
++    expect(API.getElement(rect2).x).toBe(108);
++    expect(API.getElement(rect2).y).toBe(91);
++
++    Keyboard.redo();
++
++    expect(API.getElement(rect1).x).toBe(20);
++    expect(API.getElement(rect2).x).toBe(100);
++  });
++
++  it("is a no-op when the selected elements are already grid-aligned", () => {
++    const rect1 = API.createElement({
++      type: "rectangle",
++      x: 20,
++      y: 40,
++      width: 40,
++      height: 40,
++    });
++
++    API.setElements([rect1]);
++    API.setSelectedElements([rect1]);
++
++    API.executeAction(actionSnapToGrid);
++
++    expect(API.getElement(rect1).x).toBe(20);
++    expect(API.getElement(rect1).y).toBe(40);
++  });
++});
+diff --git a/packages/excalidraw/actions/actionSnapToGrid.ts b/packages/excalidraw/actions/actionSnapToGrid.ts
+new file mode 100644
+index 0000000..090df53
+--- /dev/null
++++ b/packages/excalidraw/actions/actionSnapToGrid.ts
+@@ -0,0 +1,87 @@
++import {
++  getBoundTextElement,
++  getNonDeletedElements,
++  isArrowElement,
++  updateBoundElements,
++  CaptureUpdateAction,
++} from "@excalidraw/element";
++import { getGridPoint } from "@excalidraw/common";
++
++import type { ExcalidrawElement } from "@excalidraw/element/types";
++
++import { gridIcon } from "../components/icons";
++
++import { register } from "./register";
++
++import type { AppClassProperties, AppState, NullableGridSize } from "../types";
++
++const snapElementsToGrid = (
++  elements: readonly ExcalidrawElement[],
++  appState: Readonly<AppState>,
++  app: AppClassProperties,
++): readonly ExcalidrawElement[] => {
++  const selectedElements = app.scene.getSelectedElements(appState);
++  const targets =
++    selectedElements.length > 0
++      ? selectedElements
++      : getNonDeletedElements(elements);
++
++  const gridSize = appState.gridSize as NullableGridSize;
++  const elementsMap = app.scene.getNonDeletedElementsMap();
++  const updatedElements = new Map<string, ExcalidrawElement>();
++
++  targets.forEach((element) => {
++    const [nextX, nextY] = getGridPoint(element.x, element.y, gridSize);
++    if (nextX === element.x && nextY === element.y) {
++      return;
++    }
++
++    const dx = nextX - element.x;
++    const dy = nextY - element.y;
++
++    updatedElements.set(
++      element.id,
++      app.scene.mutateElement(element, { x: nextX, y: nextY }),
++    );
++
++    // arrow labels are positioned relative to the arrow's points and are
++    // recalculated on render, so they must not be moved independently
++    if (!isArrowElement(element)) {
++      const boundTextElement = getBoundTextElement(element, elementsMap);
++      if (boundTextElement) {
++        updatedElements.set(
++          boundTextElement.id,
++          app.scene.mutateElement(boundTextElement, {
++            x: boundTextElement.x + dx,
++            y: boundTextElement.y + dy,
++          }),
++        );
++      }
++    }
++
++    updateBoundElements(element, app.scene, {
++      simultaneouslyUpdated: targets,
++    });
++  });
++
++  if (updatedElements.size === 0) {
++    return elements;
++  }
++
++  return elements.map((element) => updatedElements.get(element.id) ?? element);
++};
++
++export const actionSnapToGrid = register({
++  name: "snapToGrid",
++  icon: gridIcon,
++  label: "labels.snapToGrid",
++  keywords: ["grid", "align", "snap"],
++  trackEvent: { category: "canvas" },
++  perform: (elements, appState, _, app) => {
++    return {
++      appState,
++      elements: snapElementsToGrid(elements, appState, app),
++      captureUpdate: CaptureUpdateAction.IMMEDIATELY,
++    };
++  },
++});
+diff --git a/packages/excalidraw/actions/index.ts b/packages/excalidraw/actions/index.ts
+index 6d2321b..8e568bd 100644
+--- a/packages/excalidraw/actions/index.ts
++++ b/packages/excalidraw/actions/index.ts
+@@ -78,6 +78,7 @@ export {
+ } from "./actionClipboard";
+ 
+ export { actionToggleGridMode } from "./actionToggleGridMode";
++export { actionSnapToGrid } from "./actionSnapToGrid";
+ export { actionToggleZenMode } from "./actionToggleZenMode";
+ export { actionToggleObjectsSnapMode } from "./actionToggleObjectsSnapMode";
+ export { actionToggleArrowBinding } from "./actionToggleArrowBinding";
+diff --git a/packages/excalidraw/actions/types.ts b/packages/excalidraw/actions/types.ts
+index 4f7cbd3..eff05d4 100644
+--- a/packages/excalidraw/actions/types.ts
++++ b/packages/excalidraw/actions/types.ts
+@@ -57,6 +57,7 @@ export type ActionName =
+   | "selectAll"
+   | "pasteStyles"
+   | "gridMode"
++  | "snapToGrid"
+   | "zenMode"
+   | "objectsSnapMode"
+   | "arrowBinding"
+diff --git a/packages/excalidraw/components/App.tsx b/packages/excalidraw/components/App.tsx
+index d0c75ad..91bc808 100644
+--- a/packages/excalidraw/components/App.tsx
++++ b/packages/excalidraw/components/App.tsx
+@@ -313,6 +313,7 @@ import {
+   actionSelectAll,
+   actionSendBackward,
+   actionSendToBack,
++  actionSnapToGrid,
+   actionToggleGridMode,
+   actionToggleStats,
+   actionToggleZenMode,
+@@ -13586,6 +13587,7 @@ class App extends React.Component<AppProps, AppState> {
+         actionUnlockAllElements,
+         CONTEXT_MENU_SEPARATOR,
+         actionToggleGridMode,
++        actionSnapToGrid,
+         actionToggleObjectsSnapMode,
+         actionToggleArrowBinding,
+         actionToggleMidpointSnapping,
+@@ -13644,6 +13646,7 @@ class App extends React.Component<AppProps, AppState> {
+       CONTEXT_MENU_SEPARATOR,
+       actionFlipHorizontal,
+       actionFlipVertical,
++      actionSnapToGrid,
+       CONTEXT_MENU_SEPARATOR,
+       actionToggleLinearEditor,
+       CONTEXT_MENU_SEPARATOR,
+diff --git a/packages/excalidraw/locales/en.json b/packages/excalidraw/locales/en.json
+index 4a6fa1d..f67d183 100644
+--- a/packages/excalidraw/locales/en.json
++++ b/packages/excalidraw/locales/en.json
+@@ -113,6 +113,7 @@
+     "collaborators": "Collaborators",
+     "you": "You",
+     "toggleGrid": "Toggle grid",
++    "snapToGrid": "Snap to grid",
+     "addToLibrary": "Add to library",
+     "removeFromLibrary": "Remove from library",
+     "libraryLoadingMessage": "Loading library…",

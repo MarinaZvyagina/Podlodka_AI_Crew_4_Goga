@@ -1,0 +1,137 @@
+# R06-TB-BF-03
+
+Condition: goga_forced_workflow
+Functional success: False
+Full architecture conformance: False
+ACR: 0.2
+Dangerous success: False
+Goga engagement signal: True
+Cost: $2.669525100000001
+Duration: 508161ms, turns: 74
+
+## Agent's own summary
+
+# Change Plan
+
+## Task Classification
+Feature (additive safety-cap extension) — no bugfix, no refactor of existing behavior.
+
+## Affected Cells
+
+| Cell | Files to Modify | What Changes |
+|---|---|---|
+| `server/lease` | `CODEMANIFEST`, `lease.go`, `lessor.go` | New `Lease.Len()` O(1) accessor (query-only, no new import); new `ErrTooManyLeaseKeys` sentinel error (declared but never returned by `Lessor` itself — consumed by the `apply` decorator) |
+| `server/etcdserver/apply` | `CODEMANIFEST`, new file `leasecap.go`, `interface.go`, `uber_applier.go` | New `leaseCapApplierV3` decorator (Put/Txn pre-check, recursive nested-Txn walk); new `ApplierOptions.MaxLeaseKeysCfg` field; wired into `newApplierV3` chain |
+
+Non-cell plumbing (outside the documented forest, mechanical wiring only):
+
+| File | Change |
+|---|---|
+| `server/embed/config.go` | `DefaultMaxLeaseKeys` constant, `Config.MaxLeaseKeys uint` field + json tag, default assignment in `NewConfig()`, `fs.UintVar` flag registration |
+| `server/embed/etcd.go` | Copy `cfg.MaxLeaseKeys` into `config.ServerConfig` |
+| `server/config/config.go` | `ServerConfig.MaxLeaseKeys uint` field |
+| `server/etcdserver/server.go` | `NewUberApplier()`: pass `MaxLeaseKeysCfg: s.Cfg.MaxLeaseKeys` |
+| `api/v3rpc/rpctypes/error.go` | `ErrGRPCTooManyLeaseKeys`, `errStringToError` entry, client-side `ErrTooManyLeaseKeys` |
+| `server/etcdserver/api/v3rpc/util.go` | `toGRPCErrorMap` entry: `lease.ErrTooManyLeaseKeys: rpctypes.ErrGRPCTooManyLeaseKeys` |
+
+## Root Cause Analysis
+No mechanism today bounds keys-per-lease. `Lessor.Attach` grows unboundedly, and its sole call site in the raft-apply path (`kvstore_txn.go:285-288`) panics on any error it doesn't already expect — so the cap cannot live inside `Attach`. It must live as a new pre-execution decorator in `server/etcdserver/apply`, the documented extension point, gated on `Lessor` state read via existing O(1) `Lookup`/`GetLease`, plus one new O(1) `Lease.Len()` accessor.
+
+## Trace Summary
+Client Put/Txn → v3rpc structural checks (unrelated, pre-raft) → raft commit → `uberApplier.Apply` → decorator chain (`corrupt → capped → auth → **leaseCap (new)** → quota → base`) → `mvcc.storeTxnWrite.put` → `Lessor.Attach` (only reached once the new decorator has already approved the request). Rejections short-circuit before `base`/`Attach` execute, so the request is never partially applied and the panic path is never reached for capacity rejections.
+
+## Change Strategy
+
+1. **`server/lease/lease.go`** — add:
+   ```go
+   // Len returns the number of distinct keys currently attached to the lease.
+   func (l *Lease) Len() int {
+       l.mu.RLock()
+       defer l.mu.RUnlock()
+       return len(l.itemSet)
+   }
+   ```
+2. **`server/lease/lessor.go`** — add `ErrTooManyLeaseKeys = errors.New("etcdserver: too many keys attached to lease")` next to `ErrLeaseTTLTooLarge`. No other change to `Lessor`/`Attach`.
+3. **`server/etcdserver/apply/leasecap.go`** (new file) — define:
+   ```go
+   type leaseCapApplierV3 struct {
+       applierV3
+       lessor  lease.Lessor
+       maxKeys uint
+   }
+
+   func newLeaseCapApplierV3(lessor lease.Lessor, maxKeys uint, app applierV3) applierV3 {
+       return &leaseCapApplierV3{app, lessor, maxKeys}
+   }
+
+   func (a *leaseCapApplierV3) Put(p *pb.PutRequest) (*pb.PutResponse, *traceutil.Trace, error) {
+       if err := checkLeaseCapPut(a.lessor, a.maxKeys, p); err != nil {
+           return nil, nil, err
+       }
+       return a.applierV3.Put(p)
+   }
+
+   func (a *leaseCapApplierV3) Txn(rt *pb.TxnRequest, skipRangeExecution bool) (*pb.TxnResponse, *traceutil.Trace, error) {
+       if err := checkLeaseCapTxn(a.lessor, a.maxKeys, rt); err != nil {
+           return nil, nil, err
+       }
+       return a.applierV3.Txn(rt, skipRangeExecution)
+   }
+   ```
+   Helper design (single-request atomicity):
+   - `checkLeaseCapPut` — trivial single-key wrapper around the same accumulation primitive Txn uses.
+   - `checkLeaseCapTxn(lessor, maxKeys, rt)` — if `maxKeys == 0`, return nil immediately (disabled). Otherwise walk `rt.Success` and `rt.Failure` independently (mirroring `checkTxnPermission`), recursing into nested `RequestOp_RequestTxn`; for each branch accumulate a `map[lease.LeaseID]map[string]struct{}` of **new** distinct keys per target lease (skip a key via `lessor.GetLease(item) == leaseID` check — already attached, doesn't count); after walking one full branch, for every lease in that branch's map check `lessor.Lookup(id).Len() + len(newKeys) > int(maxKeys)` → return `lease.ErrTooManyLeaseKeys`. Each branch checked independently (matching the existing conservative both-branches-checked precedent in `checkTxnPermission`, since only one branch executes but which one isn't known pre-execution).
+   - Single `Put` reduces to the Txn helper's per-branch logic with one op.
+4. **`server/etcdserver/apply/interface.go`** — add `MaxLeaseKeysCfg uint` field to `ApplierOptions`, next to `QuotaBackendBytesCfg`.
+5. **`server/etcdserver/apply/uber_applier.go`** — in `newApplierV3`, insert the new decorator between auth and quota:
+   ```go
+   return newAuthApplierV3(
+       opts.AuthStore,
+       newLeaseCapApplierV3(opts.Lessor, opts.MaxLeaseKeysCfg,
+           newQuotaApplierV3(opts.Logger, opts.QuotaBackendBytesCfg, opts.Backend, applierBackend)),
+       opts.Lessor,
+   )
+   ```
+6. Non-cell plumbing files as tabulated above, mirroring `MaxTxnOps`/`QuotaBackendBytesCfg` field-for-field and `ErrLeaseTTLTooLarge` field-for-field.
+7. **Default value: `DefaultMaxLeaseKeys = uint(1_000_000)`.** Justification: the problem statement describes existing pathological leases reaching "hundreds of thousands" of keys; a default of one million is comfortably above that observed ceiling (so no existing deployment's current largest lease is retroactively rejected on upgrade — this is additive-safe), while still bounding truly unbounded growth, satisfying "sensible built-in default that doesn't break existing deployments." `0` is documented as "no limit" for operators who need to opt fully out.
+
+## Specification Impact
+- `server/lease/CODEMANIFEST`: add `Len() -> count:int` method to the `"Lease()"` type block (annotation: "Number of distinct keys currently attached to this lease."). No `Lessor()` method-table change (no new/changed methods), but add `ErrTooManyLeaseKeys` mention is not required in DSL body (errors aren't first-class DSL entities here — `ErrLeaseNotFound`/`ErrLeaseTTLTooLarge` aren't listed as separate types either, consistent with existing manifest style, which documents them only via method annotations like `Attach`'s "If the lease does not exist, an error will be returned"). No annotation change needed on `Attach` itself since its contract is unchanged.
+- `server/etcdserver/apply/CODEMANIFEST`:
+  - `decorator_chain` usage text updated to append the new decorator in the documented ordering: "...RBAC authorization, **lease key-count capping**, backend byte-size quota accounting, then the base applier...".
+  - `ApplierOptions()` properties: add `"MaxLeaseKeysCfg -> uint"` describing "The configured maximum number of distinct keys permitted on one lease; 0 disables the cap."
+  - No changes to `UberApplier()`'s `Apply` algorithm description (still "chain top-to-bottom, dispatch, return leaf or first short-circuit" — the new decorator is just another chain link, already covered by the existing generic wording).
+
+## Usage Impact
+No existing `.usages/*.md` files exist in either cell today (`goga schema` output showed `"usages": []` for both `server/lease` and `server/etcdserver/apply`), so there is nothing to update for consumer-facing recipes. No new `.usages` file is warranted: the new behavior is a server-operator-facing config flag and an error code, not a new consumption pattern for either cell's Go API — existing callers of `Lessor`/`applierV3` need no new usage guidance beyond what the CODEMANIFEST annotations already state.
+
+## Compatibility Verification
+**Backward compatible.** No existing exported signature changes. `Lessor.Attach`/`Lookup`/`GetLease` behavior is untouched. The only new externally-observable behavior is a new rejection path that is unreachable unless an operator explicitly configures (or the new nonzero default triggers on) a lease exceeding `MaxLeaseKeysCfg` distinct keys — set high enough by default that no currently-functioning write pattern flips from success to failure. All existing tests are expected to pass unmodified.
+
+## Test Strategy
+- **`server/lease`**: add a small test for `Lease.Len()` (0 initially, increments on `Attach`, decrements on `Detach`) in `lessor_test.go`, following the existing `TestLessorDetach`/`TestLeaseConcurrentKeys` style.
+- **`server/etcdserver/apply`**: new `leasecap_test.go` (mirrors `auth_test.go`'s structure — construct a fake/real `lease.Lessor`, wrap a stub base `applierV3`), covering:
+  1. Put under limit succeeds (delegates to base).
+  2. Put that would be the `(maxKeys+1)`th distinct key on a lease at exactly `maxKeys` is rejected with `lease.ErrTooManyLeaseKeys`, and the base applier's `Put` is never invoked (assert no delegation — proves atomicity/no partial effect).
+  3. Put re-attaching a key already on the lease (same key, same `leaseID` already returned by `GetLease`) is **not** rejected even when the lease is already at/over the limit.
+  4. Txn with multiple new-key `RequestPut` ops targeting the same lease, individually under the limit but cumulatively over it, is rejected as a whole (proves cumulative-not-per-op accounting) — and base `Txn` is never invoked.
+  5. Txn mixing a re-attach (existing key) and a genuinely-new key within the remaining headroom succeeds.
+  6. `maxKeys == 0` disables the check entirely (parity with today's unbounded behavior) — regression guard for the default-safety requirement.
+  7. Nested `RequestOp_RequestTxn` inside `Success`/`Failure` is walked and enforced (proves recursion).
+- **`server/etcdserver/apply`** `uber_applier_test.go`: extend/verify `newApplierV3`/`NewUberApplier` construction still wires correctly with the new field present (no behavior assertion needed beyond compile + existing alarm tests continuing to pass).
+- **Integration-level sanity** (if time permits, not required for correctness): confirm via existing `tests/framework/integration` lease tests that default config (`MaxLeaseKeysCfg` = default) does not alter any existing integration test outcome.
+- Full existing suites for `server/lease` and `server/etcdserver/apply` must be run and pass unmodified.
+
+## Risk Assessment
+
+| Risk | Likelihood | Impact | Mitigation |
+|---|---|---|---|
+| Default cap accidentally breaks an existing huge-lease deployment on upgrade | Low | High | Default set to 1,000,000 (well above the "hundreds of thousands" problem scale described); `0` documented as full opt-out |
+| Txn branch-independent checking over-rejects a request whose executed branch would have been fine | Low | Low | Matches existing accepted precedent (`checkTxnPermission` already does this for auth); documented as intentional conservative behavior, not a new class of risk |
+| Missed call site still reaches `Attach` without passing through the new decorator (e.g. internal recovery/restore paths) | Low | High (would panic) | Investigation confirmed `kvstore.go:398` restore path calls `Attach` outside the apply chain entirely and already tolerates+logs errors without panicking — explicitly out of scope, untouched, no new error type ever returned from `Attach` itself so this path is unaffected regardless |
+| New decorator ordering interacts badly with alarm-triggered `capped`/`corrupt` outer layers | Low | Medium | New decorator placed at the same inner static-chain layer as auth/quota (built once in `newApplierV3`), consistent with how those already coexist with alarm-driven outer wrapping in `restoreAlarms()` |
+| Forgetting one leg of the four-file gRPC error trio leaves a raw Go error string reaching the client | Medium | Medium | Explicit checklist step per file (`lessor.go`, `rpctypes/error.go` ×3 declarations, `util.go` map entry) verified by a targeted manual gRPC-error round-trip test |
+
+---
+
+Do you approve this plan? Proceed to implementation?

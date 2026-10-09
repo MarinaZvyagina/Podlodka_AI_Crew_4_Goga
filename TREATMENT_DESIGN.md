@@ -72,4 +72,4 @@ The full Goga SDD pipeline (Experiment B) remains a legitimate, separate researc
 
 ## 7. What "Goga" means for the rest of this benchmark
 
-Everywhere `PROTOCOL.md`, `repos.yaml`, `experiment_plan.csv`, and `results/*.csv` refer to "Goga condition," it means precisely: *Condition B as defined in §2 of this document* — a frozen CODEMANIFEST architecture forest plus one static pointer file, nothing else. This scoping note must be repeated in `report/final_report.md` §3 verbatim to prevent readers (or the HighLoad++ audience) from generalizing findings to "Goga the product" or "Goga the workflow."
+Everywhere `PROTOCOL.md`, `repos.yaml`, `experiment_plan.csv`, and `results/*.csv` refer to "Goga condition," it means precisely: *Condition B as defined in §2 of this document* — a frozen CODEMANIFEST architecture forest plus one static pointer file, nothing else. This scoping note must be repeated in `report/final_report.md` §3 verbatim to prevent readers (or the Podlodka AI Crew audience) from generalizing findings to "Goga the product" or "Goga the workflow."

@@ -1,0 +1,123 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+index f47eddb..17c49ad 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+@@ -6,6 +6,7 @@ import android.text.Spannable;
+ import android.text.SpannableString;
+ import android.text.SpannableStringBuilder;
+ import android.text.TextUtils;
++import android.util.LruCache;
+ 
+ import androidx.annotation.NonNull;
+ import androidx.annotation.Nullable;
+@@ -50,6 +51,8 @@ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Set;
+ import java.util.concurrent.Executor;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicLong;
+ 
+ import static org.thoughtcrime.securesms.database.SearchTable.SNIPPET_WRAP;
+ 
+@@ -62,6 +65,13 @@ public class SearchRepository {
+ 
+   private static final int MAX_SNIPPET_SIZE = 100;
+ 
++  /** Bumped whenever a message/thread/recipient change could invalidate a previously-cached search result. */
++  private static final AtomicLong resultCacheGeneration = new AtomicLong(0);
++
++  private static final AtomicBoolean resultCacheObserverRegistered = new AtomicBoolean(false);
++
++  private static final int RESULT_CACHE_SIZE = 32;
++
+   private final Context           context;
+   private final String            noteToSelfTitle;
+   private final SearchTable       searchDatabase;
+@@ -72,6 +82,10 @@ public class SearchRepository {
+ 
+   private final Executor serialExecutor;
+ 
++  private final LruCache<List<Object>, ThreadSearchResult>  threadResultCache  = new LruCache<>(RESULT_CACHE_SIZE);
++  private final LruCache<List<Object>, MessageSearchResult> messageResultCache = new LruCache<>(RESULT_CACHE_SIZE);
++  private volatile long cachedResultGeneration = resultCacheGeneration.get();
++
+   public SearchRepository(@NonNull String noteToSelfTitle) {
+     this.context           = AppDependencies.getApplication().getApplicationContext();
+     this.noteToSelfTitle   = noteToSelfTitle;
+@@ -81,10 +95,24 @@ public class SearchRepository {
+     this.mentionTable      = SignalDatabase.mentions();
+     this.messageTable      = SignalDatabase.messages();
+     this.serialExecutor    = new SerialExecutor(SignalExecutors.BOUNDED);
++
++    if (resultCacheObserverRegistered.compareAndSet(false, true)) {
++      // A single, app-wide signal: any message, thread, or recipient/group name change could affect any cached query
++      // across any SearchRepository instance, so we invalidate broadly rather than track which queries are affected.
++      AppDependencies.getDatabaseObserver().registerConversationListObserver(resultCacheGeneration::incrementAndGet);
++    }
+   }
+ 
+   @WorkerThread
+   public @NonNull ThreadSearchResult queryThreadsSync(@NonNull String query, boolean unreadOnly) {
++    evictStaleCacheEntries();
++
++    List<Object> cacheKey = List.of(query, unreadOnly);
++    ThreadSearchResult cached = threadResultCache.get(cacheKey);
++    if (cached != null) {
++      return cached;
++    }
++
+     SignalTrace.beginSection("ConversationListSearch-Threads");
+     try {
+       long                      start  = System.currentTimeMillis();
+@@ -92,7 +120,9 @@ public class SearchRepository {
+ 
+       Log.d(TAG, "[threads] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new ThreadSearchResult(result, query);
++      ThreadSearchResult searchResult = new ThreadSearchResult(result, query);
++      threadResultCache.put(cacheKey, searchResult);
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -100,6 +130,14 @@ public class SearchRepository {
+ 
+   @WorkerThread
+   public @NonNull MessageSearchResult queryMessagesSync(@NonNull String query, @NonNull SearchFilter filter) {
++    evictStaleCacheEntries();
++
++    List<Object> cacheKey = List.of(query, filter);
++    MessageSearchResult cached = messageResultCache.get(cacheKey);
++    if (cached != null) {
++      return cached;
++    }
++
+     SignalTrace.beginSection("ConversationListSearch-Messages");
+     try {
+       long start = System.currentTimeMillis();
+@@ -111,12 +149,24 @@ public class SearchRepository {
+ 
+       Log.d(TAG, "[messages] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new MessageSearchResult(combined, query);
++      MessageSearchResult searchResult = new MessageSearchResult(combined, query);
++      messageResultCache.put(cacheKey, searchResult);
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+   }
+ 
++  /** Clears this instance's caches if any relevant data has changed since they were last populated. */
++  private void evictStaleCacheEntries() {
++    long currentGeneration = resultCacheGeneration.get();
++    if (cachedResultGeneration != currentGeneration) {
++      cachedResultGeneration = currentGeneration;
++      threadResultCache.evictAll();
++      messageResultCache.evictAll();
++    }
++  }
++
+   public void query(@NonNull String query, long threadId, @NonNull Callback<List<MessageResult>> callback) {
+     if (TextUtils.isEmpty(query)) {
+       callback.onResult(Collections.emptyList());

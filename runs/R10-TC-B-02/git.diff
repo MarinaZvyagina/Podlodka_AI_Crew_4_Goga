@@ -1,0 +1,306 @@
+diff --git a/Signal/src/ViewControllers/AppSettings/ChatsSettingsViewController.swift b/Signal/src/ViewControllers/AppSettings/ChatsSettingsViewController.swift
+index 32fac8f..6e4f507 100644
+--- a/Signal/src/ViewControllers/AppSettings/ChatsSettingsViewController.swift
++++ b/Signal/src/ViewControllers/AppSettings/ChatsSettingsViewController.swift
+@@ -102,6 +102,25 @@ class ChatsSettingsViewController: OWSTableViewController2 {
+         )
+         contents.add(keepMutedChatsArchived)
+ 
++        let messageRetentionSection = OWSTableSection()
++        messageRetentionSection.add(.disclosureItem(
++            withText: OWSLocalizedString(
++                "SETTINGS_MESSAGE_RETENTION_TITLE",
++                comment: "Label for the 'keep messages' retention setting in the Chats settings.",
++            ),
++            accessoryText: Self.messageRetentionPeriodDaysLabel(
++                SSKEnvironment.shared.databaseStorageRef.read { SSKPreferences.messageRetentionPeriodDays(transaction: $0) },
++            ),
++            actionBlock: { [weak self] in
++                self?.showMessageRetentionPicker()
++            },
++        ))
++        messageRetentionSection.footerTitle = OWSLocalizedString(
++            "SETTINGS_MESSAGE_RETENTION_FOOTER",
++            comment: "Footer describing the 'keep messages' retention setting in the Chats settings.",
++        )
++        contents.add(messageRetentionSection)
++
+         let clearHistorySection = OWSTableSection()
+         clearHistorySection.add(.item(
+             name: OWSLocalizedString("SETTINGS_CLEAR_HISTORY", comment: ""),
+@@ -168,6 +187,69 @@ class ChatsSettingsViewController: OWSTableViewController2 {
+         SSKEnvironment.shared.storageServiceManagerRef.recordPendingLocalAccountUpdates()
+     }
+ 
++    // MARK: - Message Retention
++
++    private static let messageRetentionPeriodDayOptions: [UInt32?] = [nil, 30, 90, 365]
++
++    private static func messageRetentionPeriodDaysLabel(_ days: UInt32?) -> String {
++        guard let days else {
++            return OWSLocalizedString(
++                "SETTINGS_MESSAGE_RETENTION_FOREVER",
++                comment: "Label indicating that message history is kept forever.",
++            )
++        }
++        if days == 365 {
++            return OWSLocalizedString(
++                "SETTINGS_MESSAGE_RETENTION_1_YEAR",
++                comment: "Label indicating that message history is kept for one year.",
++            )
++        }
++        let format = OWSLocalizedString(
++            "SETTINGS_MESSAGE_RETENTION_N_DAYS_FORMAT",
++            comment: "Label indicating that message history is kept for a number of days. Embeds {{ the number of days }}.",
++        )
++        return String(format: format, Int(days))
++    }
++
++    private func showMessageRetentionPicker() {
++        let actionSheet = ActionSheetController(title: OWSLocalizedString(
++            "SETTINGS_MESSAGE_RETENTION_TITLE",
++            comment: "Label for the 'keep messages' retention setting in the Chats settings.",
++        ))
++
++        for days in Self.messageRetentionPeriodDayOptions {
++            actionSheet.addAction(.init(
++                title: Self.messageRetentionPeriodDaysLabel(days),
++                handler: { [weak self] _ in
++                    self?.didSelectMessageRetentionPeriodDays(days)
++                },
++            ))
++        }
++
++        actionSheet.addAction(OWSActionSheets.cancelAction)
++
++        presentActionSheet(actionSheet)
++    }
++
++    private func didSelectMessageRetentionPeriodDays(_ days: UInt32?) {
++        Logger.info("selected: \(String(describing: days))")
++
++        SSKEnvironment.shared.databaseStorageRef.asyncWrite { tx in
++            SSKPreferences.setMessageRetentionPeriodDays(days, transaction: tx)
++
++            guard let days else { return }
++
++            SSKEnvironment.shared.bulkDeleteInteractionJobQueueRef.sweepMessageRetention(
++                retentionPeriodDays: days,
++                now: Date(),
++                threadStore: DependenciesBridge.shared.threadStore,
++                tx: tx,
++            )
++        }
++
++        updateTableContents()
++    }
++
+     // MARK: -
+ 
+     private func didTapClearHistory() {
+diff --git a/Signal/translations/en.lproj/Localizable.strings b/Signal/translations/en.lproj/Localizable.strings
+index c811732..cede3c7 100644
+--- a/Signal/translations/en.lproj/Localizable.strings
++++ b/Signal/translations/en.lproj/Localizable.strings
+@@ -8974,6 +8974,21 @@
+ /* Label for the 'video' attachment type in the media download settings. */
+ "SETTINGS_MEDIA_DOWNLOAD_TYPE_VIDEO" = "Videos";
+ 
++/* Footer describing the 'keep messages' retention setting in the Chats settings. */
++"SETTINGS_MESSAGE_RETENTION_FOOTER" = "Automatically delete messages older than the selected time period from all of your chats.";
++
++/* Label indicating that message history is kept forever. */
++"SETTINGS_MESSAGE_RETENTION_FOREVER" = "Forever";
++
++/* Label indicating that message history is kept for a number of days. Embeds {{ the number of days }}. */
++"SETTINGS_MESSAGE_RETENTION_N_DAYS_FORMAT" = "%d Days";
++
++/* Label for the 'keep messages' retention setting in the Chats settings. */
++"SETTINGS_MESSAGE_RETENTION_TITLE" = "Keep Messages";
++
++/* Label indicating that message history is kept for one year. */
++"SETTINGS_MESSAGE_RETENTION_1_YEAR" = "1 Year";
++
+ /* Setting for enabling & disabling the sound effect played when a message is sent. */
+ "SETTINGS_MESSAGE_SENT_SOUND" = "Message Sent Sound";
+ 
+diff --git a/SignalServiceKit/Environment/AppSetup.swift b/SignalServiceKit/Environment/AppSetup.swift
+index 5d89a51..d7b1b18 100644
+--- a/SignalServiceKit/Environment/AppSetup.swift
++++ b/SignalServiceKit/Environment/AppSetup.swift
+@@ -2248,6 +2248,27 @@ extension AppSetup.FinalContinuation {
+             sskEnvironment.smJobQueuesRef.incomingContactSyncJobQueue.start(appContext: appContext)
+             sskEnvironment.smJobQueuesRef.sendGiftBadgeJobQueue.start(appContext: appContext)
+         }
++
++        appReadiness.runNowOrWhenAppDidBecomeReadyAsync { [sskEnvironment] in
++            Self.sweepMessageRetentionIfNeeded(sskEnvironment: sskEnvironment)
++        }
++        NotificationCenter.default.addObserver(
++            forName: .OWSApplicationDidBecomeActive,
++            object: nil,
++            queue: nil,
++        ) { [sskEnvironment] _ in
++            Self.sweepMessageRetentionIfNeeded(sskEnvironment: sskEnvironment)
++        }
++    }
++
++    private static func sweepMessageRetentionIfNeeded(sskEnvironment: SSKEnvironment) {
++        sskEnvironment.databaseStorageRef.asyncWrite { tx in
++            sskEnvironment.bulkDeleteInteractionJobQueueRef.sweepMessageRetentionIfNeeded(
++                now: Date(),
++                threadStore: DependenciesBridge.shared.threadStore,
++                tx: tx,
++            )
++        }
+     }
+ 
+     @MainActor
+diff --git a/SignalServiceKit/Jobs/BulkDeleteInteractionJobQueue.swift b/SignalServiceKit/Jobs/BulkDeleteInteractionJobQueue.swift
+index d7b0be7..b003681 100644
+--- a/SignalServiceKit/Jobs/BulkDeleteInteractionJobQueue.swift
++++ b/SignalServiceKit/Jobs/BulkDeleteInteractionJobQueue.swift
+@@ -64,6 +64,70 @@ public final class BulkDeleteInteractionJobQueue {
+             self.jobQueueRunner.addPersistedJob(jobRecord)
+         }
+     }
++
++    // MARK: - Message Retention
++
++    private enum RetentionConstants {
++        static let secondsPerDay: TimeInterval = 24 * 60 * 60
++        static let minSweepInterval: TimeInterval = 24 * 60 * 60
++    }
++
++    /// Enqueues a bulk-delete job for every thread that has messages older
++    /// than the given retention window, applying it retroactively.
++    public func sweepMessageRetention(
++        retentionPeriodDays: UInt32,
++        now: Date,
++        threadStore: ThreadStore,
++        tx: DBWriteTransaction,
++    ) {
++        let cutoffTimestamp = UInt64(max(
++            0,
++            now.timeIntervalSince1970 - Double(retentionPeriodDays) * RetentionConstants.secondsPerDay,
++        )) * 1000
++
++        threadStore.enumerateNonStoryThreads(tx: tx) { thread in
++            if
++                let anchorRowId = InteractionFinder(threadUniqueId: thread.uniqueId)
++                    .rowIdOfNewestInteraction(receivedAtOrBefore: cutoffTimestamp, tx: tx)
++            {
++                self.addJob(
++                    anchorMessageRowId: anchorRowId,
++                    isFullThreadDelete: false,
++                    threadUniqueId: thread.uniqueId,
++                    tx: tx,
++                )
++            }
++            return true
++        }
++
++        SSKPreferences.setLastMessageRetentionSweepAt(now, transaction: tx)
++    }
++
++    /// Throttled wrapper around `sweepMessageRetention`, suitable for calling
++    /// on every app launch/foreground.
++    func sweepMessageRetentionIfNeeded(
++        now: Date,
++        threadStore: ThreadStore,
++        tx: DBWriteTransaction,
++    ) {
++        guard let retentionPeriodDays = SSKPreferences.messageRetentionPeriodDays(transaction: tx) else {
++            return
++        }
++
++        if
++            let lastSweepAt = SSKPreferences.lastMessageRetentionSweepAt(transaction: tx),
++            now.timeIntervalSince(lastSweepAt) < RetentionConstants.minSweepInterval
++        {
++            return
++        }
++
++        sweepMessageRetention(
++            retentionPeriodDays: retentionPeriodDays,
++            now: now,
++            threadStore: threadStore,
++            tx: tx,
++        )
++    }
+ }
+ 
+ // MARK: -
+diff --git a/SignalServiceKit/Storage/Database/Records/InteractionFinder.swift b/SignalServiceKit/Storage/Database/Records/InteractionFinder.swift
+index 10ddd2a..3bb524c 100644
+--- a/SignalServiceKit/Storage/Database/Records/InteractionFinder.swift
++++ b/SignalServiceKit/Storage/Database/Records/InteractionFinder.swift
+@@ -1495,4 +1495,28 @@ extension InteractionFinder {
+             return 0
+         }
+     }
++
++    /// The row ID of the newest interaction in the given thread received at
++    /// or before `receivedAtOrBefore`, or `nil` if there are none.
++    public func rowIdOfNewestInteraction(
++        receivedAtOrBefore: UInt64,
++        tx: DBReadTransaction,
++    ) -> Int64? {
++        let sql = """
++        SELECT MAX(\(interactionColumn: .id))
++        FROM \(InteractionRecord.databaseTableName)
++        WHERE \(interactionColumn: .threadUniqueId) = ?
++        AND \(interactionColumn: .receivedAtTimestamp) <= ?
++        """
++        do {
++            return try Int64.fetchOne(
++                tx.database,
++                sql: sql,
++                arguments: [threadUniqueId, receivedAtOrBefore],
++            )
++        } catch {
++            owsFailDebug("Failed to find newest interaction row ID: \(error)")
++            return nil
++        }
++    }
+ }
+diff --git a/SignalServiceKit/Util/SSKPreferences.swift b/SignalServiceKit/Util/SSKPreferences.swift
+index e436bda..658085c 100644
+--- a/SignalServiceKit/Util/SSKPreferences.swift
++++ b/SignalServiceKit/Util/SSKPreferences.swift
+@@ -193,4 +193,35 @@ public class SSKPreferences: NSObject {
+     public static func setShouldKeepMutedChatsArchived(_ newValue: Bool, transaction: DBWriteTransaction) {
+         store.setBool(newValue, key: shouldKeepMutedChatsArchivedKey, transaction: transaction)
+     }
++
++    // MARK: - Message Retention
++
++    private static var messageRetentionPeriodDaysKey: String { "messageRetentionPeriodDays" }
++
++    /// The number of days of message history to keep, or `nil` if messages
++    /// should be kept forever.
++    public static func messageRetentionPeriodDays(transaction: DBReadTransaction) -> UInt32? {
++        guard let value = store.getUInt32(messageRetentionPeriodDaysKey, transaction: transaction) else {
++            return nil
++        }
++        return value
++    }
++
++    public static func setMessageRetentionPeriodDays(_ newValue: UInt32?, transaction: DBWriteTransaction) {
++        if let newValue {
++            store.setUInt32(newValue, key: messageRetentionPeriodDaysKey, transaction: transaction)
++        } else {
++            store.removeValue(forKey: messageRetentionPeriodDaysKey, transaction: transaction)
++        }
++    }
++
++    private static var lastMessageRetentionSweepAtKey: String { "lastMessageRetentionSweepAt" }
++
++    public static func lastMessageRetentionSweepAt(transaction: DBReadTransaction) -> Date? {
++        return store.getDate(lastMessageRetentionSweepAtKey, transaction: transaction)
++    }
++
++    public static func setLastMessageRetentionSweepAt(_ newValue: Date, transaction: DBWriteTransaction) {
++        store.setDate(newValue, key: lastMessageRetentionSweepAtKey, transaction: transaction)
++    }
+ }

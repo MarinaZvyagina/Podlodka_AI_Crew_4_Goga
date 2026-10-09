@@ -1,0 +1,33 @@
+## Ticket: Protect vmagent from runaway target counts coming from a single scrape job
+
+We've had a couple of incidents where a scrape job backed by an auto-discovery source
+(cloud API, orchestrator, catalog, etc.) briefly returned a huge number of targets because of
+a misconfiguration on the discovery side (e.g. a tag filter was accidentally removed, or a
+catalog query became too broad). In each case, vmagent happily tried to scrape all of them at
+once, which spiked memory and CPU usage and degraded scraping for every other job running on
+the same vmagent instance until someone noticed and fixed the discovery-side config.
+
+We want a safety net: operators should be able to configure a maximum number of scrape targets
+that a single job (`job_name`) is allowed to have active at once, regardless of which discovery
+mechanism produced those targets. If a job's discovered target count goes over the configured
+maximum, vmagent should keep scraping only up to that number of targets for that job (rather
+than crashing, rejecting the whole job, or silently scraping everything anyway), and it should
+be obvious to an operator, from the same places they already go to check on scrape target
+health today, which job(s) are currently hitting the limit and roughly how many targets are
+being left out because of it.
+
+Requirements:
+
+- New, documented way to configure the per-job target cap (global default plus the ability to
+  reason about it per job is fine — use your judgement on the exact mechanism, but it must be
+  off/unlimited by default so existing setups are unaffected).
+- The cap must apply uniformly no matter which service discovery mechanism supplied the targets
+  for that job — this is not specific to any single discovery backend.
+- Operators must be able to see, using the existing places where scrape target status is
+  already reported, which jobs are currently over the limit and how many targets are being
+  excluded.
+- Add tests covering: a job under the limit (unaffected), a job over the limit (truncated,
+  visible in status), and the default (unlimited) behavior.
+
+This will primarily affect vmagent, but should also work for the scraping functionality built
+into the single-node binary, since they share the same scraping code.

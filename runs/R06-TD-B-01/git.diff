@@ -1,0 +1,612 @@
+diff --git a/server/storage/mvcc/kvstore.go b/server/storage/mvcc/kvstore.go
+index a9cb65c0c..a978217bf 100644
+--- a/server/storage/mvcc/kvstore.go
++++ b/server/storage/mvcc/kvstore.go
+@@ -73,6 +73,10 @@ type store struct {
+ 	// compactMainRev is the main revision of the last compaction.
+ 	compactMainRev int64
+ 
++	// readCache memoizes read-only Range results between writes. See
++	// rangeCache for the invalidation strategy that keeps it correct.
++	readCache *rangeCache
++
+ 	fifoSched schedule.Scheduler
+ 
+ 	stopc chan struct{}
+@@ -104,6 +108,8 @@ func NewStore(lg *zap.Logger, b backend.Backend, le lease.Lessor, cfg StoreConfi
+ 		currentRev:     1,
+ 		compactMainRev: -1,
+ 
++		readCache: newRangeCache(),
++
+ 		fifoSched: schedule.NewFIFOScheduler(lg),
+ 
+ 		stopc: make(chan struct{}),
+@@ -209,6 +215,10 @@ func (s *store) updateCompactRev(rev int64) (<-chan struct{}, int64, error) {
+ 	}
+ 	compactMainRev := s.compactMainRev
+ 	s.compactMainRev = rev
++	// A cached historical-revision read that succeeded before this point
++	// may need to return ErrCompacted after it; drop it rather than track
++	// per-entry validity, since compaction is rare.
++	s.readCache.reset()
+ 
+ 	SetScheduledCompact(s.b.BatchTx(), rev)
+ 	// ensure that desired compaction is persisted
+@@ -298,6 +308,7 @@ func (s *store) Restore(b backend.Backend) error {
+ 
+ 	s.b = b
+ 	s.kvindex = newTreeIndex(s.lg)
++	s.readCache.reset()
+ 
+ 	{
+ 		// During restore the metrics might report 'special' values
+diff --git a/server/storage/mvcc/kvstore_test.go b/server/storage/mvcc/kvstore_test.go
+index 8c2255f2e..93c47f81c 100644
+--- a/server/storage/mvcc/kvstore_test.go
++++ b/server/storage/mvcc/kvstore_test.go
+@@ -875,6 +875,118 @@ func TestConcurrentReadTxAndWrite(t *testing.T) {
+ 	}
+ }
+ 
++// TestStoreRangeCacheReflectsWrites is a regression test for the read
++// cache: repeated identical Range requests must be served without
++// recomputation, but a write or delete that touches the requested range
++// must be visible to the very next read, and writes to unrelated keys must
++// not evict cache entries they don't affect.
++func TestStoreRangeCacheReflectsWrites(t *testing.T) {
++	lg := zaptest.NewLogger(t)
++	b, _ := betesting.NewDefaultTmpBackend(t)
++	s := NewStore(lg, b, &lease.FakeLessor{}, StoreConfig{})
++	defer cleanup(s, b)
++
++	s.Put([]byte("foo"), []byte("bar"), lease.NoLease)
++	s.Put([]byte("other"), []byte("untouched"), lease.NoLease)
++
++	rangeFoo := func() string {
++		tx := s.Read(ConcurrentReadTxMode, traceutil.TODO())
++		defer tx.End()
++		ret, err := tx.Range(t.Context(), []byte("foo"), nil, RangeOptions{})
++		if err != nil {
++			t.Fatalf("range failed: %v", err)
++		}
++		if len(ret.KVs) != 1 {
++			t.Fatalf("expected exactly one kv, got %d", len(ret.KVs))
++		}
++		return string(ret.KVs[0].Value)
++	}
++
++	if got := rangeFoo(); got != "bar" {
++		t.Fatalf("first range = %q, want %q", got, "bar")
++	}
++	if n := len(s.readCache.entries); n != 1 {
++		t.Fatalf("expected the first range to populate the cache, got %d entries", n)
++	}
++
++	// A repeated, identical read must hit the cache and return the same
++	// result, without adding a second entry.
++	if got := rangeFoo(); got != "bar" {
++		t.Fatalf("cached range = %q, want %q", got, "bar")
++	}
++	if n := len(s.readCache.entries); n != 1 {
++		t.Fatalf("expected the repeated range to hit the cache, got %d entries", n)
++	}
++
++	// A write to an unrelated key must not evict foo's cache entry.
++	s.Put([]byte("other"), []byte("changed"), lease.NoLease)
++	if n := len(s.readCache.entries); n != 1 {
++		t.Fatalf("write to an unrelated key evicted an unrelated cache entry: %d entries left", n)
++	}
++	if got := rangeFoo(); got != "bar" {
++		t.Fatalf("range after unrelated write = %q, want %q", got, "bar")
++	}
++
++	// A write to foo itself must be visible on the very next read, not
++	// just eventually.
++	s.Put([]byte("foo"), []byte("baz"), lease.NoLease)
++	if got := rangeFoo(); got != "baz" {
++		t.Fatalf("range after write to foo = %q, want %q (must not serve stale cached data)", got, "baz")
++	}
++
++	// Same for deletion.
++	s.DeleteRange([]byte("foo"), nil)
++	tx := s.Read(ConcurrentReadTxMode, traceutil.TODO())
++	ret, err := tx.Range(t.Context(), []byte("foo"), nil, RangeOptions{})
++	tx.End()
++	if err != nil {
++		t.Fatalf("range failed: %v", err)
++	}
++	if len(ret.KVs) != 0 {
++		t.Fatalf("expected foo to be deleted, got %+v", ret.KVs)
++	}
++}
++
++// TestStoreRangeCacheHonorsSnapshotIsolation ensures a long-lived read
++// transaction keeps seeing the revision it was opened at, even though its
++// Range call happens after a concurrent write and after another read
++// transaction has already cached the post-write result for the same key.
++func TestStoreRangeCacheHonorsSnapshotIsolation(t *testing.T) {
++	lg := zaptest.NewLogger(t)
++	b, _ := betesting.NewDefaultTmpBackend(t)
++	s := NewStore(lg, b, &lease.FakeLessor{}, StoreConfig{})
++	defer cleanup(s, b)
++
++	s.Put([]byte("foo"), []byte("bar"), lease.NoLease)
++
++	oldTx := s.Read(ConcurrentReadTxMode, traceutil.TODO())
++	defer oldTx.End()
++
++	s.Put([]byte("foo"), []byte("newBar"), lease.NoLease)
++
++	// This populates the cache with the post-write value at the new
++	// revision.
++	newTx := s.Read(ConcurrentReadTxMode, traceutil.TODO())
++	newRet, err := newTx.Range(t.Context(), []byte("foo"), nil, RangeOptions{})
++	newTx.End()
++	if err != nil {
++		t.Fatalf("range failed: %v", err)
++	}
++	if string(newRet.KVs[0].Value) != "newBar" {
++		t.Fatalf("newTx range = %q, want %q", newRet.KVs[0].Value, "newBar")
++	}
++
++	// oldTx was opened before the write and must keep seeing its own
++	// snapshot, regardless of what got cached in the meantime.
++	oldRet, err := oldTx.Range(t.Context(), []byte("foo"), nil, RangeOptions{})
++	if err != nil {
++		t.Fatalf("range failed: %v", err)
++	}
++	if string(oldRet.KVs[0].Value) != "bar" {
++		t.Fatalf("oldTx range = %q, want %q (must not observe a write that happened after it opened)", oldRet.KVs[0].Value, "bar")
++	}
++}
++
+ type kv struct {
+ 	key []byte
+ 	val []byte
+@@ -928,6 +1040,7 @@ func newFakeStore(lg *zap.Logger) *store {
+ 		kvindex:        newFakeIndex(),
+ 		currentRev:     0,
+ 		compactMainRev: -1,
++		readCache:      newRangeCache(),
+ 		fifoSched:      schedule.NewFIFOScheduler(lg),
+ 		stopc:          make(chan struct{}),
+ 		lg:             lg,
+diff --git a/server/storage/mvcc/kvstore_txn.go b/server/storage/mvcc/kvstore_txn.go
+index f46c79766..ac7cb4732 100644
+--- a/server/storage/mvcc/kvstore_txn.go
++++ b/server/storage/mvcc/kvstore_txn.go
+@@ -67,7 +67,19 @@ func (tr *storeTxnCommon) FirstRev() int64 { return tr.firstRev }
+ func (tr *storeTxnCommon) Rev() int64      { return tr.rev }
+ 
+ func (tr *storeTxnCommon) Range(ctx context.Context, key, end []byte, ro RangeOptions) (r *RangeResult, err error) {
+-	return tr.rangeKeys(ctx, key, end, tr.Rev(), ro)
++	// tr.Rev() is this transaction's pinned snapshot revision, fixed when
++	// it was opened; it must be used for cache lookups (rather than, say,
++	// the store's live current revision) so a long-lived TxnRead keeps
++	// seeing its own snapshot no matter how many writes land afterwards or
++	// how late Range is actually called.
++	if cached, ok := tr.s.readCache.get(key, end, tr.Rev(), ro); ok {
++		return cached, nil
++	}
++	r, err = tr.rangeKeys(ctx, key, end, tr.Rev(), ro)
++	if err == nil {
++		tr.s.readCache.put(key, end, tr.Rev(), ro, r)
++	}
++	return r, err
+ }
+ 
+ func (tr *storeTxnCommon) rangeKeys(ctx context.Context, key, end []byte, curRev int64, ro RangeOptions) (*RangeResult, error) {
+@@ -212,6 +224,10 @@ func (tw *storeTxnWrite) End() {
+ 		// hold revMu lock to prevent new read txns from opening until writeback.
+ 		tw.s.revMu.Lock()
+ 		tw.s.currentRev++
++		// Evict affected cache entries before unlocking revMu, so that any
++		// read txn opened after this point (which must wait for revMu) can
++		// never observe a cache entry computed before this write.
++		tw.s.readCache.invalidate(tw.changes)
+ 	}
+ 	tw.tx.Unlock()
+ 	if len(tw.changes) != 0 {
+diff --git a/server/storage/mvcc/range_cache.go b/server/storage/mvcc/range_cache.go
+new file mode 100644
+index 000000000..e9de9e8f9
+--- /dev/null
++++ b/server/storage/mvcc/range_cache.go
+@@ -0,0 +1,228 @@
++// Copyright 2025 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package mvcc
++
++import (
++	"sync"
++
++	"google.golang.org/protobuf/proto"
++
++	"go.etcd.io/etcd/api/v3/mvccpb"
++	"go.etcd.io/etcd/pkg/v3/adt"
++)
++
++// maxRangeCacheEntries bounds the memory the read cache can use. Once full,
++// new results simply aren't cached until invalidation frees up room; this
++// only affects hit rate, never correctness.
++const maxRangeCacheEntries = 8192
++
++// rangeCacheKey identifies a Range call by every parameter that can affect
++// its result, including the exact revision the result was computed at.
++// Pinning the resolved revision (rather than the raw, possibly-zero
++// RangeOptions.Rev) is what makes a cache hit safe for long-lived read
++// transactions: a TxnRead snapshots the store revision when it is opened,
++// and must keep returning data as of that revision no matter how much later
++// Range is actually called or how many unrelated writes land in between.
++type rangeCacheKey struct {
++	key, end string
++	// endIsNil distinguishes a single-key lookup (end == nil) from a
++	// from-key-to-infinity range whose end happens to stringify the same
++	// way (end == []byte{}, i.e. end == "").
++	endIsNil bool
++	// rev is the resolved revision the read was executed at: ro.Rev if the
++	// caller pinned an explicit historical revision, otherwise the reading
++	// transaction's own snapshot revision. Since revisions are immutable
++	// once committed, a hit here is correct by construction and needs no
++	// further freshness check.
++	rev            int64
++	limit          int64
++	countOnly      bool
++	fastKeysOnly   bool
++	withTotalCount bool
++}
++
++func makeRangeCacheKey(key, end []byte, curRev int64, ro RangeOptions) rangeCacheKey {
++	rev := ro.Rev
++	if rev <= 0 {
++		rev = curRev
++	}
++	return rangeCacheKey{
++		key:            string(key),
++		end:            string(end),
++		endIsNil:       end == nil,
++		rev:            rev,
++		limit:          ro.Limit,
++		countOnly:      ro.CountOnly,
++		fastKeysOnly:   ro.FastKeysOnly,
++		withTotalCount: ro.WithTotalCount,
++	}
++}
++
++type rangeCacheEntry struct {
++	k      rangeCacheKey
++	result *RangeResult
++}
++
++// rangeCache memoizes read-only Range results so that repeated requests for
++// identical parameters, at the same resolved revision, skip the
++// index/backend lookup entirely. Correctness does not rely on a timeout:
++// each entry is keyed by an already-committed, immutable revision, so once
++// stored it can never go stale. invalidate proactively evicts entries a
++// write affects — not for correctness, but so the cache doesn't keep
++// serving dead entries from before the write (no future read at the new,
++// post-write revision would ever match them anyway) and so their memory is
++// reclaimed promptly instead of waiting on the size cap.
++type rangeCache struct {
++	mu sync.RWMutex
++
++	entries map[rangeCacheKey]*rangeCacheEntry
++
++	// singleKey and ranges index entries by the key range they cover so
++	// that invalidate can find affected entries without scanning the
++	// whole cache. This mirrors watcherGroup's indexing scheme.
++	singleKey map[string]map[*rangeCacheEntry]struct{}
++	ranges    adt.IntervalTree
++}
++
++func newRangeCache() *rangeCache {
++	return &rangeCache{
++		entries:   make(map[rangeCacheKey]*rangeCacheEntry),
++		singleKey: make(map[string]map[*rangeCacheEntry]struct{}),
++		ranges:    adt.NewIntervalTree(),
++	}
++}
++
++func (c *rangeCache) get(key, end []byte, curRev int64, ro RangeOptions) (*RangeResult, bool) {
++	k := makeRangeCacheKey(key, end, curRev, ro)
++	c.mu.RLock()
++	e, ok := c.entries[k]
++	c.mu.RUnlock()
++	if !ok {
++		return nil, false
++	}
++	// Return a copy: callers (e.g. keys-only assembly, result pruning)
++	// mutate the RangeResult and its KeyValues in place.
++	return cloneRangeResult(e.result), true
++}
++
++func (c *rangeCache) put(key, end []byte, curRev int64, ro RangeOptions, result *RangeResult) {
++	k := makeRangeCacheKey(key, end, curRev, ro)
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if _, ok := c.entries[k]; ok {
++		return
++	}
++	if len(c.entries) >= maxRangeCacheEntries {
++		return
++	}
++	e := &rangeCacheEntry{k: k, result: cloneRangeResult(result)}
++	c.entries[k] = e
++	c.link(e)
++}
++
++func (c *rangeCache) link(e *rangeCacheEntry) {
++	if e.k.endIsNil {
++		set := c.singleKey[e.k.key]
++		if set == nil {
++			set = make(map[*rangeCacheEntry]struct{})
++			c.singleKey[e.k.key] = set
++		}
++		set[e] = struct{}{}
++		return
++	}
++	ivl := adt.NewStringAffineInterval(e.k.key, e.k.end)
++	if iv := c.ranges.Find(ivl); iv != nil {
++		iv.Val.(map[*rangeCacheEntry]struct{})[e] = struct{}{}
++		return
++	}
++	set := map[*rangeCacheEntry]struct{}{e: {}}
++	c.ranges.Insert(ivl, set)
++}
++
++func (c *rangeCache) unlink(e *rangeCacheEntry) {
++	if e.k.endIsNil {
++		set := c.singleKey[e.k.key]
++		delete(set, e)
++		if len(set) == 0 {
++			delete(c.singleKey, e.k.key)
++		}
++		return
++	}
++	ivl := adt.NewStringAffineInterval(e.k.key, e.k.end)
++	iv := c.ranges.Find(ivl)
++	if iv == nil {
++		return
++	}
++	set := iv.Val.(map[*rangeCacheEntry]struct{})
++	delete(set, e)
++	if len(set) == 0 {
++		c.ranges.Delete(ivl)
++	}
++}
++
++// invalidate drops every cached entry whose range covers any of the given
++// keys. Every such entry was necessarily computed at a revision older than
++// this write (revisions only move forward), so no future read will ever
++// look it up again; evicting it now just reclaims the space immediately
++// instead of leaving it for the size cap to page out.
++func (c *rangeCache) invalidate(changes []*mvccpb.KeyValue) {
++	if len(changes) == 0 {
++		return
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if len(c.entries) == 0 {
++		return
++	}
++	victims := make(map[*rangeCacheEntry]struct{})
++	for _, kv := range changes {
++		key := string(kv.Key)
++		for e := range c.singleKey[key] {
++			victims[e] = struct{}{}
++		}
++		for _, iv := range c.ranges.Stab(adt.NewStringAffinePoint(key)) {
++			for e := range iv.Val.(map[*rangeCacheEntry]struct{}) {
++				victims[e] = struct{}{}
++			}
++		}
++	}
++	for e := range victims {
++		delete(c.entries, e.k)
++		c.unlink(e)
++	}
++}
++
++// reset drops every cached entry. Used on compaction and restore: those can
++// change whether a historical-revision read succeeds or returns
++// ErrCompacted independent of any single key changing, so a blanket flush
++// is simplest and, since both events are rare, cheap.
++func (c *rangeCache) reset() {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.entries = make(map[rangeCacheKey]*rangeCacheEntry)
++	c.singleKey = make(map[string]map[*rangeCacheEntry]struct{})
++	c.ranges = adt.NewIntervalTree()
++}
++
++func cloneRangeResult(r *RangeResult) *RangeResult {
++	kvs := make([]*mvccpb.KeyValue, len(r.KVs))
++	for i, kv := range r.KVs {
++		// proto.Clone, not a struct copy: mvccpb.KeyValue embeds protobuf
++		// internal state (including a mutex) that must not be copied by
++		// value.
++		kvs[i] = proto.Clone(kv).(*mvccpb.KeyValue)
++	}
++	return &RangeResult{KVs: kvs, Rev: r.Rev, Count: r.Count}
++}
+diff --git a/server/storage/mvcc/range_cache_test.go b/server/storage/mvcc/range_cache_test.go
+new file mode 100644
+index 000000000..49bba7b30
+--- /dev/null
++++ b/server/storage/mvcc/range_cache_test.go
+@@ -0,0 +1,162 @@
++// Copyright 2025 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package mvcc
++
++import (
++	"testing"
++
++	"go.etcd.io/etcd/api/v3/mvccpb"
++)
++
++func TestRangeCacheGetPutHit(t *testing.T) {
++	c := newRangeCache()
++	result := &RangeResult{
++		KVs: []*mvccpb.KeyValue{{Key: []byte("foo"), Value: []byte("bar")}},
++		Rev: 5,
++	}
++	c.put([]byte("foo"), nil, 5, RangeOptions{}, result)
++
++	got, ok := c.get([]byte("foo"), nil, 5, RangeOptions{})
++	if !ok {
++		t.Fatalf("expected cache hit")
++	}
++	if len(got.KVs) != 1 || string(got.KVs[0].Value) != "bar" {
++		t.Fatalf("unexpected cached result: %+v", got)
++	}
++
++	// The caller must own the returned KVs: mutating them must not corrupt
++	// the cache entry for a later hit.
++	got.KVs[0].Value = nil
++	got2, ok := c.get([]byte("foo"), nil, 5, RangeOptions{})
++	if !ok {
++		t.Fatalf("expected cache hit")
++	}
++	if string(got2.KVs[0].Value) != "bar" {
++		t.Fatalf("cached entry was mutated by a caller: %+v", got2.KVs[0])
++	}
++}
++
++func TestRangeCacheMissOnDifferentParameters(t *testing.T) {
++	c := newRangeCache()
++	result := &RangeResult{KVs: []*mvccpb.KeyValue{{Key: []byte("foo")}}, Rev: 5}
++	c.put([]byte("foo"), nil, 5, RangeOptions{}, result)
++
++	cases := []struct {
++		name          string
++		key, end      []byte
++		curRev        int64
++		ro            RangeOptions
++		wantCacheHitB bool
++	}{
++		{"same params", []byte("foo"), nil, 5, RangeOptions{}, true},
++		{"different key", []byte("bar"), nil, 5, RangeOptions{}, false},
++		{"different revision", []byte("foo"), nil, 6, RangeOptions{}, false},
++		{"different limit", []byte("foo"), nil, 5, RangeOptions{Limit: 1}, false},
++		{"different countOnly", []byte("foo"), nil, 5, RangeOptions{CountOnly: true}, false},
++		{"nil vs empty end", []byte("foo"), []byte{}, 5, RangeOptions{}, false},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			_, ok := c.get(tc.key, tc.end, tc.curRev, tc.ro)
++			if ok != tc.wantCacheHitB {
++				t.Fatalf("get(%q,%q,rev=%d,%+v) hit = %v, want %v", tc.key, tc.end, tc.curRev, tc.ro, ok, tc.wantCacheHitB)
++			}
++		})
++	}
++}
++
++func TestRangeCacheInvalidateSingleKey(t *testing.T) {
++	c := newRangeCache()
++	c.put([]byte("foo"), nil, 5, RangeOptions{}, &RangeResult{Rev: 5})
++	c.put([]byte("bar"), nil, 5, RangeOptions{}, &RangeResult{Rev: 5})
++
++	c.invalidate([]*mvccpb.KeyValue{{Key: []byte("foo")}})
++
++	if _, ok := c.get([]byte("foo"), nil, 5, RangeOptions{}); ok {
++		t.Fatalf("expected foo to be evicted after a write to foo")
++	}
++	if _, ok := c.get([]byte("bar"), nil, 5, RangeOptions{}); !ok {
++		t.Fatalf("expected bar to remain cached: a write to foo must not evict unrelated entries")
++	}
++}
++
++func TestRangeCacheInvalidateRange(t *testing.T) {
++	c := newRangeCache()
++	// A cached range [a, z) covering many keys.
++	c.put([]byte("a"), []byte("z"), 5, RangeOptions{}, &RangeResult{Rev: 5})
++	// A cached single key outside that range.
++	c.put([]byte("zz"), nil, 5, RangeOptions{}, &RangeResult{Rev: 5})
++	// A cached from-key-to-infinity range starting after the write.
++	c.put([]byte("zzz"), []byte{}, 5, RangeOptions{}, &RangeResult{Rev: 5})
++
++	c.invalidate([]*mvccpb.KeyValue{{Key: []byte("m")}})
++
++	if _, ok := c.get([]byte("a"), []byte("z"), 5, RangeOptions{}); ok {
++		t.Fatalf("expected [a,z) to be evicted: it covers the written key m")
++	}
++	if _, ok := c.get([]byte("zz"), nil, 5, RangeOptions{}); !ok {
++		t.Fatalf("expected zz to remain cached: it does not cover the written key")
++	}
++	if _, ok := c.get([]byte("zzz"), []byte{}, 5, RangeOptions{}); !ok {
++		t.Fatalf("expected [zzz,inf) to remain cached: it does not cover the written key")
++	}
++}
++
++func TestRangeCacheInvalidateUnboundedRangeCoversWrite(t *testing.T) {
++	c := newRangeCache()
++	c.put([]byte("m"), []byte{}, 5, RangeOptions{}, &RangeResult{Rev: 5})
++
++	c.invalidate([]*mvccpb.KeyValue{{Key: []byte("zzzzzz")}})
++
++	if _, ok := c.get([]byte("m"), []byte{}, 5, RangeOptions{}); ok {
++		t.Fatalf("expected [m,inf) to be evicted: it covers any key >= m")
++	}
++}
++
++func TestRangeCacheReset(t *testing.T) {
++	c := newRangeCache()
++	c.put([]byte("foo"), nil, 5, RangeOptions{}, &RangeResult{Rev: 5})
++	c.put([]byte("a"), []byte("z"), 5, RangeOptions{}, &RangeResult{Rev: 5})
++
++	c.reset()
++
++	if _, ok := c.get([]byte("foo"), nil, 5, RangeOptions{}); ok {
++		t.Fatalf("expected cache to be empty after reset")
++	}
++	if _, ok := c.get([]byte("a"), []byte("z"), 5, RangeOptions{}); ok {
++		t.Fatalf("expected cache to be empty after reset")
++	}
++	// reset must also clear the invalidation index, or a stale entry
++	// there could panic/leak on the next put+invalidate cycle.
++	c.put([]byte("foo"), nil, 5, RangeOptions{}, &RangeResult{Rev: 5})
++	c.invalidate([]*mvccpb.KeyValue{{Key: []byte("foo")}})
++	if _, ok := c.get([]byte("foo"), nil, 5, RangeOptions{}); ok {
++		t.Fatalf("expected foo to be evicted")
++	}
++}
++
++func TestRangeCacheHistoricalRevisionIgnoresCurRev(t *testing.T) {
++	c := newRangeCache()
++	// An explicit historical revision pins the entry regardless of the
++	// transaction's current snapshot revision.
++	c.put([]byte("foo"), nil, 9, RangeOptions{Rev: 3}, &RangeResult{Rev: 3})
++
++	if _, ok := c.get([]byte("foo"), nil, 42, RangeOptions{Rev: 3}); !ok {
++		t.Fatalf("expected a historical-revision read to hit regardless of curRev")
++	}
++	if _, ok := c.get([]byte("foo"), nil, 9, RangeOptions{}); ok {
++		t.Fatalf("a current-revision read must not reuse a pinned historical-revision entry")
++	}
++}

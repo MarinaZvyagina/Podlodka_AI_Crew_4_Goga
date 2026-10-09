@@ -1,0 +1,223 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/search/SearchInvalidationTracker.kt b/app/src/main/java/org/thoughtcrime/securesms/search/SearchInvalidationTracker.kt
+new file mode 100644
+index 0000000..1dcc19f
+--- /dev/null
++++ b/app/src/main/java/org/thoughtcrime/securesms/search/SearchInvalidationTracker.kt
+@@ -0,0 +1,25 @@
++package org.thoughtcrime.securesms.search
++
++import org.thoughtcrime.securesms.database.RxDatabaseObserver
++import java.util.concurrent.atomic.AtomicLong
++
++/**
++ * Tracks how many times conversation data (messages or threads) has changed, so [SearchResultCache]
++ * instances can tell a cached result apart from one computed against stale data with a single
++ * cheap comparison, instead of every cache having to register and unregister its own database
++ * observer.
++ *
++ * Subscribes once for the lifetime of the app -- there's nothing to unregister, since all this
++ * holds onto is a counter.
++ */
++object SearchInvalidationTracker {
++
++  private val version = AtomicLong(0)
++
++  init {
++    RxDatabaseObserver.conversationList.subscribe { version.incrementAndGet() }
++  }
++
++  val currentVersion: Long
++    get() = version.get()
++}
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+index f47eddb..cf260fd 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+@@ -72,6 +72,9 @@ public class SearchRepository {
+ 
+   private final Executor serialExecutor;
+ 
++  private final SearchResultCache<ThreadSearchCacheKey, ThreadSearchResult>   threadResultCache  = new SearchResultCache<>();
++  private final SearchResultCache<MessageSearchCacheKey, MessageSearchResult> messageResultCache = new SearchResultCache<>();
++
+   public SearchRepository(@NonNull String noteToSelfTitle) {
+     this.context           = AppDependencies.getApplication().getApplicationContext();
+     this.noteToSelfTitle   = noteToSelfTitle;
+@@ -85,36 +88,40 @@ public class SearchRepository {
+ 
+   @WorkerThread
+   public @NonNull ThreadSearchResult queryThreadsSync(@NonNull String query, boolean unreadOnly) {
+-    SignalTrace.beginSection("ConversationListSearch-Threads");
+-    try {
+-      long                      start  = System.currentTimeMillis();
+-      List<ThreadWithRecipient> result = queryConversations(query, unreadOnly);
++    return threadResultCache.get(new ThreadSearchCacheKey(query, unreadOnly), () -> {
++      SignalTrace.beginSection("ConversationListSearch-Threads");
++      try {
++        long                      start  = System.currentTimeMillis();
++        List<ThreadWithRecipient> result = queryConversations(query, unreadOnly);
+ 
+-      Log.d(TAG, "[threads] Search took " + (System.currentTimeMillis() - start) + " ms");
++        Log.d(TAG, "[threads] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new ThreadSearchResult(result, query);
+-    } finally {
+-      SignalTrace.endSection();
+-    }
++        return new ThreadSearchResult(result, query);
++      } finally {
++        SignalTrace.endSection();
++      }
++    });
+   }
+ 
+   @WorkerThread
+   public @NonNull MessageSearchResult queryMessagesSync(@NonNull String query, @NonNull SearchFilter filter) {
+-    SignalTrace.beginSection("ConversationListSearch-Messages");
+-    try {
+-      long start = System.currentTimeMillis();
++    return messageResultCache.get(new MessageSearchCacheKey(query, filter), () -> {
++      SignalTrace.beginSection("ConversationListSearch-Messages");
++      try {
++        long start = System.currentTimeMillis();
+ 
+-      List<MessageResult> messages         = queryMessages(query, filter);
+-      List<MessageResult> mentionMessages  = queryMentions(convertMentionsQueryToTokens(query));
+-      List<MessageResult> filteredMentions = filterMentionResults(mentionMessages, filter);
+-      List<MessageResult> combined         = mergeMessagesAndMentions(messages, filteredMentions);
++        List<MessageResult> messages         = queryMessages(query, filter);
++        List<MessageResult> mentionMessages  = queryMentions(convertMentionsQueryToTokens(query));
++        List<MessageResult> filteredMentions = filterMentionResults(mentionMessages, filter);
++        List<MessageResult> combined         = mergeMessagesAndMentions(messages, filteredMentions);
+ 
+-      Log.d(TAG, "[messages] Search took " + (System.currentTimeMillis() - start) + " ms");
++        Log.d(TAG, "[messages] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new MessageSearchResult(combined, query);
+-    } finally {
+-      SignalTrace.endSection();
+-    }
++        return new MessageSearchResult(combined, query);
++      } finally {
++        SignalTrace.endSection();
++      }
++    });
+   }
+ 
+   public void query(@NonNull String query, long threadId, @NonNull Callback<List<MessageResult>> callback) {
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/search/SearchResultCache.kt b/app/src/main/java/org/thoughtcrime/securesms/search/SearchResultCache.kt
+new file mode 100644
+index 0000000..7a2543c
+--- /dev/null
++++ b/app/src/main/java/org/thoughtcrime/securesms/search/SearchResultCache.kt
+@@ -0,0 +1,38 @@
++package org.thoughtcrime.securesms.search
++
++import java.util.concurrent.ConcurrentHashMap
++
++/**
++ * Caches values by [K] until [currentVersion] reports that the underlying data has moved on.
++ *
++ * Each entry is stamped with the version it was computed under, so a data change doesn't need to
++ * reach in and clear the map -- a stale entry just fails its version check on the next [get] and
++ * is recomputed in place. Different keys are unaffected by each other; a version bump just means
++ * every key's next lookup recomputes once.
++ */
++class SearchResultCache<K : Any, V>(
++  private val currentVersion: () -> Long = { SearchInvalidationTracker.currentVersion }
++) {
++
++  private val entries = ConcurrentHashMap<K, Entry<V>>()
++
++  fun get(key: K, compute: () -> V): V {
++    val version = currentVersion()
++
++    entries[key]?.let { entry ->
++      if (entry.version == version) {
++        return entry.value
++      }
++    }
++
++    val value = compute()
++    entries[key] = Entry(value, version)
++    return value
++  }
++
++  private class Entry<V>(val value: V, val version: Long)
++}
++
++data class MessageSearchCacheKey(val query: String, val filter: SearchFilter)
++
++data class ThreadSearchCacheKey(val query: String, val unreadOnly: Boolean)
+diff --git a/app/src/test/java/org/thoughtcrime/securesms/search/SearchResultCacheTest.kt b/app/src/test/java/org/thoughtcrime/securesms/search/SearchResultCacheTest.kt
+new file mode 100644
+index 0000000..8cf483d
+--- /dev/null
++++ b/app/src/test/java/org/thoughtcrime/securesms/search/SearchResultCacheTest.kt
+@@ -0,0 +1,66 @@
++package org.thoughtcrime.securesms.search
++
++import assertk.assertThat
++import assertk.assertions.isEqualTo
++import assertk.assertions.isSameAs
++import org.junit.Test
++
++class SearchResultCacheTest {
++
++  private var version = 0L
++  private val cache = SearchResultCache<String, String>(currentVersion = { version })
++
++  @Test
++  fun `repeated get with same key does not recompute`() {
++    var computeCount = 0
++    val compute = { computeCount++; "result" }
++
++    cache.get("query", compute)
++    val second = cache.get("query", compute)
++
++    assertThat(computeCount).isEqualTo(1)
++    assertThat(second).isEqualTo("result")
++  }
++
++  @Test
++  fun `different keys are cached independently`() {
++    var computeCount = 0
++    val compute = { computeCount++; "result-$computeCount" }
++
++    val first = cache.get("alice", compute)
++    val second = cache.get("bob", compute)
++    val firstAgain = cache.get("alice", compute)
++
++    assertThat(computeCount).isEqualTo(2)
++    assertThat(first).isEqualTo("result-1")
++    assertThat(second).isEqualTo("result-2")
++    assertThat(firstAgain).isSameAs(first)
++  }
++
++  @Test
++  fun `version bump invalidates every cached entry`() {
++    var computeCount = 0
++    val compute = { computeCount++; "result-$computeCount" }
++
++    cache.get("query", compute)
++    version++
++    val afterBump = cache.get("query", compute)
++
++    assertThat(computeCount).isEqualTo(2)
++    assertThat(afterBump).isEqualTo("result-2")
++  }
++
++  @Test
++  fun `stale entry is recomputed only once`() {
++    var computeCount = 0
++    val compute = { computeCount++; "result-$computeCount" }
++
++    cache.get("query", compute)
++    version++
++    cache.get("query", compute)
++    val thirdCall = cache.get("query", compute)
++
++    assertThat(computeCount).isEqualTo(2)
++    assertThat(thirdCall).isEqualTo("result-2")
++  }
++}

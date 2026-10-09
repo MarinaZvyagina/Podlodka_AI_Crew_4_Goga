@@ -1,0 +1,475 @@
+diff --git a/packages/common/interfaces/websockets/web-socket-adapter.interface.ts b/packages/common/interfaces/websockets/web-socket-adapter.interface.ts
+index fe08dbe..f04fdd9 100644
+--- a/packages/common/interfaces/websockets/web-socket-adapter.interface.ts
++++ b/packages/common/interfaces/websockets/web-socket-adapter.interface.ts
+@@ -26,4 +26,11 @@ export interface WebSocketAdapter<
+     transform: (data: any) => Observable<any>,
+   ): any;
+   close(server: TServer): any;
++  /**
++   * Invoked right before `close()` during a graceful shutdown, while
++   * currently connected clients are still reachable. Adapters can use this
++   * to warn clients that their connection is about to be terminated as part
++   * of the shutdown sequence, rather than dropped silently.
++   */
++  notifyShutdown?(server: TServer): any;
+ }
+diff --git a/packages/platform-socket.io/adapters/io-adapter.ts b/packages/platform-socket.io/adapters/io-adapter.ts
+index 90c640c..769ab50 100644
+--- a/packages/platform-socket.io/adapters/io-adapter.ts
++++ b/packages/platform-socket.io/adapters/io-adapter.ts
+@@ -13,6 +13,8 @@ import { DISCONNECT_EVENT } from '@nestjs/websockets/internal';
+  */
+ export class IoAdapter extends AbstractWsAdapter {
+   private readonly disconnectMap = new WeakMap<Socket, Observable<any>>();
++  private shutdownEvent = 'shutdown';
++  private shutdownMessage: unknown = 'Server is shutting down';
+ 
+   public create(
+     port: number,
+@@ -99,4 +101,66 @@ export class IoAdapter extends AbstractWsAdapter {
+ 
+     return super.close(server);
+   }
++
++  /**
++   * Customizes the event name and payload sent to currently connected
++   * clients right before the server closes their connection as part of a
++   * graceful shutdown. Pass `null` as the message to disable the notice.
++   */
++  public setShutdownMessage(data: unknown, event = 'shutdown') {
++    this.shutdownEvent = event;
++    this.shutdownMessage = data;
++  }
++
++  public async notifyShutdown(server: Server | Namespace): Promise<void> {
++    if (this.shutdownMessage === null || this.shutdownMessage === undefined) {
++      return;
++    }
++    // On a top-level `Server`, `.sockets` is the default `Namespace` (not a
++    // `Map`) -- the actual map of connected sockets lives one level deeper.
++    // On a `Namespace`, `.sockets` is already that `Map`.
++    const nestedSockets = (server as any).sockets?.sockets;
++    const sockets: Map<string, Socket> | undefined =
++      nestedSockets instanceof Map ? nestedSockets : (server as any).sockets;
++    if (!sockets?.size) {
++      return;
++    }
++    await Promise.all(
++      Array.from(sockets.values()).map(socket =>
++        this.emitAndWaitForFlush(
++          socket,
++          this.shutdownEvent,
++          this.shutdownMessage,
++        ),
++      ),
++    );
++  }
++
++  /**
++   * `Server#close()` tears down every socket's transport right away, without
++   * waiting for packets that are still in flight, so a plain `emit()` can be
++   * silently dropped. This flushes the notice through the engine.io
++   * transport before resolving, falling back to a short timeout so a stalled
++   * client can never block shutdown.
++   */
++  private emitAndWaitForFlush(
++    socket: Socket,
++    event: string,
++    data: unknown,
++  ): Promise<void> {
++    return new Promise<void>(resolve => {
++      const conn = (socket as any).conn;
++      socket.emit(event, data);
++
++      if (!conn || conn.transport?.writable !== false) {
++        resolve();
++        return;
++      }
++      const timer = setTimeout(resolve, 1000);
++      conn.once('drain', () => {
++        clearTimeout(timer);
++        resolve();
++      });
++    });
++  }
+ }
+diff --git a/packages/platform-socket.io/test/io-adapter.spec.ts b/packages/platform-socket.io/test/io-adapter.spec.ts
+index 7c5520a..a834ca0 100644
+--- a/packages/platform-socket.io/test/io-adapter.spec.ts
++++ b/packages/platform-socket.io/test/io-adapter.spec.ts
+@@ -45,4 +45,125 @@ describe('IoAdapter', () => {
+       expect(messageCalls).toHaveLength(2);
+     });
+   });
++
++  describe('notifyShutdown', () => {
++    // A socket whose underlying transport is idle (nothing in flight):
++    // `notifyShutdown` should resolve as soon as `emit()` returns.
++    const createIdleSocket = () => ({
++      emit: vi.fn(),
++      conn: { transport: { writable: true }, once: vi.fn() },
++    });
++
++    it('should emit the default shutdown notice to every socket in a namespace', async () => {
++      const socket = createIdleSocket();
++      const server = { sockets: new Map([['id1', socket]]) } as any;
++
++      await adapter.notifyShutdown(server);
++
++      expect(socket.emit).toHaveBeenCalledWith(
++        'shutdown',
++        'Server is shutting down',
++      );
++    });
++
++    it('should look up connected sockets through the default namespace on a top-level Server', async () => {
++      // On a top-level `Server`, `.sockets` is the default `Namespace`
++      // instance, not a `Map` -- the actual `Map` of sockets is nested one
++      // level deeper, at `server.sockets.sockets`.
++      const socket = createIdleSocket();
++      const server = {
++        sockets: { sockets: new Map([['id1', socket]]) },
++      } as any;
++
++      await adapter.notifyShutdown(server);
++
++      expect(socket.emit).toHaveBeenCalledWith(
++        'shutdown',
++        'Server is shutting down',
++      );
++    });
++
++    it('should be a no-op on a top-level Server with no connected sockets', async () => {
++      const server = { sockets: { sockets: new Map() } } as any;
++      await expect(adapter.notifyShutdown(server)).resolves.toBeUndefined();
++    });
++
++    it('should be a no-op when there are no connected sockets', async () => {
++      const server = { sockets: new Map() } as any;
++      await expect(adapter.notifyShutdown(server)).resolves.toBeUndefined();
++    });
++
++    it('should respect a custom message and event name', async () => {
++      const socket = createIdleSocket();
++      const server = { sockets: new Map([['id1', socket]]) } as any;
++      adapter.setShutdownMessage({ reason: 'deploy' }, 'server:shutdown');
++
++      await adapter.notifyShutdown(server);
++
++      expect(socket.emit).toHaveBeenCalledWith('server:shutdown', {
++        reason: 'deploy',
++      });
++    });
++
++    it('should allow disabling the notice entirely', async () => {
++      const socket = createIdleSocket();
++      const server = { sockets: new Map([['id1', socket]]) } as any;
++      adapter.setShutdownMessage(null);
++
++      await adapter.notifyShutdown(server);
++
++      expect(socket.emit).not.toHaveBeenCalled();
++    });
++
++    it('should wait for the transport to flush the packet before resolving', async () => {
++      let drainCallback: Function | undefined;
++      const socket = {
++        emit: vi.fn(),
++        conn: {
++          transport: { writable: false },
++          once: vi.fn((event: string, cb: Function) => {
++            if (event === 'drain') {
++              drainCallback = cb;
++            }
++          }),
++        },
++      };
++      const server = { sockets: new Map([['id1', socket]]) } as any;
++
++      let resolved = false;
++      const notifyPromise = adapter
++        .notifyShutdown(server)
++        .then(() => (resolved = true));
++
++      await Promise.resolve();
++      await Promise.resolve();
++      expect(resolved).toBe(false);
++
++      drainCallback?.();
++      await notifyPromise;
++      expect(resolved).toBe(true);
++    });
++
++    it('should fall back to resolving after a timeout if the transport never drains', async () => {
++      vi.useFakeTimers();
++      try {
++        const socket = {
++          emit: vi.fn(),
++          conn: { transport: { writable: false }, once: vi.fn() },
++        };
++        const server = { sockets: new Map([['id1', socket]]) } as any;
++
++        let resolved = false;
++        const notifyPromise = adapter
++          .notifyShutdown(server)
++          .then(() => (resolved = true));
++
++        await vi.advanceTimersByTimeAsync(1000);
++        await notifyPromise;
++        expect(resolved).toBe(true);
++      } finally {
++        vi.useRealTimers();
++      }
++    });
++  });
+ });
+diff --git a/packages/platform-ws/adapters/ws-adapter.ts b/packages/platform-ws/adapters/ws-adapter.ts
+index fd75cf7..07cf667 100644
+--- a/packages/platform-ws/adapters/ws-adapter.ts
++++ b/packages/platform-ws/adapters/ws-adapter.ts
+@@ -49,6 +49,8 @@ export class WsAdapter extends AbstractWsAdapter {
+   protected messageParser: WsMessageParser = (data: WsData) => {
+     return JSON.parse(data.toString());
+   };
++  protected shutdownEvent = 'shutdown';
++  protected shutdownMessage: unknown = 'Server is shutting down';
+ 
+   constructor(
+     appOrHttpServer?: INestApplicationContext | object,
+@@ -204,6 +206,40 @@ export class WsAdapter extends AbstractWsAdapter {
+     await closeEventSignal;
+   }
+ 
++  /**
++   * Customizes the event name and payload sent to currently connected
++   * clients right before the server closes their connection as part of a
++   * graceful shutdown. Pass `null` as the message to disable the notice.
++   */
++  public setShutdownMessage(data: unknown, event = 'shutdown') {
++    this.shutdownEvent = event;
++    this.shutdownMessage = data;
++  }
++
++  public async notifyShutdown(server: any): Promise<void> {
++    if (
++      this.shutdownMessage === null ||
++      this.shutdownMessage === undefined ||
++      !server.clients?.size
++    ) {
++      return;
++    }
++    const payload = JSON.stringify({
++      event: this.shutdownEvent,
++      data: this.shutdownMessage,
++    });
++    await Promise.all(
++      Array.from(server.clients as Set<any>)
++        .filter((client: any) => client.readyState === READY_STATE.OPEN_STATE)
++        .map(
++          (client: any) =>
++            new Promise<void>(resolve => {
++              client.send(payload, () => resolve());
++            }),
++        ),
++    );
++  }
++
+   public async dispose() {
+     const closeEventSignals = Array.from(this.httpServersRegistry)
+       .filter(([port]) => port !== UNDERLYING_HTTP_SERVER_PORT)
+diff --git a/packages/platform-ws/test/ws-adapter.spec.ts b/packages/platform-ws/test/ws-adapter.spec.ts
+new file mode 100644
+index 0000000..4fb37a0
+--- /dev/null
++++ b/packages/platform-ws/test/ws-adapter.spec.ts
+@@ -0,0 +1,83 @@
++import { WsAdapter } from '../adapters/ws-adapter.js';
++
++describe('WsAdapter', () => {
++  let adapter: WsAdapter;
++
++  beforeEach(() => {
++    adapter = new WsAdapter();
++  });
++
++  describe('notifyShutdown', () => {
++    const createClient = (readyState = 1) => ({
++      readyState,
++      send: vi.fn((_payload: string, cb: Function) => cb()),
++    });
++
++    it('should send the default shutdown notice to every open client', async () => {
++      const clientA = createClient();
++      const clientB = createClient();
++      const server = { clients: new Set([clientA, clientB]) };
++
++      await adapter.notifyShutdown(server);
++
++      const expectedPayload = JSON.stringify({
++        event: 'shutdown',
++        data: 'Server is shutting down',
++      });
++      expect(clientA.send).toHaveBeenCalledWith(
++        expectedPayload,
++        expect.any(Function),
++      );
++      expect(clientB.send).toHaveBeenCalledWith(
++        expectedPayload,
++        expect.any(Function),
++      );
++    });
++
++    it('should skip clients that are not in the OPEN state', async () => {
++      const openClient = createClient(1);
++      const closingClient = createClient(2);
++      const server = { clients: new Set([openClient, closingClient]) };
++
++      await adapter.notifyShutdown(server);
++
++      expect(openClient.send).toHaveBeenCalledTimes(1);
++      expect(closingClient.send).not.toHaveBeenCalled();
++    });
++
++    it('should be a no-op when the server has no connected clients', async () => {
++      const server = { clients: new Set() };
++      await expect(adapter.notifyShutdown(server)).resolves.toBeUndefined();
++    });
++
++    it('should be a no-op when the server exposes no clients collection at all', async () => {
++      await expect(adapter.notifyShutdown({})).resolves.toBeUndefined();
++    });
++
++    it('should respect a custom message and event name', async () => {
++      adapter.setShutdownMessage({ reason: 'deploy' }, 'server:shutdown');
++      const client = createClient();
++      const server = { clients: new Set([client]) };
++
++      await adapter.notifyShutdown(server);
++
++      expect(client.send).toHaveBeenCalledWith(
++        JSON.stringify({
++          event: 'server:shutdown',
++          data: { reason: 'deploy' },
++        }),
++        expect.any(Function),
++      );
++    });
++
++    it('should allow disabling the notice entirely', async () => {
++      adapter.setShutdownMessage(null);
++      const client = createClient();
++      const server = { clients: new Set([client]) };
++
++      await adapter.notifyShutdown(server);
++
++      expect(client.send).not.toHaveBeenCalled();
++    });
++  });
++});
+diff --git a/packages/websockets/adapters/ws-adapter.ts b/packages/websockets/adapters/ws-adapter.ts
+index 411b158..6d22a71 100644
+--- a/packages/websockets/adapters/ws-adapter.ts
++++ b/packages/websockets/adapters/ws-adapter.ts
+@@ -51,6 +51,8 @@ export abstract class AbstractWsAdapter<
+     isCallable && (await new Promise(resolve => server.close(resolve)));
+   }
+ 
++  public async notifyShutdown(_server: TServer) {}
++
+   public async dispose() {}
+ 
+   public abstract create(port: number, options?: TOptions): TServer;
+diff --git a/packages/websockets/socket-module.ts b/packages/websockets/socket-module.ts
+index 6a39c48..8df88a1 100644
+--- a/packages/websockets/socket-module.ts
++++ b/packages/websockets/socket-module.ts
+@@ -137,7 +137,13 @@ export class SocketModule<
+     await Promise.all(
+       iterate(servers.values())
+         .filter(({ server }) => server)
+-        .map(async ({ server }) => adapter.close(server)),
++        .map(async ({ server }) => {
++          // Give currently connected clients a chance to be notified that
++          // the server is going away before their connection is actually
++          // torn down.
++          await adapter.notifyShutdown?.(server);
++          await adapter.close(server);
++        }),
+     );
+     await (adapter as AbstractWsAdapter)?.dispose();
+ 
+diff --git a/packages/websockets/test/socket-module.spec.ts b/packages/websockets/test/socket-module.spec.ts
+new file mode 100644
+index 0000000..86f06ce
+--- /dev/null
++++ b/packages/websockets/test/socket-module.spec.ts
+@@ -0,0 +1,68 @@
++import { SocketModule } from '../socket-module.js';
++
++describe('SocketModule', () => {
++  describe('close', () => {
++    const setupSocketModule = (adapter: any, servers: any[]) => {
++      const socketModule = new SocketModule();
++      (socketModule as any).applicationConfig = {
++        getIoAdapter: () => adapter,
++      };
++      servers.forEach((server, index) => {
++        (socketModule as any).socketsContainer.addOne(
++          { key: index },
++          { server, init: null, connection: null, disconnect: null },
++        );
++      });
++      return socketModule;
++    };
++
++    it('should notify each server before closing it', async () => {
++      const calls: string[] = [];
++      const adapter = {
++        notifyShutdown: vi.fn(async (server: any) =>
++          calls.push(`notify:${server.id}`),
++        ),
++        close: vi.fn(async (server: any) => calls.push(`close:${server.id}`)),
++        dispose: vi.fn(async () => {}),
++      };
++      const socketModule = setupSocketModule(adapter, [
++        { id: 'a' },
++        { id: 'b' },
++      ]);
++
++      await socketModule.close();
++
++      expect(adapter.notifyShutdown).toHaveBeenCalledTimes(2);
++      expect(adapter.close).toHaveBeenCalledTimes(2);
++      expect(adapter.dispose).toHaveBeenCalledTimes(1);
++      // notify must happen strictly before close, per server
++      expect(calls.indexOf('notify:a')).toBeLessThan(calls.indexOf('close:a'));
++      expect(calls.indexOf('notify:b')).toBeLessThan(calls.indexOf('close:b'));
++    });
++
++    it('should not fail when the adapter does not implement notifyShutdown', async () => {
++      const closeSpy = vi.fn(async () => {});
++      const adapter = {
++        close: closeSpy,
++        dispose: vi.fn(async () => {}),
++      };
++      const socketModule = setupSocketModule(adapter, [{ id: 'a' }]);
++
++      await expect(socketModule.close()).resolves.toBeUndefined();
++      expect(closeSpy).toHaveBeenCalledTimes(1);
++    });
++
++    it('should be a no-op when there is no application config', async () => {
++      const socketModule = new SocketModule();
++      await expect(socketModule.close()).resolves.toBeUndefined();
++    });
++
++    it('should be a no-op when there is no registered adapter', async () => {
++      const socketModule = new SocketModule();
++      (socketModule as any).applicationConfig = {
++        getIoAdapter: () => undefined,
++      };
++      await expect(socketModule.close()).resolves.toBeUndefined();
++    });
++  });
++});

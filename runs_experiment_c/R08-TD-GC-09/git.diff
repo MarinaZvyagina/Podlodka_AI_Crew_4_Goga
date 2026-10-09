@@ -1,0 +1,164 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+index f47eddb..b3f203c 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+@@ -6,6 +6,7 @@ import android.text.Spannable;
+ import android.text.SpannableString;
+ import android.text.SpannableStringBuilder;
+ import android.text.TextUtils;
++import android.util.LruCache;
+ 
+ import androidx.annotation.NonNull;
+ import androidx.annotation.Nullable;
+@@ -18,6 +19,7 @@ import org.signal.core.util.logging.Log;
+ import org.thoughtcrime.securesms.conversation.MessageStyler;
+ import org.thoughtcrime.securesms.database.BodyAdjustment;
+ import org.thoughtcrime.securesms.database.BodyRangeUtil;
++import org.thoughtcrime.securesms.database.DatabaseObserver;
+ import org.thoughtcrime.securesms.database.GroupTable;
+ import org.thoughtcrime.securesms.database.MentionTable;
+ import org.thoughtcrime.securesms.database.MentionUtil;
+@@ -38,6 +40,7 @@ import org.thoughtcrime.securesms.util.SignalTrace;
+ import org.signal.core.util.Util;
+ import org.signal.core.util.concurrent.SerialExecutor;
+ 
++import java.util.AbstractMap;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
+@@ -50,6 +53,7 @@ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Set;
+ import java.util.concurrent.Executor;
++import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import static org.thoughtcrime.securesms.database.SearchTable.SNIPPET_WRAP;
+ 
+@@ -62,6 +66,20 @@ public class SearchRepository {
+ 
+   private static final int MAX_SNIPPET_SIZE = 100;
+ 
++  /**
++   * Repeating an identical search (same query + filter) is common -- e.g. clearing a search by
++   * accident and retyping it, or leaving the chat list and coming back to search the same term.
++   * These caches let that repeat search skip straight to a cached result instead of re-scanning
++   * the database. They're keyed process-wide (not per {@link SearchRepository} instance, since
++   * instances are short-lived and tied to a Fragment/ViewModel) and wiped wholesale whenever any
++   * conversation-list-affecting write happens, since that's the only invalidation granularity
++   * {@link DatabaseObserver} exposes for search-relevant changes. Bounded with an LRU eviction
++   * policy so an idle app can't accumulate unbounded cached search results over time.
++   */
++  private static final LruCache<Object, MessageSearchResult> messageResultCache = new LruCache<>(50);
++  private static final LruCache<Object, ThreadSearchResult>  threadResultCache  = new LruCache<>(50);
++  private static final AtomicBoolean                         cacheInvalidationRegistered = new AtomicBoolean(false);
++
+   private final Context           context;
+   private final String            noteToSelfTitle;
+   private final SearchTable       searchDatabase;
+@@ -81,18 +99,42 @@ public class SearchRepository {
+     this.mentionTable      = SignalDatabase.mentions();
+     this.messageTable      = SignalDatabase.messages();
+     this.serialExecutor    = new SerialExecutor(SignalExecutors.BOUNDED);
++
++    registerCacheInvalidationListener();
++  }
++
++  /**
++   * Clears the search caches whenever a conversation-list-affecting write happens (new/edited/
++   * deleted messages, thread changes, etc.), so a later search for a previously-cached term never
++   * returns stale results. Registered at most once per process.
++   */
++  private static void registerCacheInvalidationListener() {
++    if (cacheInvalidationRegistered.compareAndSet(false, true)) {
++      AppDependencies.getDatabaseObserver().registerConversationListObserver(() -> {
++        messageResultCache.evictAll();
++        threadResultCache.evictAll();
++      });
++    }
+   }
+ 
+   @WorkerThread
+   public @NonNull ThreadSearchResult queryThreadsSync(@NonNull String query, boolean unreadOnly) {
+     SignalTrace.beginSection("ConversationListSearch-Threads");
+     try {
++      Object              cacheKey = new AbstractMap.SimpleImmutableEntry<String, Boolean>(query, unreadOnly);
++      ThreadSearchResult  cached   = threadResultCache.get(cacheKey);
++      if (cached != null) {
++        return cached;
++      }
++
+       long                      start  = System.currentTimeMillis();
+       List<ThreadWithRecipient> result = queryConversations(query, unreadOnly);
+ 
+       Log.d(TAG, "[threads] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new ThreadSearchResult(result, query);
++      ThreadSearchResult searchResult = new ThreadSearchResult(result, query);
++      threadResultCache.put(cacheKey, searchResult);
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -102,6 +144,12 @@ public class SearchRepository {
+   public @NonNull MessageSearchResult queryMessagesSync(@NonNull String query, @NonNull SearchFilter filter) {
+     SignalTrace.beginSection("ConversationListSearch-Messages");
+     try {
++      Object               cacheKey = new AbstractMap.SimpleImmutableEntry<String, SearchFilter>(query, filter);
++      MessageSearchResult  cached   = messageResultCache.get(cacheKey);
++      if (cached != null) {
++        return cached;
++      }
++
+       long start = System.currentTimeMillis();
+ 
+       List<MessageResult> messages         = queryMessages(query, filter);
+@@ -111,7 +159,9 @@ public class SearchRepository {
+ 
+       Log.d(TAG, "[messages] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new MessageSearchResult(combined, query);
++      MessageSearchResult searchResult = new MessageSearchResult(combined, query);
++      messageResultCache.put(cacheKey, searchResult);
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -325,6 +375,14 @@ public class SearchRepository {
+ 
+   @VisibleForTesting
+   static @NonNull CharSequence makeSnippet(@NonNull List<String> queries, @NonNull CharSequence styledBody) {
++    // Snippets are cached and re-rendered across repeat searches, so a mutable SpannableStringBuilder
++    // can't be returned as-is: downstream rendering (SearchUtil.getHighlightedSpan -> StringUtil.replace)
++    // special-cases SpannableStringBuilder and mutates it in place instead of copying, which would corrupt
++    // the cached entry. Normalizing to an immutable-content SpannableString up front closes that off.
++    if (styledBody instanceof SpannableStringBuilder) {
++      styledBody = SpannableString.valueOf(styledBody);
++    }
++
+     if (styledBody.length() < 50) {
+       return styledBody;
+     }
+@@ -337,9 +395,9 @@ public class SearchRepository {
+         int lastSpace    = TextUtils.indexOf(styledBody, ' ', foundIndex + 30);
+         int snippetEnd   = Math.min(styledBody.length(), lastSpace > 0 ? Math.min(lastSpace, foundIndex + 40) : foundIndex + 40);
+ 
+-        return new SpannableStringBuilder().append(snippetStart > 0 ? SNIPPET_WRAP : "")
+-                                           .append(styledBody.subSequence(snippetStart, snippetEnd))
+-                                           .append(snippetEnd < styledBody.length() ? SNIPPET_WRAP : "");
++        return SpannableString.valueOf(new SpannableStringBuilder().append(snippetStart > 0 ? SNIPPET_WRAP : "")
++                                                                    .append(styledBody.subSequence(snippetStart, snippetEnd))
++                                                                    .append(snippetEnd < styledBody.length() ? SNIPPET_WRAP : ""));
+       }
+     }
+ 
+@@ -350,8 +408,8 @@ public class SearchRepository {
+     int lastSpace = TextUtils.lastIndexOf(styledBody, ' ', MAX_SNIPPET_SIZE);
+     int snippetEnd = lastSpace > 0 ? lastSpace : MAX_SNIPPET_SIZE;
+ 
+-    return new SpannableStringBuilder().append(styledBody.subSequence(0, snippetEnd))
+-                                       .append(SNIPPET_WRAP);
++    return SpannableString.valueOf(new SpannableStringBuilder().append(styledBody.subSequence(0, snippetEnd))
++                                                                .append(SNIPPET_WRAP));
+   }
+ 
+   /**

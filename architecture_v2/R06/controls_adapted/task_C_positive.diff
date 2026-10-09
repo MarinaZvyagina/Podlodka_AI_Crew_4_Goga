@@ -1,0 +1,107 @@
+diff --git a/server/etcdserver/api/v3rpc/grpc.go b/server/etcdserver/api/v3rpc/grpc.go
+index 91863e2..21c4257 100644
+--- a/server/etcdserver/api/v3rpc/grpc.go
++++ b/server/etcdserver/api/v3rpc/grpc.go
+@@ -54,6 +54,7 @@ func Server(s *etcdserver.EtcdServer, tls *tls.Config, interceptor grpc.UnarySer
+ 		newLogUnaryInterceptor(s),
+ 		serverMetrics.UnaryServerInterceptor(),
+ 		newUnaryInterceptor(s),
++		newAuditUnaryInterceptor(s),
+ 	}
+ 	if interceptor != nil {
+ 		chainUnaryInterceptors = append(chainUnaryInterceptors, interceptor)
+diff --git a/server/etcdserver/api/v3rpc/interceptor.go b/server/etcdserver/api/v3rpc/interceptor.go
+index f09ec42..3529ba9 100644
+--- a/server/etcdserver/api/v3rpc/interceptor.go
++++ b/server/etcdserver/api/v3rpc/interceptor.go
+@@ -213,6 +213,90 @@ func logExpensiveRequestStats(lg *zap.Logger, startTime time.Time, duration time
+ 	)
+ }
+ 
++// newAuditUnaryInterceptor returns an interceptor that produces a uniform audit
++// record (caller identity, operation kind, key/range, duration, outcome) for every
++// Range/Put/DeleteRange/Txn request handled by the server. It is registered once in
++// the chain built by Server() in grpc.go, mirroring the way newLogUnaryInterceptor /
++// logUnaryRequestStats already type-switch on the same four response types in one
++// place, so that coverage stays uniform without touching key.go or v3_server.go and
++// without needing per-RPC-method changes when a new KV RPC is added in the future.
++func newAuditUnaryInterceptor(s *etcdserver.EtcdServer) grpc.UnaryServerInterceptor {
++	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
++		startTime := time.Now()
++		resp, err := handler(ctx, req)
++		lg := s.Logger()
++		if lg != nil {
++			auditUnaryRequest(ctx, lg, s, startTime, req, resp, err)
++		}
++		return resp, err
++	}
++}
++
++// auditUnaryRequest emits a single "audit" log record for KV read/write/delete/txn
++// requests. Caller identity is obtained via the existing AuthInfoFromCtx accessor
++// (the same one used by AuthAdmin.isPermitted in auth.go), not by re-parsing gRPC
++// metadata or tokens.
++func auditUnaryRequest(ctx context.Context, lg *zap.Logger, s *etcdserver.EtcdServer, startTime time.Time, req any, resp any, err error) {
++	var op, key string
++	switch r := resp.(type) {
++	case *pb.RangeResponse:
++		if rq, ok := req.(*pb.RangeRequest); ok {
++			op = "range"
++			key = auditKeyOrRange(rq.Key, rq.RangeEnd)
++		}
++	case *pb.PutResponse:
++		if rq, ok := req.(*pb.PutRequest); ok {
++			op = "put"
++			key = auditKeyOrRange(rq.Key, nil)
++		}
++	case *pb.DeleteRangeResponse:
++		if rq, ok := req.(*pb.DeleteRangeRequest); ok {
++			op = "delete_range"
++			key = auditKeyOrRange(rq.Key, rq.RangeEnd)
++		}
++	case *pb.TxnResponse:
++		if _, ok := req.(*pb.TxnRequest); ok {
++			op = "txn"
++			key = "<txn>"
++		}
++	default:
++		_ = r
++	}
++	if op == "" {
++		// not one of the KV request/response kinds this audit trail covers
++		return
++	}
++
++	identity := "unauthenticated"
++	if s.AuthStore() != nil && s.AuthStore().IsAuthEnabled() {
++		if authInfo, aerr := s.AuthInfoFromCtx(ctx); aerr == nil && authInfo != nil && authInfo.Username != "" {
++			identity = authInfo.Username
++		}
++	}
++
++	outcome := "success"
++	if err != nil {
++		outcome = "failure"
++	}
++
++	lg.Info("audit",
++		zap.String("caller", identity),
++		zap.String("operation", op),
++		zap.String("key", key),
++		zap.Duration("duration", time.Since(startTime)),
++		zap.String("outcome", outcome),
++	)
++}
++
++// auditKeyOrRange renders a key or key range as a single human-readable string for
++// audit records.
++func auditKeyOrRange(key, rangeEnd []byte) string {
++	if len(rangeEnd) == 0 {
++		return string(key)
++	}
++	return string(key) + ".." + string(rangeEnd)
++}
++
+ func newStreamInterceptor(s *etcdserver.EtcdServer) grpc.StreamServerInterceptor {
+ 	smap := monitorLeader(s)
+ 

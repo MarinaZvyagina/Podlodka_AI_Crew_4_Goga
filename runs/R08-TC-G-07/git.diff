@@ -1,0 +1,259 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/ApplicationContext.java b/app/src/main/java/org/thoughtcrime/securesms/ApplicationContext.java
+index f706929..04324a9 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/ApplicationContext.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/ApplicationContext.java
+@@ -94,6 +94,7 @@ import org.thoughtcrime.securesms.jobs.RestoreOptimizedMediaJob;
+ import org.thoughtcrime.securesms.jobs.RetrieveProfileJob;
+ import org.thoughtcrime.securesms.jobs.RetrieveRemoteAnnouncementsJob;
+ import org.thoughtcrime.securesms.jobs.StoryOnboardingDownloadJob;
++import org.thoughtcrime.securesms.jobs.ThumbnailCleanupJob;
+ import org.thoughtcrime.securesms.keyvalue.KeepMessagesDuration;
+ import org.thoughtcrime.securesms.keyvalue.SignalStore;
+ import org.thoughtcrime.securesms.logging.CustomSignalProtocolLogger;
+@@ -291,6 +292,7 @@ public class ApplicationContext extends Application implements AppForegroundObse
+       MemoryTracker.start();
+       BackupSubscriptionCheckJob.enqueueIfAble();
+       CheckKeyTransparencyJob.enqueueIfNecessary(true, false);
++      ThumbnailCleanupJob.enqueueIfNecessary();
+       AppDependencies.getAuthWebSocket().registerKeepAliveToken(SignalWebSocket.FOREGROUND_KEEPALIVE);
+       AppDependencies.getUnauthWebSocket().registerKeepAliveToken(SignalWebSocket.FOREGROUND_KEEPALIVE);
+ 
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/database/AttachmentTable.kt b/app/src/main/java/org/thoughtcrime/securesms/database/AttachmentTable.kt
+index 1e92473..f0ebfb6 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/database/AttachmentTable.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/database/AttachmentTable.kt
+@@ -1806,6 +1806,68 @@ class AttachmentTable(
+     return onDiskButNotInDatabase.size
+   }
+ 
++  /**
++   * Pages through the attachment directory looking for files (attachment data files, and the thumbnail/preview cache files stored alongside them)
++   * that are no longer referenced by any attachment or sticker, deleting whichever of them it finds, and reports how far it got.
++   *
++   * Used by [org.thoughtcrime.securesms.jobs.ThumbnailCleanupJob] to sweep the whole directory in bounded batches instead of doing it all in one
++   * pass: each call only looks at files sorted after [afterFile], so if the caller checkpoints [AbandonedAttachmentFileScanResult.nextCursor]
++   * between calls, an interrupted sweep can pick back up where it left off rather than rescanning files it already handled.
++   */
++  fun deleteAbandonedAttachmentFilesBatch(afterFile: String?, limit: Int): AbandonedAttachmentFileScanResult {
++    val diskFiles = context.getDir(DIRECTORY, Context.MODE_PRIVATE).listFiles() ?: return AbandonedAttachmentFileScanResult(nextCursor = null, filesDeleted = 0)
++
++    val filtered: List<String> = diskFiles
++      .map { file: File -> file.absolutePath }
++      .filter { afterFile == null || it > afterFile }
++      .sorted()
++
++    val candidates: List<String> = filtered.take(limit)
++
++    if (candidates.isEmpty()) {
++      return AbandonedAttachmentFileScanResult(nextCursor = null, filesDeleted = 0)
++    }
++
++    val referenced: MutableSet<String> = HashSet()
++
++    readableDatabase.withinTransaction { db ->
++      for (query in SqlUtil.buildCollectionQuery(DATA_FILE, candidates)) {
++        db.select(DATA_FILE).from(TABLE_NAME).where(query.where, query.whereArgs).run().forEach { cursor ->
++          cursor.requireString(DATA_FILE)?.let { referenced += it }
++        }
++      }
++      for (query in SqlUtil.buildCollectionQuery(THUMBNAIL_FILE, candidates)) {
++        db.select(THUMBNAIL_FILE).from(TABLE_NAME).where(query.where, query.whereArgs).run().forEach { cursor ->
++          cursor.requireString(THUMBNAIL_FILE)?.let { referenced += it }
++        }
++      }
++    }
++
++    referenced += SignalDatabase.stickers.getAllStickerFiles().filter { it in candidates }
++
++    var filesDeleted = 0
++    for (path in candidates) {
++      if (path in referenced) {
++        continue
++      }
++
++      val file = File(path)
++      if (PartFileProtector.isProtected(file)) {
++        continue
++      }
++
++      if (file.delete()) {
++        filesDeleted++
++      } else {
++        Log.w(TAG, "[deleteAbandonedAttachmentFilesBatch] Failed to delete attachment file. $path")
++      }
++    }
++
++    val nextCursor = if (filtered.size > candidates.size) candidates.last() else null
++
++    return AbandonedAttachmentFileScanResult(nextCursor = nextCursor, filesDeleted = filesDeleted)
++  }
++
+   /**
+    * Removes all references to the provided [DATA_FILE] from all attachments.
+    * Only do this if the file is known to not exist or has some other critical problem!
+@@ -4640,4 +4702,13 @@ class AttachmentTable(
+     /** There was nothing to clear. The attachment is gone, or an upload is already underway. */
+     NOT_NEEDED
+   }
++
++  /**
++   * The result of one [deleteAbandonedAttachmentFilesBatch] call.
++   *
++   * @param nextCursor Where the next batch should resume from, or null if the scan reached the end of the directory.
++   */
++  data class AbandonedAttachmentFileScanResult(val nextCursor: String?, val filesDeleted: Int) {
++    val isComplete: Boolean get() = nextCursor == null
++  }
+ }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/jobs/JobManagerFactories.java b/app/src/main/java/org/thoughtcrime/securesms/jobs/JobManagerFactories.java
+index 7e31c60..b7b60cb 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/jobs/JobManagerFactories.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/jobs/JobManagerFactories.java
+@@ -308,6 +308,7 @@ public final class JobManagerFactories {
+       put(Svr2MirrorJob.KEY,                           new Svr2MirrorJob.Factory());
+       put(Svr3MirrorJob.KEY,                           new Svr3MirrorJob.Factory());
+       put(ThreadUpdateJob.KEY,                         new ThreadUpdateJob.Factory());
++      put(ThumbnailCleanupJob.KEY,                     new ThumbnailCleanupJob.Factory());
+       put(TrimThreadJob.KEY,                           new TrimThreadJob.Factory());
+       put(TypingSendJob.KEY,                           new TypingSendJob.Factory());
+       put(UnpinMessageJob.KEY,                         new UnpinMessageJob.Factory());
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/jobs/ThumbnailCleanupJob.kt b/app/src/main/java/org/thoughtcrime/securesms/jobs/ThumbnailCleanupJob.kt
+new file mode 100644
+index 0000000..94dcc9f
+--- /dev/null
++++ b/app/src/main/java/org/thoughtcrime/securesms/jobs/ThumbnailCleanupJob.kt
+@@ -0,0 +1,97 @@
++/*
++ * Copyright 2026 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.jobs
++
++import org.signal.core.util.logging.Log
++import org.signal.core.util.nullIfBlank
++import org.thoughtcrime.securesms.database.SignalDatabase.Companion.attachments
++import org.thoughtcrime.securesms.dependencies.AppDependencies
++import org.thoughtcrime.securesms.jobmanager.Job
++import org.thoughtcrime.securesms.jobmanager.impl.BatteryNotLowConstraint
++import org.thoughtcrime.securesms.jobmanager.impl.NotInCallConstraint
++import org.thoughtcrime.securesms.jobs.protos.ThumbnailCleanupJobData
++import org.thoughtcrime.securesms.keyvalue.SignalStore
++import kotlin.time.Duration.Companion.days
++
++/**
++ * Backstop that periodically sweeps the attachment directory for thumbnail/preview cache files that no longer correspond to any attachment or
++ * message still in the app (e.g. because the attachment or its message was deleted), deleting them to reclaim disk space.
++ *
++ * The directory can be large on a long-lived device, so each run only processes a bounded batch and checkpoints a cursor, rescheduling itself via
++ * [Result.retry] until the whole directory has been swept. Since the cursor is persisted with the job (see [serialize]), a pass that gets killed
++ * partway through (which routinely happens on Android) resumes from the last checkpoint on its next attempt instead of restarting from scratch or
++ * never finishing.
++ */
++class ThumbnailCleanupJob private constructor(
++  private var cursor: String?,
++  parameters: Parameters
++) : Job(parameters) {
++
++  companion object {
++    private val TAG = Log.tag(ThumbnailCleanupJob::class)
++    const val KEY = "ThumbnailCleanupJob"
++
++    private val SCAN_INTERVAL = 3.days
++    private const val BATCH_SIZE = 500
++
++    /**
++     * Enqueues a sweep if we haven't completed one recently. Safe to call frequently (e.g. every app foreground) since it self-throttles.
++     */
++    @JvmStatic
++    fun enqueueIfNecessary() {
++      val timeSinceLastRun = System.currentTimeMillis() - SignalStore.misc.lastThumbnailCleanupTime
++
++      if (timeSinceLastRun < SCAN_INTERVAL.inWholeMilliseconds) {
++        return
++      }
++
++      AppDependencies.jobManager.add(ThumbnailCleanupJob())
++    }
++  }
++
++  constructor() : this(
++    cursor = null,
++    parameters = Parameters.Builder()
++      .setQueue(KEY)
++      .addConstraint(NotInCallConstraint.KEY)
++      .addConstraint(BatteryNotLowConstraint.KEY)
++      .setGlobalPriority(Parameters.PRIORITY_LOWER)
++      .setMaxInstancesForFactory(1)
++      .setMaxAttempts(Parameters.UNLIMITED)
++      .setLifespan(Parameters.IMMORTAL)
++      .build()
++  )
++
++  override fun serialize(): ByteArray = ThumbnailCleanupJobData(cursor = cursor ?: "").encode()
++
++  override fun getFactoryKey(): String = KEY
++
++  override fun onFailure() = Unit
++
++  override fun run(): Result {
++    val batch = attachments.deleteAbandonedAttachmentFilesBatch(cursor, BATCH_SIZE)
++
++    if (batch.filesDeleted > 0) {
++      Log.i(TAG, "Deleted ${batch.filesDeleted} orphaned cache file(s) in this batch.")
++    }
++
++    if (!batch.isComplete) {
++      cursor = batch.nextCursor
++      return Result.retry(0)
++    }
++
++    Log.i(TAG, "Finished a full sweep of the attachment directory.")
++    SignalStore.misc.lastThumbnailCleanupTime = System.currentTimeMillis()
++    return Result.success()
++  }
++
++  class Factory : Job.Factory<ThumbnailCleanupJob> {
++    override fun create(parameters: Parameters, serializedData: ByteArray?): ThumbnailCleanupJob {
++      val data = serializedData?.let { ThumbnailCleanupJobData.ADAPTER.decode(it) }
++      return ThumbnailCleanupJob(cursor = data?.cursor?.nullIfBlank(), parameters = parameters)
++    }
++  }
++}
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/keyvalue/MiscellaneousValues.kt b/app/src/main/java/org/thoughtcrime/securesms/keyvalue/MiscellaneousValues.kt
+index fa6a52f..db2930d 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/keyvalue/MiscellaneousValues.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/keyvalue/MiscellaneousValues.kt
+@@ -56,6 +56,7 @@ class MiscellaneousValues internal constructor(store: KeyValueStore) : SignalSto
+     private const val LAST_APPLIED_PNI_CHANGE_SERVER_TIMESTAMP = "misc.last_applied_pni_change_server_timestamp"
+     private const val LAST_MISSING_PLAY_SERVICES_FCM_VERIFICATION_TIME = "misc.last_missing_play_services_fcm_verification_time"
+     private const val LAST_PROCESSED_SHARE_DATA_TIMESTAMP = "misc.last_processed_share_data_timestamp"
++    private const val LAST_THUMBNAIL_CLEANUP_TIME = "misc.last_thumbnail_cleanup_time"
+   }
+ 
+   public override fun onFirstEverAppLaunch() {
+@@ -371,4 +372,9 @@ class MiscellaneousValues internal constructor(store: KeyValueStore) : SignalSto
+    * the activity that consumed it is gone.
+    */
+   var lastProcessedShareDataTimestamp: Long by longValue(LAST_PROCESSED_SHARE_DATA_TIMESTAMP, -1)
++
++  /**
++   * The last time a full pass of [org.thoughtcrime.securesms.jobs.ThumbnailCleanupJob] completed successfully.
++   */
++  var lastThumbnailCleanupTime: Long by longValue(LAST_THUMBNAIL_CLEANUP_TIME, 0)
+ }
+diff --git a/app/src/main/protowire/JobData.proto b/app/src/main/protowire/JobData.proto
+index 454accb..c81fb3b 100644
+--- a/app/src/main/protowire/JobData.proto
++++ b/app/src/main/protowire/JobData.proto
+@@ -255,6 +255,10 @@ message SecondRoundFixupSendJobData {
+   uint64 messageId = 1;
+ }
+ 
++message ThumbnailCleanupJobData {
++  string cursor = 1;
++}
++
+ message PollVoteJobData {
+   uint64 messageId = 1;
+   repeated uint64 recipients = 2;

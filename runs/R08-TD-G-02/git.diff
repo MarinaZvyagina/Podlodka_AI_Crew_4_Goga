@@ -1,0 +1,207 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+index f47eddb..ad6fa45 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+@@ -85,36 +85,40 @@ public class SearchRepository {
+ 
+   @WorkerThread
+   public @NonNull ThreadSearchResult queryThreadsSync(@NonNull String query, boolean unreadOnly) {
+-    SignalTrace.beginSection("ConversationListSearch-Threads");
+-    try {
+-      long                      start  = System.currentTimeMillis();
+-      List<ThreadWithRecipient> result = queryConversations(query, unreadOnly);
++    return ConversationSearchCache.INSTANCE.getThreads().getOrCompute(new ThreadSearchCacheKey(query, unreadOnly), () -> {
++      SignalTrace.beginSection("ConversationListSearch-Threads");
++      try {
++        long                      start  = System.currentTimeMillis();
++        List<ThreadWithRecipient> result = queryConversations(query, unreadOnly);
+ 
+-      Log.d(TAG, "[threads] Search took " + (System.currentTimeMillis() - start) + " ms");
++        Log.d(TAG, "[threads] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new ThreadSearchResult(result, query);
+-    } finally {
+-      SignalTrace.endSection();
+-    }
++        return new ThreadSearchResult(result, query);
++      } finally {
++        SignalTrace.endSection();
++      }
++    });
+   }
+ 
+   @WorkerThread
+   public @NonNull MessageSearchResult queryMessagesSync(@NonNull String query, @NonNull SearchFilter filter) {
+-    SignalTrace.beginSection("ConversationListSearch-Messages");
+-    try {
+-      long start = System.currentTimeMillis();
++    return ConversationSearchCache.INSTANCE.getMessages().getOrCompute(new MessageSearchCacheKey(query, filter), () -> {
++      SignalTrace.beginSection("ConversationListSearch-Messages");
++      try {
++        long start = System.currentTimeMillis();
+ 
+-      List<MessageResult> messages         = queryMessages(query, filter);
+-      List<MessageResult> mentionMessages  = queryMentions(convertMentionsQueryToTokens(query));
+-      List<MessageResult> filteredMentions = filterMentionResults(mentionMessages, filter);
+-      List<MessageResult> combined         = mergeMessagesAndMentions(messages, filteredMentions);
++        List<MessageResult> messages         = queryMessages(query, filter);
++        List<MessageResult> mentionMessages  = queryMentions(convertMentionsQueryToTokens(query));
++        List<MessageResult> filteredMentions = filterMentionResults(mentionMessages, filter);
++        List<MessageResult> combined         = mergeMessagesAndMentions(messages, filteredMentions);
+ 
+-      Log.d(TAG, "[messages] Search took " + (System.currentTimeMillis() - start) + " ms");
++        Log.d(TAG, "[messages] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new MessageSearchResult(combined, query);
+-    } finally {
+-      SignalTrace.endSection();
+-    }
++        return new MessageSearchResult(combined, query);
++      } finally {
++        SignalTrace.endSection();
++      }
++    });
+   }
+ 
+   public void query(@NonNull String query, long threadId, @NonNull Callback<List<MessageResult>> callback) {
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/search/SearchResultCache.kt b/app/src/main/java/org/thoughtcrime/securesms/search/SearchResultCache.kt
+new file mode 100644
+index 0000000..065f9ea
+--- /dev/null
++++ b/app/src/main/java/org/thoughtcrime/securesms/search/SearchResultCache.kt
+@@ -0,0 +1,49 @@
++/*
++ * Copyright 2026 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.search
++
++import org.thoughtcrime.securesms.dependencies.AppDependencies
++import java.util.concurrent.ConcurrentHashMap
++
++/**
++ * A generic memoizing cache. There's no per-entry invalidation -- callers call [invalidate] to
++ * drop everything whenever anything that could affect any cached value changes, since a cached
++ * value alone can't tell whether a given change is relevant to it.
++ */
++class SearchResultCache<K : Any, V : Any> {
++  private val cache = ConcurrentHashMap<K, V>()
++
++  fun getOrCompute(key: K, compute: () -> V): V = cache.computeIfAbsent(key) { compute() }
++
++  fun invalidate() = cache.clear()
++}
++
++data class ThreadSearchCacheKey(val query: String, val unreadOnly: Boolean)
++data class MessageSearchCacheKey(val query: String, val filter: SearchFilter)
++
++/**
++ * Caches the results of [SearchRepository]'s chat-list search queries, so repeating an identical
++ * search (same text, same filters) is instant instead of re-scanning the database.
++ *
++ * Shared process-wide -- rather than owned per [SearchRepository] instance -- so it survives
++ * screens being torn down and recreated (every caller just constructs a new [SearchRepository]
++ * freely) and is only ever registered with [AppDependencies.databaseObserver] once.
++ *
++ * Invalidated wholesale on any conversation-list-relevant change (new/edited/deleted messages,
++ * renamed contacts or groups, etc.), since a cached result can't tell on its own whether a given
++ * change affects it.
++ */
++object ConversationSearchCache {
++  val threads = SearchResultCache<ThreadSearchCacheKey, ThreadSearchResult>()
++  val messages = SearchResultCache<MessageSearchCacheKey, MessageSearchResult>()
++
++  init {
++    AppDependencies.databaseObserver.registerConversationListObserver {
++      threads.invalidate()
++      messages.invalidate()
++    }
++  }
++}
+diff --git a/app/src/test/java/org/thoughtcrime/securesms/search/SearchResultCacheTest.kt b/app/src/test/java/org/thoughtcrime/securesms/search/SearchResultCacheTest.kt
+new file mode 100644
+index 0000000..975ad4f
+--- /dev/null
++++ b/app/src/test/java/org/thoughtcrime/securesms/search/SearchResultCacheTest.kt
+@@ -0,0 +1,80 @@
++/*
++ * Copyright 2026 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.search
++
++import assertk.assertThat
++import assertk.assertions.isEqualTo
++import org.junit.Test
++
++class SearchResultCacheTest {
++
++  @Test
++  fun getOrComputeOnlyComputesOnceForTheSameKey() {
++    val cache = SearchResultCache<String, Int>()
++    var computeCount = 0
++
++    val first = cache.getOrCompute("hello") { computeCount++; 1 }
++    val second = cache.getOrCompute("hello") { computeCount++; 2 }
++
++    assertThat(first).isEqualTo(1)
++    assertThat(second).isEqualTo(1)
++    assertThat(computeCount).isEqualTo(1)
++  }
++
++  @Test
++  fun getOrComputeTreatsDifferentKeysIndependently() {
++    val cache = SearchResultCache<String, Int>()
++    var computeCount = 0
++
++    val hello = cache.getOrCompute("hello") { computeCount++; 1 }
++    val world = cache.getOrCompute("world") { computeCount++; 2 }
++
++    assertThat(hello).isEqualTo(1)
++    assertThat(world).isEqualTo(2)
++    assertThat(computeCount).isEqualTo(2)
++  }
++
++  @Test
++  fun invalidateClearsEveryEntrySoTheNextGetRecomputes() {
++    val cache = SearchResultCache<String, Int>()
++    var computeCount = 0
++
++    cache.getOrCompute("hello") { computeCount++; 1 }
++    cache.invalidate()
++    val afterInvalidate = cache.getOrCompute("hello") { computeCount++; 2 }
++
++    assertThat(afterInvalidate).isEqualTo(2)
++    assertThat(computeCount).isEqualTo(2)
++  }
++
++  @Test
++  fun threadSearchCacheKeyDistinguishesUnreadOnly() {
++    val cache = SearchResultCache<ThreadSearchCacheKey, Int>()
++    var computeCount = 0
++
++    val allChats = cache.getOrCompute(ThreadSearchCacheKey("hello", unreadOnly = false)) { computeCount++; 1 }
++    val unreadOnly = cache.getOrCompute(ThreadSearchCacheKey("hello", unreadOnly = true)) { computeCount++; 2 }
++
++    assertThat(allChats).isEqualTo(1)
++    assertThat(unreadOnly).isEqualTo(2)
++    assertThat(computeCount).isEqualTo(2)
++  }
++
++  @Test
++  fun messageSearchCacheKeyDistinguishesFilter() {
++    val cache = SearchResultCache<MessageSearchCacheKey, Int>()
++    var computeCount = 0
++
++    val unfiltered = cache.getOrCompute(MessageSearchCacheKey("hello", SearchFilter.EMPTY)) { computeCount++; 1 }
++    val filtered = cache.getOrCompute(MessageSearchCacheKey("hello", SearchFilter(startDate = 1L))) { computeCount++; 2 }
++    val unfilteredAgain = cache.getOrCompute(MessageSearchCacheKey("hello", SearchFilter.EMPTY)) { computeCount++; 3 }
++
++    assertThat(unfiltered).isEqualTo(1)
++    assertThat(filtered).isEqualTo(2)
++    assertThat(unfilteredAgain).isEqualTo(1)
++    assertThat(computeCount).isEqualTo(2)
++  }
++}

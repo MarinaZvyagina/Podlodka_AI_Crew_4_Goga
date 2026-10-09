@@ -1,0 +1,373 @@
+diff --git a/server/etcdserver/api/v3rpc/CODEMANIFEST b/server/etcdserver/api/v3rpc/CODEMANIFEST
+index 4889799c8..e49039818 100644
+--- a/server/etcdserver/api/v3rpc/CODEMANIFEST
++++ b/server/etcdserver/api/v3rpc/CODEMANIFEST
+@@ -18,13 +18,36 @@ Usages:
+     term, and revision by a shared header helper. Add a new cross-cutting gRPC-level concern as
+     a new decorator around the relevant service struct rather than editing it directly.
+ 
++    This pattern only fires for the specific methods a decorator chooses to override (see the
++    quota decorator on the KV service, which overrides Put/Txn but not Range/DeleteRange) — it
++    embeds the wrapped service, so an un-overridden method silently falls through to the base
++    implementation. It is the right tool when a concern intentionally applies to a subset of
++    methods, but the wrong tool when a concern must apply uniformly to every method of a service
++    including ones added later. For that case use `uniform_service_audit` instead.
++
++  uniform_service_audit: |
++    A concern that must cover every method of a gRPC service uniformly, including methods added
++    to that service in the future, is implemented as a unary interceptor filtered by gRPC service
++    name (full-method prefix, e.g. the KV service's) rather than as a per-service-struct decorator
++    that overrides individual methods by name. The interceptor is wired into the fixed internal
++    interceptor chain composed inside `Server`, not its optional external interceptor
++    parameter — which callers may leave nil — so it always runs. It observes the already-flowing request/response/error and
++    only logs; it never mutates them, so it cannot change functional behavior or response content.
++    The audit-trail interceptor is the instance of this pattern: it logs identity, operation kind,
++    key/range, duration, and outcome for every KV Range/Put/DeleteRange/Txn call, deriving
++    operation kind and key/range generically (by method-name suffix and by the request message's
++    key/range-end field convention) so a future KV method is still audited, with a best-effort
++    label, without editing this cell.
++
+ Annotations: |
+   This cell is the gRPC-facing adapter layer: it translates protobuf service calls into calls
+   on the imported `EtcdServer`, plus a direct dependency on `KV` for bridging gRPC watch streams
+   to the storage layer's watch mechanism. It is the top of the server-side request path — the
+   client cell talks to it over the network, and `EtcdServer` itself never imports back from it.
+ 
+-  Use `decorator_wrapping` when adding a new cross-cutting concern to an existing gRPC service.
++  Use `decorator_wrapping` when adding a new cross-cutting concern to a specific subset of an
++  existing gRPC service's methods. Use `uniform_service_audit` when the concern must cover every
++  method of a service uniformly and automatically, without per-method instrumentation.
+ 
+ ---
+ 
+diff --git a/server/etcdserver/api/v3rpc/audit.go b/server/etcdserver/api/v3rpc/audit.go
+new file mode 100644
+index 000000000..d5f6a5600
+--- /dev/null
++++ b/server/etcdserver/api/v3rpc/audit.go
+@@ -0,0 +1,187 @@
++// Copyright 2016 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package v3rpc
++
++import (
++	"context"
++	"strings"
++	"time"
++
++	"go.uber.org/zap"
++	"google.golang.org/grpc"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/server/v3/auth"
++	"go.etcd.io/etcd/server/v3/etcdserver"
++)
++
++// kvServiceMethodPrefix is the gRPC full-method prefix shared by every method
++// of the KV service (Range, Put, DeleteRange, Txn, ...). Matching on the
++// service rather than enumerating individual method names means any KV
++// method added to the service in the future is audited automatically,
++// without editing this file.
++const kvServiceMethodPrefix = "/etcdserverpb.KV/"
++
++const unauthenticatedIdentity = "unauthenticated"
++
++// keyRanged is implemented by any protobuf message that carries a single
++// key, e.g. PutRequest, DeleteRangeRequest, RangeRequest, and Compare. It is
++// used to extract the audited key generically, so a future KV request
++// message following the same field convention is covered without adding a
++// case here.
++type keyRanged interface {
++	GetKey() []byte
++}
++
++// rangeEnded is implemented in addition to keyRanged by messages that carry
++// a [key, rangeEnd) span rather than a single key.
++type rangeEnded interface {
++	GetRangeEnd() []byte
++}
++
++// keySpan is a single key or [Key, RangeEnd) range touched by a KV request.
++type keySpan struct {
++	Key      []byte
++	RangeEnd []byte
++}
++
++// newAuditUnaryInterceptor returns a unary gRPC interceptor that records one
++// audit log entry for every request handled by the KV service: caller
++// identity, operation kind, key/range, duration, and outcome. It is wired
++// into the fixed interceptor chain in Server() below, so it covers every KV
++// request type uniformly and cannot be skipped by forgetting to instrument a
++// newly added request type by hand. It only observes the request/response
++// that already flow through the chain and never mutates them, so it cannot
++// change functional behavior or response content.
++func newAuditUnaryInterceptor(s *etcdserver.EtcdServer) grpc.UnaryServerInterceptor {
++	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
++		if !strings.HasPrefix(info.FullMethod, kvServiceMethodPrefix) {
++			return handler(ctx, req)
++		}
++
++		start := time.Now()
++		resp, err := handler(ctx, req)
++		logKVAudit(s, ctx, info.FullMethod, start, req, resp, err)
++		return resp, err
++	}
++}
++
++func logKVAudit(s *etcdserver.EtcdServer, ctx context.Context, fullMethod string, start time.Time, req, resp any, err error) {
++	lg := s.Logger()
++	if lg == nil {
++		return
++	}
++
++	authInfo, aerr := s.AuthInfoFromCtx(ctx)
++
++	fields := []zap.Field{
++		zap.String("identity", auditIdentity(authInfo, aerr)),
++		zap.String("operation", auditOperationKind(fullMethod)),
++		zap.Duration("duration", time.Since(start)),
++		zap.Bool("success", err == nil),
++	}
++	for _, span := range auditKeySpans(req, resp) {
++		fields = append(fields, zap.ByteString("key", span.Key))
++		if len(span.RangeEnd) > 0 {
++			fields = append(fields, zap.ByteString("range_end", span.RangeEnd))
++		}
++	}
++	if err != nil {
++		fields = append(fields, zap.Error(err))
++	}
++
++	lg.Info("kv audit", fields...)
++}
++
++// auditIdentity reports the caller identity for an audit record: the
++// authenticated username, or unauthenticatedIdentity when auth is disabled,
++// no credentials were presented, or identity lookup failed.
++func auditIdentity(authInfo *auth.AuthInfo, err error) string {
++	if err != nil || authInfo == nil || authInfo.Username == "" {
++		return unauthenticatedIdentity
++	}
++	return authInfo.Username
++}
++
++// auditOperationKind maps a KV service gRPC method to the audited operation
++// kind. Methods not in this known set (e.g. a future addition to the KV
++// service) still produce an audit record — their operation kind is simply
++// the lowercased method name — rather than being silently dropped.
++func auditOperationKind(fullMethod string) string {
++	method := fullMethod
++	if i := strings.LastIndexByte(fullMethod, '/'); i >= 0 {
++		method = fullMethod[i+1:]
++	}
++	switch method {
++	case "Range":
++		return "read"
++	case "Put":
++		return "write"
++	case "DeleteRange":
++		return "delete"
++	case "Txn":
++		return "transaction"
++	default:
++		return strings.ToLower(method)
++	}
++}
++
++// auditKeySpans extracts every key or key range a KV request touches. Txn is
++// unwrapped recursively into the compare list and whichever branch actually
++// ran (per resp.GetSucceeded()); any other request is handled generically
++// through the keyRanged/rangeEnded interfaces.
++func auditKeySpans(req, resp any) []keySpan {
++	if txnReq, ok := req.(*pb.TxnRequest); ok {
++		txnResp, _ := resp.(*pb.TxnResponse)
++		return txnKeySpans(txnReq, txnResp)
++	}
++	if kr, ok := req.(keyRanged); ok {
++		return []keySpan{spanOf(kr)}
++	}
++	return nil
++}
++
++func txnKeySpans(req *pb.TxnRequest, resp *pb.TxnResponse) []keySpan {
++	var spans []keySpan
++	for _, cmp := range req.GetCompare() {
++		spans = append(spans, spanOf(cmp))
++	}
++
++	branch := req.GetSuccess()
++	if resp != nil && !resp.GetSucceeded() {
++		branch = req.GetFailure()
++	}
++	for _, op := range branch {
++		switch {
++		case op.GetRequestRange() != nil:
++			spans = append(spans, spanOf(op.GetRequestRange()))
++		case op.GetRequestPut() != nil:
++			spans = append(spans, spanOf(op.GetRequestPut()))
++		case op.GetRequestDeleteRange() != nil:
++			spans = append(spans, spanOf(op.GetRequestDeleteRange()))
++		case op.GetRequestTxn() != nil:
++			spans = append(spans, txnKeySpans(op.GetRequestTxn(), nil)...)
++		}
++	}
++	return spans
++}
++
++func spanOf(v keyRanged) keySpan {
++	span := keySpan{Key: v.GetKey()}
++	if re, ok := v.(rangeEnded); ok {
++		span.RangeEnd = re.GetRangeEnd()
++	}
++	return span
++}
+diff --git a/server/etcdserver/api/v3rpc/audit_test.go b/server/etcdserver/api/v3rpc/audit_test.go
+new file mode 100644
+index 000000000..b6382971f
+--- /dev/null
++++ b/server/etcdserver/api/v3rpc/audit_test.go
+@@ -0,0 +1,120 @@
++// Copyright 2016 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package v3rpc
++
++import (
++	"errors"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/server/v3/auth"
++)
++
++func TestAuditOperationKind(t *testing.T) {
++	tests := []struct {
++		fullMethod string
++		want       string
++	}{
++		{"/etcdserverpb.KV/Range", "read"},
++		{"/etcdserverpb.KV/Put", "write"},
++		{"/etcdserverpb.KV/DeleteRange", "delete"},
++		{"/etcdserverpb.KV/Txn", "transaction"},
++		{"/etcdserverpb.KV/Compact", "compact"},
++		{"NoSlashes", "noslashes"},
++	}
++	for _, tt := range tests {
++		assert.Equal(t, tt.want, auditOperationKind(tt.fullMethod), tt.fullMethod)
++	}
++}
++
++func TestAuditIdentity(t *testing.T) {
++	tests := []struct {
++		name     string
++		authInfo *auth.AuthInfo
++		err      error
++		want     string
++	}{
++		{"auth disabled", nil, nil, unauthenticatedIdentity},
++		{"lookup error", &auth.AuthInfo{Username: "root"}, errors.New("boom"), unauthenticatedIdentity},
++		{"empty username", &auth.AuthInfo{Username: ""}, nil, unauthenticatedIdentity},
++		{"authenticated", &auth.AuthInfo{Username: "alice"}, nil, "alice"},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			assert.Equal(t, tt.want, auditIdentity(tt.authInfo, tt.err))
++		})
++	}
++}
++
++func TestAuditKeySpansSimpleRequests(t *testing.T) {
++	assert.Equal(t,
++		[]keySpan{{Key: []byte("a"), RangeEnd: []byte("z")}},
++		auditKeySpans(&pb.RangeRequest{Key: []byte("a"), RangeEnd: []byte("z")}, &pb.RangeResponse{}))
++
++	assert.Equal(t,
++		[]keySpan{{Key: []byte("a")}},
++		auditKeySpans(&pb.PutRequest{Key: []byte("a")}, &pb.PutResponse{}))
++
++	assert.Equal(t,
++		[]keySpan{{Key: []byte("a"), RangeEnd: []byte("z")}},
++		auditKeySpans(&pb.DeleteRangeRequest{Key: []byte("a"), RangeEnd: []byte("z")}, &pb.DeleteRangeResponse{}))
++
++	assert.Nil(t, auditKeySpans(&pb.AuthEnableRequest{}, &pb.AuthEnableResponse{}))
++}
++
++func TestAuditKeySpansTxn(t *testing.T) {
++	req := &pb.TxnRequest{
++		Compare: []*pb.Compare{
++			{Key: []byte("cmp"), RangeEnd: []byte("cmp-end")},
++		},
++		Success: []*pb.RequestOp{
++			{Request: &pb.RequestOp_RequestPut{RequestPut: &pb.PutRequest{Key: []byte("success-put")}}},
++			{Request: &pb.RequestOp_RequestRange{RequestRange: &pb.RangeRequest{Key: []byte("success-range"), RangeEnd: []byte("success-range-end")}}},
++		},
++		Failure: []*pb.RequestOp{
++			{Request: &pb.RequestOp_RequestDeleteRange{RequestDeleteRange: &pb.DeleteRangeRequest{Key: []byte("failure-del")}}},
++		},
++	}
++
++	succeeded := auditKeySpans(req, &pb.TxnResponse{Succeeded: true})
++	assert.Equal(t, []keySpan{
++		{Key: []byte("cmp"), RangeEnd: []byte("cmp-end")},
++		{Key: []byte("success-put")},
++		{Key: []byte("success-range"), RangeEnd: []byte("success-range-end")},
++	}, succeeded)
++
++	failed := auditKeySpans(req, &pb.TxnResponse{Succeeded: false})
++	assert.Equal(t, []keySpan{
++		{Key: []byte("cmp"), RangeEnd: []byte("cmp-end")},
++		{Key: []byte("failure-del")},
++	}, failed)
++}
++
++func TestAuditKeySpansNestedTxn(t *testing.T) {
++	inner := &pb.TxnRequest{
++		Success: []*pb.RequestOp{
++			{Request: &pb.RequestOp_RequestPut{RequestPut: &pb.PutRequest{Key: []byte("nested-put")}}},
++		},
++	}
++	outer := &pb.TxnRequest{
++		Success: []*pb.RequestOp{
++			{Request: &pb.RequestOp_RequestTxn{RequestTxn: inner}},
++		},
++	}
++
++	assert.Equal(t, []keySpan{{Key: []byte("nested-put")}}, auditKeySpans(outer, &pb.TxnResponse{Succeeded: true}))
++}
+diff --git a/server/etcdserver/api/v3rpc/grpc.go b/server/etcdserver/api/v3rpc/grpc.go
+index 91863e294..a462896c5 100644
+--- a/server/etcdserver/api/v3rpc/grpc.go
++++ b/server/etcdserver/api/v3rpc/grpc.go
+@@ -52,6 +52,7 @@ func Server(s *etcdserver.EtcdServer, tls *tls.Config, interceptor grpc.UnarySer
+ 
+ 	chainUnaryInterceptors := []grpc.UnaryServerInterceptor{
+ 		newLogUnaryInterceptor(s),
++		newAuditUnaryInterceptor(s),
+ 		serverMetrics.UnaryServerInterceptor(),
+ 		newUnaryInterceptor(s),
+ 	}

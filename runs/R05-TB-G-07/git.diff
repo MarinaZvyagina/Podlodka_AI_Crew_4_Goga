@@ -1,0 +1,644 @@
+diff --git a/docs/victoriametrics/changelog/CHANGELOG.md b/docs/victoriametrics/changelog/CHANGELOG.md
+index 6620b10..85f461f 100644
+--- a/docs/victoriametrics/changelog/CHANGELOG.md
++++ b/docs/victoriametrics/changelog/CHANGELOG.md
+@@ -26,6 +26,7 @@ See also [LTS releases](https://docs.victoriametrics.com/victoriametrics/lts-rel
+ 
+ ## tip
+ 
++* FEATURE: [vmagent](https://docs.victoriametrics.com/victoriametrics/vmagent/): add `-promscrape.maxTargetsPerJob` command-line flag and the `max_targets_per_job` per-job option for limiting the number of active scrape targets a single scrape job (`job_name`) can have at once, regardless of which service discovery mechanism(s) provided the targets. This protects `vmagent` from runaway target counts caused by a misconfigured discovery source. By default, there is no limit. Excluded targets are shown as `DROPPED` with the `target limit exceeded` reason at the `/service-discovery` page and are reflected in the `vm_promscrape_scrape_pool_targets{status="excluded"}` metric. See [these docs](https://docs.victoriametrics.com/victoriametrics/vmagent/#limiting-the-number-of-scrape-targets-per-job).
+ * FEATURE: [vmagent](https://docs.victoriametrics.com/victoriametrics/vmagent/), [vmsingle](https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/), `vmstorage` and `vmselect` in [VictoriaMetrics cluster](https://docs.victoriametrics.com/victoriametrics/cluster-victoriametrics/): expose the `vm_app_prev_shutdown_unclean` gauge. It is set to `1` when the previous process run didn't shut down cleanly. Added the `UncleanShutdown` [alerting rule](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/deployment/docker/rules/alerts-health.yml), which fires for 10 minutes after an unclean shutdown is detected. See [#8443](https://github.com/VictoriaMetrics/VictoriaMetrics/issues/8443).
+ * FEATURE: [vmui](https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#vmui): show the selected time zone UTC offset next to the date/time controls and allow opening time zone settings from it. See [#11332](https://github.com/VictoriaMetrics/VictoriaMetrics/pull/11332).
+ * FEATURE: [vmsingle](https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/), [vmagent](https://docs.victoriametrics.com/victoriametrics/vmagent/), [vmalert](https://docs.victoriametrics.com/victoriametrics/vmalert/), and `vmselect` in [VictoriaMetrics cluster](https://docs.victoriametrics.com/victoriametrics/cluster-victoriametrics/): show how the default value is calculated for command-line flags which derive it from the number of available CPU cores. For example, `-maxConcurrentInserts` now prints `(default 16 = 2*cgroup.AvailableCPUs())` in `-help` output instead of `(default 16)`. Updated flags: `-search.maxConcurrentRequests`, `-search.maxWorkersPerQuery`, `-fs.maxConcurrency`, `-remoteWrite.concurrency`, `-remoteWrite.queues`. See [#9680](https://github.com/VictoriaMetrics/VictoriaMetrics/issues/9680). Thanks to @Vandit1604 for contribution.
+diff --git a/docs/victoriametrics/sd_configs.md b/docs/victoriametrics/sd_configs.md
+index 956f047..db58961 100644
+--- a/docs/victoriametrics/sd_configs.md
++++ b/docs/victoriametrics/sd_configs.md
+@@ -2133,6 +2133,16 @@ scrape_configs:
+   #
+   # series_limit: <int>
+ 
++  # max_targets_per_job is an optional limit on the number of active scrape targets this job can have
++  # at once, regardless of which service discovery mechanism(s) provided the targets.
++  # If the number of discovered targets exceeds this limit, then the excess targets are dropped
++  # and shown as DROPPED with the "target limit exceeded" reason at the /service-discovery page.
++  # By default, there is no limit. If max_targets_per_job isn't set, then the limit from
++  # -promscrape.maxTargetsPerJob command-line flag is used instead.
++  # See https://docs.victoriametrics.com/victoriametrics/vmagent/#limiting-the-number-of-scrape-targets-per-job
++  #
++  # max_targets_per_job: <int>
++
+   # label_limit is an optional limit on the number of labels per each sample
+   # exposed by a target. It can be set globally for a whole scrape configuration and for each scrape job
+   #
+diff --git a/docs/victoriametrics/vmagent.md b/docs/victoriametrics/vmagent.md
+index 87a5b27..982742f 100644
+--- a/docs/victoriametrics/vmagent.md
++++ b/docs/victoriametrics/vmagent.md
+@@ -967,6 +967,25 @@ to all the metrics scraped by the given `vmagent` instance:
+ 
+ See also [how to shard data among multiple remote storage systems](#sharding-among-remote-storages).
+ 
++## Limiting the number of scrape targets per job
++
++Sometimes a scrape job backed by service discovery (Kubernetes, Consul, EC2, etc.) may unexpectedly return
++a huge number of targets because of a misconfiguration on the discovery side. Scraping all of these targets
++at once may spike memory and CPU usage and degrade scraping for other jobs running on the same `vmagent` instance.
++
++In order to protect against this, the `-promscrape.maxTargetsPerJob` command-line flag can be used for limiting
++the number of active scrape targets a single scrape job (`job_name`) can have at once, regardless of which
++service discovery mechanism(s) provided the targets. This limit can be overridden on a per-job basis with the
++`max_targets_per_job` option at `scrape_config` level. By default, there is no limit, so existing setups
++are unaffected unless this option is explicitly configured.
++
++If the number of discovered targets for a job exceeds the configured limit, then `vmagent` keeps scraping
++only up to the limit, while the excess targets are dropped and shown as `DROPPED` with the `target limit exceeded`
++reason at the `http://vmagent:8429/service-discovery` page, in the same way as targets dropped because of
++[relabeling](#relabeling-and-filtering) or [sharding](#scraping-big-number-of-targets). The number of currently
++excluded targets for a job is also exposed via the `vm_promscrape_scrape_pool_targets{scrape_job="<job_name>", status="excluded"}`
++metric.
++
+ ## High availability
+ 
+ It is possible to run multiple **identically configured** `vmagent` instances or `vmagent`
+diff --git a/lib/promscrape/config.go b/lib/promscrape/config.go
+index 87e5ecc..516e948 100644
+--- a/lib/promscrape/config.go
++++ b/lib/promscrape/config.go
+@@ -88,6 +88,10 @@ var (
+ 		"See https://docs.victoriametrics.com/victoriametrics/vmagent/#scraping-big-number-of-targets for more info")
+ 	maxScrapeSize = flagutil.NewBytes("promscrape.maxScrapeSize", 16*1024*1024, "The maximum size of uncompressed scrape response in bytes to process from Prometheus targets. "+
+ 		"Bigger uncompressed responses are rejected. See also max_scrape_size option at https://docs.victoriametrics.com/victoriametrics/sd_configs/#scrape_configs")
++	maxTargetsPerJob = flag.Int("promscrape.maxTargetsPerJob", 0, "Optional limit on the number of active scrape targets a single scrape job (job_name) can have at once, "+
++		"regardless of which service discovery mechanism(s) provided the targets. Extra discovered targets are dropped and shown as `DROPPED` "+
++		"with the `target limit exceeded` reason at /service-discovery page. By default there is no limit. This limit can be overridden with "+
++		"max_targets_per_job option at job level. See also https://docs.victoriametrics.com/victoriametrics/vmagent/#limiting-the-number-of-scrape-targets-per-job")
+ )
+ 
+ var (
+@@ -163,7 +167,7 @@ func (cfg *Config) mustStart() {
+ 		sc.mustStart(cfg.baseDir)
+ 	}
+ 	jobNames := cfg.getJobNames()
+-	tsmGlobal.registerJobNames(jobNames)
++	tsmGlobal.registerJobNames(jobNames, cfg.getMaxTargetsByJob())
+ 	logger.Infof("started %d service discovery routines in %.3f seconds", len(cfg.ScrapeConfigs), time.Since(startTime).Seconds())
+ }
+ 
+@@ -213,7 +217,7 @@ func (cfg *Config) mustRestart(prevCfg *Config) bool {
+ 		}
+ 	}
+ 	jobNames := cfg.getJobNames()
+-	tsmGlobal.registerJobNames(jobNames)
++	tsmGlobal.registerJobNames(jobNames, cfg.getMaxTargetsByJob())
+ 	updated := started + stopped + restarted
+ 	if updated == 0 {
+ 		return false
+@@ -273,6 +277,19 @@ func (cfg *Config) getJobNames() []string {
+ 	return a
+ }
+ 
++// getMaxTargetsByJob returns the resolved max_targets_per_job limit for each job_name in cfg.
++//
++// Jobs without a limit (i.e. unlimited) are omitted from the returned map.
++func (cfg *Config) getMaxTargetsByJob() map[string]int {
++	m := make(map[string]int)
++	for _, sc := range cfg.ScrapeConfigs {
++		if sc.swc != nil && sc.swc.maxTargets > 0 {
++			m[sc.JobName] = sc.swc.maxTargets
++		}
++	}
++	return m
++}
++
+ // GlobalConfig represents essential parts for `global` section of Prometheus config.
+ //
+ // See https://prometheus.io/docs/prometheus/latest/configuration/configuration/
+@@ -352,6 +369,11 @@ type ScrapeConfig struct {
+ 	NoStaleMarkers      *bool                      `yaml:"no_stale_markers,omitempty"`
+ 	ProxyClientConfig   promauth.ProxyClientConfig `yaml:",inline"`
+ 
++	// MaxTargetsPerJob is an optional limit on the number of active scrape targets this job can have at once,
++	// regardless of which service discovery mechanism(s) provided the targets.
++	// If not set (or set to a non-positive value), then the limit from -promscrape.maxTargetsPerJob is used instead.
++	MaxTargetsPerJob int `yaml:"max_targets_per_job,omitempty"`
++
+ 	// This is set in loadConfig
+ 	swc *scrapeWorkConfig
+ }
+@@ -1006,6 +1028,10 @@ func getScrapeWorkConfig(sc *ScrapeConfig, baseDir string, globalCfg *GlobalConf
+ 	if sc.EnableCompression != nil {
+ 		disableCompression = !*sc.EnableCompression
+ 	}
++	maxTargets := sc.MaxTargetsPerJob
++	if maxTargets <= 0 {
++		maxTargets = *maxTargetsPerJob
++	}
+ 	swc := &scrapeWorkConfig{
+ 		scrapeInterval:       scrapeInterval,
+ 		scrapeIntervalString: scrapeInterval.String(),
+@@ -1034,6 +1060,7 @@ func getScrapeWorkConfig(sc *ScrapeConfig, baseDir string, globalCfg *GlobalConf
+ 		scrapeOffset:         sc.ScrapeOffset.Duration(),
+ 		seriesLimit:          seriesLimit,
+ 		noStaleMarkers:       noStaleTracking,
++		maxTargets:           maxTargets,
+ 	}
+ 	return swc, nil
+ }
+@@ -1045,6 +1072,9 @@ type scrapeWorkConfig struct {
+ 	scrapeTimeoutString  string
+ 	maxScrapeSize        int64
+ 	jobName              string
++	// maxTargets is the maximum number of active scrape targets this job can have at once.
++	// Zero or negative value means no limit.
++	maxTargets           int
+ 	metricsPath          string
+ 	scheme               string
+ 	params               map[string][]string
+diff --git a/lib/promscrape/config_test.go b/lib/promscrape/config_test.go
+index 73ac545..96e9f74 100644
+--- a/lib/promscrape/config_test.go
++++ b/lib/promscrape/config_test.go
+@@ -120,6 +120,60 @@ global:
+   - action: labeldrop
+     source_labels: [id]
+ `)
++	f(`
++scrape_configs:
++- job_name: foo
++  static_configs:
++  - targets:
++    - foo
++  max_targets_per_job: 1000
++`)
++}
++
++func TestConfigGetMaxTargetsByJob(t *testing.T) {
++	f := func(data string, maxTargetsPerJobFlag int, expected map[string]int) {
++		t.Helper()
++		prevFlagValue := *maxTargetsPerJob
++		*maxTargetsPerJob = maxTargetsPerJobFlag
++		defer func() { *maxTargetsPerJob = prevFlagValue }()
++
++		var cfg Config
++		if err := cfg.parseData([]byte(data), "test-scrape.yaml"); err != nil {
++			t.Fatalf("cannot parse config: %s", err)
++		}
++		got := cfg.getMaxTargetsByJob()
++		if !reflect.DeepEqual(got, expected) {
++			t.Fatalf("unexpected result;\ngot\n%v\nwant\n%v", got, expected)
++		}
++	}
++
++	// no limit set anywhere - the job must be absent from the result (unlimited).
++	f(`
++scrape_configs:
++- job_name: foo
++  static_configs:
++  - targets: ["foo.bar:1234"]
++`, 0, map[string]int{})
++
++	// no per-job override - falls back to the global -promscrape.maxTargetsPerJob flag.
++	f(`
++scrape_configs:
++- job_name: foo
++  static_configs:
++  - targets: ["foo.bar:1234"]
++`, 42, map[string]int{"foo": 42})
++
++	// per-job override takes precedence over the global flag.
++	f(`
++scrape_configs:
++- job_name: foo
++  max_targets_per_job: 5
++  static_configs:
++  - targets: ["foo.bar:1234"]
++- job_name: bar
++  static_configs:
++  - targets: ["foo.bar:1234"]
++`, 42, map[string]int{"foo": 5, "bar": 42})
+ }
+ 
+ func TestGetClusterMemberNumsForScrapeWork(t *testing.T) {
+diff --git a/lib/promscrape/scraper.go b/lib/promscrape/scraper.go
+index ecf37f9..e2b97d5 100644
+--- a/lib/promscrape/scraper.go
++++ b/lib/promscrape/scraper.go
+@@ -329,6 +329,11 @@ type scraperGroup struct {
+ 	m        map[string]*scraper
+ 	pushData func(at *auth.Token, wr *prompb.WriteRequest)
+ 
++	// excludedKeys contains keys of targets which sg currently reported to tsmGlobal as excluded
++	// because of the max_targets_per_job limit. It is used to unmark them once they either succeed
++	// or disappear from the discovered targets.
++	excludedKeys map[string]struct{}
++
+ 	changesCount    *metrics.Counter
+ 	activeScrapers  *metrics.Counter
+ 	scrapersStarted *metrics.Counter
+@@ -339,9 +344,10 @@ type scraperGroup struct {
+ 
+ func newScraperGroup(name string, pushData func(at *auth.Token, wr *prompb.WriteRequest), globalStopCh <-chan struct{}) *scraperGroup {
+ 	sg := &scraperGroup{
+-		name:     name,
+-		m:        make(map[string]*scraper),
+-		pushData: pushData,
++		name:         name,
++		m:            make(map[string]*scraper),
++		excludedKeys: make(map[string]struct{}),
++		pushData:     pushData,
+ 
+ 		changesCount:    metrics.NewCounter(fmt.Sprintf(`vm_promscrape_config_changes_total{type=%q}`, name)),
+ 		activeScrapers:  metrics.NewCounter(fmt.Sprintf(`vm_promscrape_active_scrapers{type=%q}`, name)),
+@@ -415,16 +421,43 @@ func (sg *scraperGroup) update(sws []*ScrapeWork) {
+ 		<-ch
+ 	}
+ 
++	// Forget about previously excluded targets which either disappeared from the discovered
++	// targets or are no longer excluded (they are re-evaluated below in swsToStart).
++	for key := range sg.excludedKeys {
++		if _, ok := swsMap[key]; !ok {
++			delete(sg.excludedKeys, key)
++			tsmGlobal.unmarkExcluded(key)
++		}
++	}
++
+ 	// Start new scrapers only after the deleted scrapers are stopped.
+ 	for _, sw := range swsToStart {
++		key := sw.key()
+ 		sc, err := newScraper(sw, sg.name, sg.pushData)
+ 		if err != nil {
+ 			logger.Errorf("skipping scraper for url=%s, job=%s because of error: %s", sw.ScrapeURL, sg.name, err)
+ 			continue
+ 		}
++		if !tsmGlobal.Register(&sc.sw) {
++			// The job has already reached its max_targets_per_job limit. Drop this target
++			// and keep retrying it on subsequent updates, in case the limit condition changes.
++			sc.cancel()
++			if _, ok := sg.excludedKeys[key]; !ok {
++				sg.excludedKeys[key] = struct{}{}
++				tsmGlobal.markExcluded(key, sw.jobNameOriginal)
++				logger.Warnf("skipping scrape target %s for job_name=%s because the number of active targets for this job "+
++					"has reached the max_targets_per_job limit; see the DROPPED targets with reason=%q at /service-discovery page",
++					sw.ScrapeURL, sw.jobNameOriginal, targetDropReasonJobTargetsLimit)
++			}
++			droppedTargetsMap.Register(sw.OriginalLabels, sw.RelabelConfigs, targetDropReasonJobTargetsLimit, nil)
++			continue
++		}
++		if _, ok := sg.excludedKeys[key]; ok {
++			delete(sg.excludedKeys, key)
++			tsmGlobal.unmarkExcluded(key)
++		}
+ 		sg.activeScrapers.Inc()
+ 		sg.scrapersStarted.Inc()
+-		tsmGlobal.Register(&sc.sw)
+ 		sg.wg.Go(func() {
+ 			defer func() {
+ 				close(sc.stoppedCh)
+@@ -434,7 +467,6 @@ func (sg *scraperGroup) update(sws []*ScrapeWork) {
+ 			sg.activeScrapers.Dec()
+ 			sg.scrapersStopped.Inc()
+ 		})
+-		key := sw.key()
+ 		sg.m[key] = sc
+ 		additionsCount++
+ 	}
+diff --git a/lib/promscrape/scraper_test.go b/lib/promscrape/scraper_test.go
+index 8a03fc4..8dc9e67 100644
+--- a/lib/promscrape/scraper_test.go
++++ b/lib/promscrape/scraper_test.go
+@@ -3,6 +3,7 @@ package promscrape
+ import (
+ 	"fmt"
+ 	"math/rand"
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
+@@ -79,3 +80,97 @@ scrape_configs:
+     - targets:
+         - localhost:8429`, true)
+ }
++
++func TestScraperGroupUpdateWithMaxTargetsLimit(t *testing.T) {
++	pushData := func(_ *auth.Token, _ *prompb.WriteRequest) {}
++	globalStopChan = make(chan struct{})
++	defer close(globalStopChan)
++
++	randName := rand.Int()
++	jobName1 := fmt.Sprintf("job-limit-test-a-%d", randName)
++	jobName2 := fmt.Sprintf("job-limit-test-b-%d", randName)
++
++	setLimit := func(jobName string, n int) {
++		tsmGlobal.mu.Lock()
++		if n > 0 {
++			tsmGlobal.maxTargetsByJob[jobName] = n
++		} else {
++			delete(tsmGlobal.maxTargetsByJob, jobName)
++		}
++		tsmGlobal.mu.Unlock()
++	}
++	excludedCount := func(jobName string) int {
++		tsmGlobal.mu.Lock()
++		defer tsmGlobal.mu.Unlock()
++		return tsmGlobal.excludedByJob[jobName]
++	}
++	defer setLimit(jobName1, 0)
++	defer setLimit(jobName2, 0)
++
++	parseTargets := func(jobName string, targets ...string) []*ScrapeWork {
++		cfgData := fmt.Sprintf("scrape_configs:\n- job_name: %s\n  static_configs:\n  - targets: %s\n",
++			jobName, "[\""+strings.Join(targets, "\", \"")+"\"]")
++		var cfg Config
++		if err := cfg.parseData([]byte(cfgData), "test-scrape.yaml"); err != nil {
++			t.Fatalf("cannot parse config: %s", err)
++		}
++		return cfg.getStaticScrapeWork()
++	}
++
++	// Default (unlimited) behavior: no limit is configured for the job, so all targets are scraped.
++	sg1 := newScraperGroup(fmt.Sprintf("static_configs_unlimited_%d", randName), pushData, globalStopChan)
++	defer sg1.stop()
++	sws := parseTargets(jobName1, "localhost:19001", "localhost:19002", "localhost:19003")
++	sg1.update(sws)
++	if n := len(sg1.m); n != 3 {
++		t.Fatalf("unlimited: unexpected number of started scrapers; got %d, want 3", n)
++	}
++	if n := excludedCount(jobName1); n != 0 {
++		t.Fatalf("unlimited: unexpected number of excluded targets; got %d, want 0", n)
++	}
++
++	// Job under the limit: unaffected, all targets are scraped.
++	setLimit(jobName1, 5)
++	sg1.update(sws)
++	if n := len(sg1.m); n != 3 {
++		t.Fatalf("under limit: unexpected number of started scrapers; got %d, want 3", n)
++	}
++	if n := excludedCount(jobName1); n != 0 {
++		t.Fatalf("under limit: unexpected number of excluded targets; got %d, want 0", n)
++	}
++
++	// Job over the limit: truncated to the limit, the excess is dropped and visible in status.
++	// Use a fresh scraperGroup and a distinct job_name, so the first update() already observes
++	// all 5 targets at once, simulating a discovery source suddenly returning a runaway number
++	// of targets for a job that had no previously-registered targets.
++	setLimit(jobName2, 2)
++	sg2 := newScraperGroup(fmt.Sprintf("static_configs_overlimit_%d", randName), pushData, globalStopChan)
++	defer sg2.stop()
++	sws2 := parseTargets(jobName2, "localhost:19004", "localhost:19005", "localhost:19006", "localhost:19007", "localhost:19008")
++	sg2.update(sws2)
++	if n := len(sg2.m); n != 2 {
++		t.Fatalf("over limit: unexpected number of started scrapers; got %d, want 2", n)
++	}
++	if n := excludedCount(jobName2); n != 3 {
++		t.Fatalf("over limit: unexpected number of excluded targets; got %d, want 3", n)
++	}
++	var droppedForJob int
++	for _, dt := range droppedTargetsMap.getTargetsList() {
++		if dt.originalLabels.getJob() == jobName2 && dt.dropReason == targetDropReasonJobTargetsLimit {
++			droppedForJob++
++		}
++	}
++	if droppedForJob != 3 {
++		t.Fatalf("over limit: unexpected number of targets visible as dropped because of the limit; got %d, want 3", droppedForJob)
++	}
++
++	// Raising the limit again must un-exclude the previously dropped targets.
++	setLimit(jobName2, 5)
++	sg2.update(sws2)
++	if n := len(sg2.m); n != 5 {
++		t.Fatalf("limit raised: unexpected number of started scrapers; got %d, want 5", n)
++	}
++	if n := excludedCount(jobName2); n != 0 {
++		t.Fatalf("limit raised: unexpected number of excluded targets; got %d, want 0", n)
++	}
++}
+diff --git a/lib/promscrape/targetstatus.go b/lib/promscrape/targetstatus.go
+index aa75dfc..98a78b1 100644
+--- a/lib/promscrape/targetstatus.go
++++ b/lib/promscrape/targetstatus.go
+@@ -101,20 +101,36 @@ type targetStatusMap struct {
+ 
+ 	// the current number of `down` targets in the given jobName
+ 	downByJob map[string]int
++
++	// maxTargetsByJob contains the resolved max_targets_per_job limit for the given jobName.
++	// A missing entry (or non-positive value) means the job has no limit.
++	maxTargetsByJob map[string]int
++
++	// excludedKeys contains the jobName for every scrape target key which is currently excluded
++	// from scraping because upByJob[jobName]+downByJob[jobName] has reached maxTargetsByJob[jobName].
++	excludedKeys map[string]string
++
++	// the current number of targets excluded from scraping because of the max_targets_per_job limit
++	// for the given jobName
++	excludedByJob map[string]int
+ }
+ 
+ func newTargetStatusMap() *targetStatusMap {
+ 	return &targetStatusMap{
+-		m:         make(map[*scrapeWork]*targetStatus),
+-		upByJob:   make(map[string]int),
+-		downByJob: make(map[string]int),
++		m:               make(map[*scrapeWork]*targetStatus),
++		upByJob:         make(map[string]int),
++		downByJob:       make(map[string]int),
++		maxTargetsByJob: make(map[string]int),
++		excludedKeys:    make(map[string]string),
++		excludedByJob:   make(map[string]int),
+ 	}
+ }
+ 
+-func (tsm *targetStatusMap) registerJobNames(jobNames []string) {
++func (tsm *targetStatusMap) registerJobNames(jobNames []string, maxTargetsByJob map[string]int) {
+ 	tsm.mu.Lock()
+ 	tsm.registerJobsMetricsLocked(tsm.jobNames, jobNames)
+ 	tsm.jobNames = append(tsm.jobNames[:0], jobNames...)
++	tsm.maxTargetsByJob = maxTargetsByJob
+ 	tsm.mu.Unlock()
+ }
+ 
+@@ -132,6 +148,7 @@ func (tsm *targetStatusMap) registerJobsMetricsLocked(prevJobNames, currentJobNa
+ 		if _, ok := currentNames[jobName]; !ok {
+ 			metrics.UnregisterMetric(fmt.Sprintf(`vm_promscrape_scrape_pool_targets{scrape_job=%q, status="up"}`, jobName))
+ 			metrics.UnregisterMetric(fmt.Sprintf(`vm_promscrape_scrape_pool_targets{scrape_job=%q, status="down"}`, jobName))
++			metrics.UnregisterMetric(fmt.Sprintf(`vm_promscrape_scrape_pool_targets{scrape_job=%q, status="excluded"}`, jobName))
+ 		}
+ 	}
+ 
+@@ -152,17 +169,60 @@ func (tsm *targetStatusMap) registerJobsMetricsLocked(prevJobNames, currentJobNa
+ 			tsm.mu.Unlock()
+ 			return float64(n)
+ 		})
++		// excluded reflects the number of targets currently dropped from scraping because of the
++		// max_targets_per_job limit for jobNameLocal. See also targetDropReasonJobTargetsLimit.
++		_ = metrics.NewGauge(fmt.Sprintf(`vm_promscrape_scrape_pool_targets{scrape_job=%q, status="excluded"}`, jobName), func() float64 {
++			tsm.mu.Lock()
++			n := tsm.excludedByJob[jobNameLocal]
++			tsm.mu.Unlock()
++			return float64(n)
++		})
+ 	}
+ }
+ 
+-func (tsm *targetStatusMap) Register(sw *scrapeWork) {
++// Register registers sw as a new scrape target.
++//
++// It returns false without registering sw if the number of active targets for its job has already
++// reached the max_targets_per_job limit configured for that job. The caller must not start scraping
++// sw in this case.
++func (tsm *targetStatusMap) Register(sw *scrapeWork) bool {
+ 	jobName := sw.Config.jobNameOriginal
+ 
+ 	tsm.mu.Lock()
++	defer tsm.mu.Unlock()
++	if maxTargets := tsm.maxTargetsByJob[jobName]; maxTargets > 0 {
++		if tsm.upByJob[jobName]+tsm.downByJob[jobName] >= maxTargets {
++			return false
++		}
++	}
+ 	tsm.m[sw] = &targetStatus{
+ 		sw: sw,
+ 	}
+ 	tsm.downByJob[jobName]++
++	return true
++}
++
++// markExcluded marks the scrape target identified by key as excluded from scraping for jobName
++// because of the max_targets_per_job limit, unless it is already marked as such.
++func (tsm *targetStatusMap) markExcluded(key, jobName string) {
++	tsm.mu.Lock()
++	if _, ok := tsm.excludedKeys[key]; !ok {
++		tsm.excludedKeys[key] = jobName
++		tsm.excludedByJob[jobName]++
++	}
++	tsm.mu.Unlock()
++}
++
++// unmarkExcluded reverts the effect of a prior markExcluded call for the given key, if any.
++func (tsm *targetStatusMap) unmarkExcluded(key string) {
++	tsm.mu.Lock()
++	if jobName, ok := tsm.excludedKeys[key]; ok {
++		delete(tsm.excludedKeys, key)
++		tsm.excludedByJob[jobName]--
++		if tsm.excludedByJob[jobName] <= 0 {
++			delete(tsm.excludedByJob, jobName)
++		}
++	}
+ 	tsm.mu.Unlock()
+ }
+ 
+@@ -351,10 +411,11 @@ type droppedTarget struct {
+ type targetDropReason string
+ 
+ const (
+-	targetDropReasonRelabeling       = targetDropReason("relabeling")         // target dropped because of relabeling
+-	targetDropReasonMissingScrapeURL = targetDropReason("missing scrape URL") // target dropped because of missing scrape URL
+-	targetDropReasonDuplicate        = targetDropReason("duplicate")          // target with the given set of labels already exists
+-	targetDropReasonSharding         = targetDropReason("sharding")           // target is dropped because of sharding https://docs.victoriametrics.com/victoriametrics/vmagent/#scraping-big-number-of-targets
++	targetDropReasonRelabeling       = targetDropReason("relabeling")            // target dropped because of relabeling
++	targetDropReasonMissingScrapeURL = targetDropReason("missing scrape URL")    // target dropped because of missing scrape URL
++	targetDropReasonDuplicate        = targetDropReason("duplicate")             // target with the given set of labels already exists
++	targetDropReasonSharding         = targetDropReason("sharding")              // target is dropped because of sharding https://docs.victoriametrics.com/victoriametrics/vmagent/#scraping-big-number-of-targets
++	targetDropReasonJobTargetsLimit  = targetDropReason("target limit exceeded") // target is dropped because of max_targets_per_job limit https://docs.victoriametrics.com/victoriametrics/vmagent/#limiting-the-number-of-scrape-targets-per-job
+ )
+ 
+ func (dt *droppedTargets) getTargetsList() []droppedTarget {
+diff --git a/lib/promscrape/targetstatus_test.go b/lib/promscrape/targetstatus_test.go
+index 4be98a8..51120ad 100644
+--- a/lib/promscrape/targetstatus_test.go
++++ b/lib/promscrape/targetstatus_test.go
+@@ -3,6 +3,7 @@ package promscrape
+ import (
+ 	"bytes"
+ 	"encoding/json"
++	"fmt"
+ 	"reflect"
+ 	"testing"
+ 
+@@ -59,6 +60,85 @@ func TestWriteActiveTargetsJSON(t *testing.T) {
+ 	f("unknown", []activeTarget{})
+ }
+ 
++func TestTargetStatusMapRegisterWithMaxTargetsLimit(t *testing.T) {
++	newSW := func(jobName, address string) *scrapeWork {
++		return &scrapeWork{
++			Config: &ScrapeWork{
++				jobNameOriginal: jobName,
++				OriginalLabels: newCompressedLabels(promutil.NewLabelsFromMap(map[string]string{
++					"__address__": address,
++				})),
++			},
++		}
++	}
++
++	// Default behavior: no limit is configured for the job, so all targets are registered (unlimited).
++	tsm := newTargetStatusMap()
++	for i := 0; i < 10; i++ {
++		sw := newSW("unlimited-job", fmt.Sprintf("host%d:80", i))
++		if !tsm.Register(sw) {
++			t.Fatalf("unlimited-job: target %d was unexpectedly rejected", i)
++		}
++	}
++	if n := tsm.downByJob["unlimited-job"]; n != 10 {
++		t.Fatalf("unlimited-job: unexpected number of registered targets; got %d, want 10", n)
++	}
++
++	// A job under its configured limit must remain unaffected - all targets get registered.
++	tsm.maxTargetsByJob["under-limit-job"] = 5
++	for i := 0; i < 3; i++ {
++		sw := newSW("under-limit-job", fmt.Sprintf("host%d:80", i))
++		if !tsm.Register(sw) {
++			t.Fatalf("under-limit-job: target %d was unexpectedly rejected", i)
++		}
++	}
++	if n := tsm.downByJob["under-limit-job"]; n != 3 {
++		t.Fatalf("under-limit-job: unexpected number of registered targets; got %d, want 3", n)
++	}
++	if n := tsm.excludedByJob["under-limit-job"]; n != 0 {
++		t.Fatalf("under-limit-job: unexpected number of excluded targets; got %d, want 0", n)
++	}
++
++	// A job over its configured limit must be truncated: only up to the limit is registered,
++	// and the rest is trackable as excluded (mirrors what scraperGroup.update does on rejection).
++	tsm.maxTargetsByJob["over-limit-job"] = 2
++	var accepted, rejected int
++	for i := 0; i < 5; i++ {
++		sw := newSW("over-limit-job", fmt.Sprintf("host%d:80", i))
++		key := fmt.Sprintf("over-limit-job-target-%d", i)
++		if tsm.Register(sw) {
++			accepted++
++		} else {
++			rejected++
++			tsm.markExcluded(key, "over-limit-job")
++		}
++	}
++	if accepted != 2 {
++		t.Fatalf("over-limit-job: unexpected accepted count; got %d, want 2", accepted)
++	}
++	if rejected != 3 {
++		t.Fatalf("over-limit-job: unexpected rejected count; got %d, want 3", rejected)
++	}
++	if n := tsm.downByJob["over-limit-job"]; n != 2 {
++		t.Fatalf("over-limit-job: unexpected number of registered targets; got %d, want 2", n)
++	}
++	if n := tsm.excludedByJob["over-limit-job"]; n != 3 {
++		t.Fatalf("over-limit-job: unexpected number of excluded targets; got %d, want 3", n)
++	}
++	// Re-marking an already-excluded key must not double-count it.
++	tsm.markExcluded("over-limit-job-target-2", "over-limit-job")
++	if n := tsm.excludedByJob["over-limit-job"]; n != 3 {
++		t.Fatalf("over-limit-job: excludedByJob must not double-count on repeated markExcluded; got %d, want 3", n)
++	}
++	// Once the excluded targets succeed or disappear, they must be unmarked.
++	for i := 2; i < 5; i++ {
++		tsm.unmarkExcluded(fmt.Sprintf("over-limit-job-target-%d", i))
++	}
++	if n := tsm.excludedByJob["over-limit-job"]; n != 0 {
++		t.Fatalf("over-limit-job: unexpected number of excluded targets after unmark; got %d, want 0", n)
++	}
++}
++
+ func TestRegisterDroppedTargets(t *testing.T) {
+ 	type opts struct {
+ 		toRegister       []*promutil.Labels

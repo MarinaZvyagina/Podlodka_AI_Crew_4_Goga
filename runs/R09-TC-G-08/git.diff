@@ -1,0 +1,480 @@
+diff --git a/BrowserKit/Sources/QuickAnswersKit/Backend/DefaultQuickAnswersService.swift b/BrowserKit/Sources/QuickAnswersKit/Backend/DefaultQuickAnswersService.swift
+index 0a6eee0..96c7bca 100644
+--- a/BrowserKit/Sources/QuickAnswersKit/Backend/DefaultQuickAnswersService.swift
++++ b/BrowserKit/Sources/QuickAnswersKit/Backend/DefaultQuickAnswersService.swift
+@@ -10,8 +10,9 @@ import Shared
+ /// using an underlying `TranscriptionEngine`. As well as request results from the transcription via `ResultsService` flow.
+ ///
+ /// Engine selection
+-/// - iOS 26+ uses `SpeechAnalyzerEngine`.
+-/// - Earlier versions use `SFSpeechRecognizerEngine`.
++/// - `useAlternativeEngine` selects `AlternativeTranscriptionEngine`, used to A/B test an alternative
++///   speech-to-text pipeline.
++/// - Otherwise, iOS 26+ uses `SpeechAnalyzerEngine` and earlier versions use `SFSpeechRecognizerEngine`.
+ @MainActor
+ final class DefaultQuickAnswersService: QuickAnswersService {
+     enum RecordingState: Equatable {
+@@ -28,13 +29,14 @@ final class DefaultQuickAnswersService: QuickAnswersService {
+     /// Creates a new service with a platform-appropriate transcription engine and results service.
+     init(
+         engine: TranscriptionEngine? = nil,
++        useAlternativeEngine: Bool = false,
+         configFetcher: QuickAnswersConfigFetcher,
+         resultsServiceFactory: ResultsServiceFactory = DefaultResultsServiceFactory(
+             liteLLMCreator: LiteLLMCreator()
+         ),
+         prefs: Prefs
+     ) throws {
+-        self.engine = engine ?? Self.makeDefaultEngine()
++        self.engine = engine ?? Self.makeEngine(useAlternativeEngine: useAlternativeEngine)
+         self.resultsService = try resultsServiceFactory.make(prefs: prefs, configFetcher: configFetcher)
+     }
+ 
+@@ -101,10 +103,19 @@ final class DefaultQuickAnswersService: QuickAnswersService {
+         }
+     }
+ 
+-    private static func makeDefaultEngine() -> TranscriptionEngine {
++    /// Selects the transcription engine to use, favoring `AlternativeTranscriptionEngine` when
++    /// `useAlternativeEngine` is `true` so it can be A/B tested against the platform default.
++    static func makeEngine(useAlternativeEngine: Bool) -> TranscriptionEngine {
+         let audioManager = AudioManager()
+         let authorizer = AuthorizationHandler()
+ 
++        if useAlternativeEngine {
++            return AlternativeTranscriptionEngine(
++                audioManager: audioManager,
++                authorizer: authorizer
++            )
++        }
++
+         if #available(iOS 26.0, *) {
+             return SpeechAnalyzerEngine(
+                 audioManager: audioManager,
+diff --git a/BrowserKit/Sources/QuickAnswersKit/Backend/SpeechService/AlternativeTranscriptionEngine.swift b/BrowserKit/Sources/QuickAnswersKit/Backend/SpeechService/AlternativeTranscriptionEngine.swift
+new file mode 100644
+index 0000000..959f7c2
+--- /dev/null
++++ b/BrowserKit/Sources/QuickAnswersKit/Backend/SpeechService/AlternativeTranscriptionEngine.swift
+@@ -0,0 +1,73 @@
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at http://mozilla.org/MPL/2.0/
++
++/// A stand-in transcription engine used to A/B test an alternative speech-to-text pipeline
++/// against the platform default (`SFSpeechRecognizerEngine`/`SpeechAnalyzerEngine`).
++///
++/// It shares the same permission and audio session handling as the default engines so that
++/// permission errors and recording lifecycle behave identically regardless of which engine is
++/// selected. The recognition step itself is simulated rather than backed by a real third-party
++/// engine.
++@MainActor
++final class AlternativeTranscriptionEngine: TranscriptionEngine {
++    static let defaultSimulatedResults: [SpeechResult] = [
++        SpeechResult(text: "What is the weather", isFinal: false),
++        SpeechResult(text: "What is the weather today", isFinal: true)
++    ]
++
++    private let audioManager: AudioManagerProtocol
++    private let authorizer: AuthorizeProvider
++    private let simulatedResults: [SpeechResult]
++    private let resultDelayNanoseconds: UInt64
++
++    private var transcriptionTask: Task<Void, Never>?
++
++    init(
++        audioManager: AudioManagerProtocol,
++        authorizer: AuthorizeProvider,
++        simulatedResults: [SpeechResult] = AlternativeTranscriptionEngine.defaultSimulatedResults,
++        resultDelayNanoseconds: UInt64 = 200_000_000
++    ) {
++        self.audioManager = audioManager
++        self.authorizer = authorizer
++        self.simulatedResults = simulatedResults
++        self.resultDelayNanoseconds = resultDelayNanoseconds
++    }
++
++    func prepare() async throws {
++        try await authorizer.requestMicrophonePermission()
++        try await authorizer.requestSpeechPermission()
++        try audioManager.configureAudioSession()
++    }
++
++    func start(continuation: AsyncThrowingStream<SpeechResult, any Error>.Continuation) async throws {
++        transcriptionTask?.cancel()
++        transcriptionTask = Task { [simulatedResults, resultDelayNanoseconds] in
++            do {
++                for result in simulatedResults {
++                    try Task.checkCancellation()
++                    if resultDelayNanoseconds > 0 {
++                        try await Task.sleep(nanoseconds: resultDelayNanoseconds)
++                    }
++                    continuation.yield(result)
++                    if result.isFinal {
++                        continuation.finish()
++                        return
++                    }
++                }
++                continuation.finish()
++            } catch is CancellationError {
++                continuation.finish()
++            } catch {
++                continuation.finish(throwing: error)
++            }
++        }
++    }
++
++    func stop() throws {
++        transcriptionTask?.cancel()
++        transcriptionTask = nil
++        try audioManager.stopEngine()
++    }
++}
+diff --git a/BrowserKit/Sources/QuickAnswersKit/UI/QuickAnswersViewController.swift b/BrowserKit/Sources/QuickAnswersKit/UI/QuickAnswersViewController.swift
+index ba56483..adc2690 100644
+--- a/BrowserKit/Sources/QuickAnswersKit/UI/QuickAnswersViewController.swift
++++ b/BrowserKit/Sources/QuickAnswersKit/UI/QuickAnswersViewController.swift
+@@ -77,11 +77,17 @@ public final class QuickAnswersViewController: UIViewController,
+         telemetry: QuickAnswersTelemetry,
+         configFetcher: QuickAnswersConfigFetcher,
+         learnMoreURL: URL?,
++        useAlternativeSpeechEngine: Bool = false,
+         notificationCenter: NotificationProtocol = NotificationCenter.default,
+     ) {
+         self.init(
+             navigationHandler: navigationHandler,
+-            viewModel: QuickAnswersViewModel(prefs: prefs, telemetry: telemetry, configFetcher: configFetcher),
++            viewModel: QuickAnswersViewModel(
++                prefs: prefs,
++                telemetry: telemetry,
++                configFetcher: configFetcher,
++                useAlternativeSpeechEngine: useAlternativeSpeechEngine
++            ),
+             transitionType: transitionType,
+             windowUUID: windowUUID,
+             themeManager: themeManager,
+diff --git a/BrowserKit/Sources/QuickAnswersKit/UI/QuickAnswersViewModel.swift b/BrowserKit/Sources/QuickAnswersKit/UI/QuickAnswersViewModel.swift
+index b083aea..be58485 100644
+--- a/BrowserKit/Sources/QuickAnswersKit/UI/QuickAnswersViewModel.swift
++++ b/BrowserKit/Sources/QuickAnswersKit/UI/QuickAnswersViewModel.swift
+@@ -30,15 +30,24 @@ final class QuickAnswersViewModel {
+         prefs: Prefs,
+         telemetry: QuickAnswersTelemetry,
+         configFetcher: QuickAnswersConfigFetcher = DefaultQuickAnswersConfigFetcher(model: .exa),
+-        makeService: (Prefs, QuickAnswersConfigFetcher) throws -> QuickAnswersService = { prefs, configFetcher in
+-            try DefaultQuickAnswersService(configFetcher: configFetcher, prefs: prefs)
++        useAlternativeSpeechEngine: Bool = false,
++        makeService: (
++            Prefs,
++            QuickAnswersConfigFetcher,
++            Bool
++        ) throws -> QuickAnswersService = { prefs, configFetcher, useAlternativeSpeechEngine in
++            try DefaultQuickAnswersService(
++                useAlternativeEngine: useAlternativeSpeechEngine,
++                configFetcher: configFetcher,
++                prefs: prefs
++            )
+         }
+     ) {
+         self.telemetry = telemetry
+         self.store = Store(prefs: prefs)
+         self.modelDisplayName = configFetcher.model.displayName
+         do {
+-            self.service = try makeService(prefs, configFetcher)
++            self.service = try makeService(prefs, configFetcher, useAlternativeSpeechEngine)
+         } catch {
+             self.service = nil
+         }
+diff --git a/BrowserKit/Tests/QuickAnswersKitTests/DefaultQuickAnswersServiceTests.swift b/BrowserKit/Tests/QuickAnswersKitTests/DefaultQuickAnswersServiceTests.swift
+index 6124fef..bb279ae 100644
+--- a/BrowserKit/Tests/QuickAnswersKitTests/DefaultQuickAnswersServiceTests.swift
++++ b/BrowserKit/Tests/QuickAnswersKitTests/DefaultQuickAnswersServiceTests.swift
+@@ -105,6 +105,61 @@ class DefaultQuickAnswersServiceTests {
+         #expect(engine.stopCallCount == 1)
+     }
+ 
++    // MARK: - Engine Selection
++
++    @Test
++    func test_makeEngine_whenAlternativeEngineEnabled_returnsAlternativeEngine() {
++        let engine = DefaultQuickAnswersService.makeEngine(useAlternativeEngine: true)
++        testHelper.trackForMemoryLeaks(engine as AnyObject)
++
++        #expect(engine is AlternativeTranscriptionEngine)
++    }
++
++    @Test
++    func test_makeEngine_whenAlternativeEngineDisabled_returnsPlatformDefaultEngine() {
++        let engine = DefaultQuickAnswersService.makeEngine(useAlternativeEngine: false)
++        testHelper.trackForMemoryLeaks(engine as AnyObject)
++
++        if #available(iOS 26.0, *) {
++            #expect(engine is SpeechAnalyzerEngine)
++        } else {
++            #expect(engine is SFSpeechRecognizerEngine)
++        }
++    }
++
++    @Test
++    func test_record_withAlternativeEngine_behavesLikeDefaultEngine() async throws {
++        let alternativeEngine = AlternativeTranscriptionEngine(
++            audioManager: MockAudioManager(),
++            authorizer: MockAuthorizer(),
++            simulatedResults: [
++                SpeechResult(text: "What is the weather", isFinal: false),
++                SpeechResult(text: "today?", isFinal: true)
++            ],
++            resultDelayNanoseconds: 0
++        )
++        let subject = try DefaultQuickAnswersService(
++            engine: alternativeEngine,
++            configFetcher: MockQuickAnswersConfigFetcher(),
++            resultsServiceFactory: resultsServiceFactory,
++            prefs: MockProfilePrefs()
++        )
++        testHelper.trackForMemoryLeaks(subject)
++
++        let stream = try await subject.record()
++
++        var received: [SpeechResult] = []
++        for try await value in stream {
++            received.append(value)
++        }
++        try await subject.stopRecording()
++
++        #expect(received == [
++            SpeechResult(text: "What is the weather", isFinal: false),
++            SpeechResult(text: "today?", isFinal: true)
++        ])
++    }
++
+     @Test
+     func test_search_returnsEmptySuccess() async throws {
+         let subject = try createSubject()
+diff --git a/BrowserKit/Tests/QuickAnswersKitTests/QuickAnswersViewControllerTests.swift b/BrowserKit/Tests/QuickAnswersKitTests/QuickAnswersViewControllerTests.swift
+index 1477530..c0c93c9 100644
+--- a/BrowserKit/Tests/QuickAnswersKitTests/QuickAnswersViewControllerTests.swift
++++ b/BrowserKit/Tests/QuickAnswersKitTests/QuickAnswersViewControllerTests.swift
+@@ -33,7 +33,7 @@ final class QuickAnswersViewControllerTests: XCTestCase {
+         let viewModel = QuickAnswersViewModel(
+             prefs: MockProfilePrefs(),
+             telemetry: MockQuickAnswersTelemetry(),
+-            makeService: { _, _ in
++            makeService: { _, _, _ in
+                 MockTestQuickAnswersService()
+             }
+         )
+diff --git a/BrowserKit/Tests/QuickAnswersKitTests/QuickAnswersViewModelTests.swift b/BrowserKit/Tests/QuickAnswersKitTests/QuickAnswersViewModelTests.swift
+index 8888ba6..e94025f 100644
+--- a/BrowserKit/Tests/QuickAnswersKitTests/QuickAnswersViewModelTests.swift
++++ b/BrowserKit/Tests/QuickAnswersKitTests/QuickAnswersViewModelTests.swift
+@@ -214,6 +214,40 @@ final class QuickAnswersViewModelTests: XCTestCase {
+         XCTAssertEqual(mockTelemetry.citationTappedCalledCount, 1)
+     }
+ 
++    // MARK: - Speech Engine Selection Tests
++
++    func testInit_withAlternativeSpeechEngineDisabled_passesFalseToMakeService() {
++        var receivedFlag: Bool?
++        let model = QuickAnswersViewModel(
++            prefs: MockProfilePrefs(),
++            telemetry: mockTelemetry,
++            useAlternativeSpeechEngine: false,
++            makeService: { _, _, useAlternativeSpeechEngine in
++                receivedFlag = useAlternativeSpeechEngine
++                return self.mockService
++            }
++        )
++        trackForMemoryLeaks(model)
++
++        XCTAssertEqual(receivedFlag, false)
++    }
++
++    func testInit_withAlternativeSpeechEngineEnabled_passesTrueToMakeService() {
++        var receivedFlag: Bool?
++        let model = QuickAnswersViewModel(
++            prefs: MockProfilePrefs(),
++            telemetry: mockTelemetry,
++            useAlternativeSpeechEngine: true,
++            makeService: { _, _, useAlternativeSpeechEngine in
++                receivedFlag = useAlternativeSpeechEngine
++                return self.mockService
++            }
++        )
++        trackForMemoryLeaks(model)
++
++        XCTAssertEqual(receivedFlag, true)
++    }
++
+     // MARK: - Model Display Name Tests
+ 
+     func testModelDisplayName_withExaModel_returnsExa() {
+@@ -237,7 +271,7 @@ final class QuickAnswersViewModelTests: XCTestCase {
+             prefs: prefs,
+             telemetry: mockTelemetry,
+             configFetcher: configFetcher,
+-            makeService: { _, _ in
++            makeService: { _, _, _ in
+                 return self.mockService
+             }
+         )
+@@ -250,7 +284,7 @@ final class QuickAnswersViewModelTests: XCTestCase {
+         let model = QuickAnswersViewModel(
+             prefs: prefs,
+             telemetry: mockTelemetry,
+-            makeService: { _, _ in throw ServiceInitError() }
++            makeService: { _, _, _ in throw ServiceInitError() }
+         )
+         trackForMemoryLeaks(model)
+         return model
+diff --git a/BrowserKit/Tests/QuickAnswersKitTests/SpeechService/AlternativeTranscriptionEngineTests.swift b/BrowserKit/Tests/QuickAnswersKitTests/SpeechService/AlternativeTranscriptionEngineTests.swift
+new file mode 100644
+index 0000000..28fdd37
+--- /dev/null
++++ b/BrowserKit/Tests/QuickAnswersKitTests/SpeechService/AlternativeTranscriptionEngineTests.swift
+@@ -0,0 +1,92 @@
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at http://mozilla.org/MPL/2.0/
++
++import Testing
++import TestKit
++
++@testable import QuickAnswersKit
++
++@Suite
++@MainActor
++struct AlternativeTranscriptionEngineTests {
++    let testHelper = SwiftTestingHelper()
++    let audioManager = MockAudioManager()
++
++    @Test
++    func test_prepare_microphoneDenied_throwsMicrophoneError() async {
++        let authorizer = MockAuthorizer(micAuthorized: false, speechAuthorized: false)
++        let subject = createSubject(authorizer: authorizer)
++
++        await #expect(throws: SpeechError.microphonePermissionDenied(isFirstTime: false)) {
++            try await subject.prepare()
++        }
++
++        #expect(audioManager.configureAudioSessionCallCount == 0)
++    }
++
++    @Test
++    func test_prepare_speechDenied_throwsSpeechError() async {
++        let authorizer = MockAuthorizer(micAuthorized: true, speechAuthorized: false)
++        let subject = createSubject(authorizer: authorizer)
++
++        await #expect(throws: SpeechError.speechRecognitionPermissionDenied(isFirstTime: false)) {
++            try await subject.prepare()
++        }
++
++        #expect(audioManager.configureAudioSessionCallCount == 0)
++    }
++
++    @Test
++    func test_prepare_withPermissions_callsConfigureAudioSession() async throws {
++        let subject = createSubject(authorizer: MockAuthorizer())
++
++        try await subject.prepare()
++
++        #expect(audioManager.configureAudioSessionCallCount == 1)
++    }
++
++    @Test
++    func test_start_yieldsSimulatedResultsThenFinishes() async throws {
++        let expectedResults = [
++            SpeechResult(text: "What is the weather", isFinal: false),
++            SpeechResult(text: "What is the weather today", isFinal: true)
++        ]
++        let subject = createSubject(authorizer: MockAuthorizer(), simulatedResults: expectedResults)
++
++        var received: [SpeechResult] = []
++        let stream = AsyncThrowingStream<SpeechResult, Error> { continuation in
++            Task {
++                try await subject.start(continuation: continuation)
++            }
++        }
++        for try await value in stream {
++            received.append(value)
++        }
++
++        #expect(received == expectedResults)
++    }
++
++    @Test
++    func test_stop_callsStopEngine() throws {
++        let subject = createSubject(authorizer: MockAuthorizer())
++
++        try subject.stop()
++
++        #expect(audioManager.stopEngineCallCount == 1)
++    }
++
++    private func createSubject(
++        authorizer: AuthorizeProvider,
++        simulatedResults: [SpeechResult] = AlternativeTranscriptionEngine.defaultSimulatedResults
++    ) -> AlternativeTranscriptionEngine {
++        let subject = AlternativeTranscriptionEngine(
++            audioManager: audioManager,
++            authorizer: authorizer,
++            simulatedResults: simulatedResults,
++            resultDelayNanoseconds: 0
++        )
++        testHelper.trackForMemoryLeaks(subject)
++        return subject
++    }
++}
+diff --git a/firefox-ios/Client/Coordinators/QuickAnswersCoordinator.swift b/firefox-ios/Client/Coordinators/QuickAnswersCoordinator.swift
+index 9adb321..8e4c8ab 100644
+--- a/firefox-ios/Client/Coordinators/QuickAnswersCoordinator.swift
++++ b/firefox-ios/Client/Coordinators/QuickAnswersCoordinator.swift
+@@ -49,6 +49,7 @@ final class QuickAnswersCoordinator: BaseCoordinator, QuickAnswersNavigationHand
+             telemetry: DefaultQuickAnswersTelemetry(),
+             configFetcher: RemoteQuickAnswersConfigFetcher(model: nimbusModel()),
+             learnMoreURL: Self.learnMoreURL,
++            useAlternativeSpeechEngine: nimbusUseAlternativeSpeechEngine(),
+         )
+         router.present(controller, animated: shouldAnimateTransition)
+     }
+@@ -60,6 +61,12 @@ final class QuickAnswersCoordinator: BaseCoordinator, QuickAnswersNavigationHand
+         return QuickAnswersKit.QuickAnswersModel(rawValue: rawValue) ?? .exa
+     }
+ 
++    /// Reads the Nimbus-configured flag enrolling this user into the alternative speech-to-text
++    /// pipeline experiment.
++    private func nimbusUseAlternativeSpeechEngine() -> Bool {
++        return FxNimbus.shared.features.quickAnswersFeature.value().useAlternativeSpeechEngine
++    }
++
+     // MARK: - QuickAnswersNavigationHandler
+     func dismissQuickAnswers(with navigationType: QuickAnswersNavigationType?) {
+         if let navigationType {
+diff --git a/firefox-ios/nimbus-features/quickAnswersFeature.yaml b/firefox-ios/nimbus-features/quickAnswersFeature.yaml
+index 2dbc6ef..c32867d 100644
+--- a/firefox-ios/nimbus-features/quickAnswersFeature.yaml
++++ b/firefox-ios/nimbus-features/quickAnswersFeature.yaml
+@@ -14,15 +14,23 @@ features:
+           Which provider model backs Quick Answers.
+         type: QuickAnswersModel
+         default: exa
++      useAlternativeSpeechEngine:
++        description: >
++          When true, voice transcription uses the alternative speech-to-text pipeline instead of the
++          platform default, for A/B testing transcription quality and latency.
++        type: Boolean
++        default: false
+     defaults:
+       - channel: beta
+         value:
+           enabled: false
+           model: exa
++          useAlternativeSpeechEngine: false
+       - channel: developer
+         value:
+           enabled: false
+           model: exa
++          useAlternativeSpeechEngine: false
+ 
+ enums:
+   QuickAnswersModel:

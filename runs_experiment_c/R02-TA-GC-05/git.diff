@@ -1,0 +1,173 @@
+diff --git a/salt/beacons/diskusage.py b/salt/beacons/diskusage.py
+index da904cf..328c8f1 100644
+--- a/salt/beacons/diskusage.py
++++ b/salt/beacons/diskusage.py
+@@ -33,6 +33,15 @@ def __virtual__():
+         return __virtualname__
+ 
+ 
++def _to_percent(value):
++    """
++    Normalize a threshold value (e.g. ``"63%"`` or ``63``) to a float
++    """
++    if isinstance(value, str) and "%" in value:
++        value = re.sub("%", "", value)
++    return float(value)
++
++
+ def validate(config):
+     """
+     Validate the beacon configuration
+@@ -40,6 +49,19 @@ def validate(config):
+     # Configuration for diskusage beacon should be a list of dicts
+     if not isinstance(config, list):
+         return False, "Configuration for diskusage beacon must be a list."
++
++    for mounts in config:
++        if not isinstance(mounts, dict):
++            continue
++        for mount, monitor_usage in mounts.items():
++            if isinstance(monitor_usage, dict) and not (
++                "min" in monitor_usage or "max" in monitor_usage
++            ):
++                return (
++                    False,
++                    "Configuration for diskusage beacon mount {} must "
++                    "specify 'min' and/or 'max'.".format(mount),
++                )
+     return True, "Valid beacon configuration"
+ 
+ 
+@@ -83,6 +105,24 @@ def beacon(config):
+     which means that if a regular expression matches another defined mount point,
+     it will override the previously defined threshold.
+ 
++    A mount can also be given a ``min`` and/or ``max`` threshold instead of a
++    bare percentage. ``max`` behaves exactly like the plain percentage form
++    above, emitting a beacon when usage rises to or above it. ``min`` emits a
++    beacon when usage drops to or below it, which is useful for catching a
++    mount that silently failed and is actually reporting the usage of the
++    (typically much emptier) underlying root filesystem.
++
++    .. code-block:: yaml
++
++        beacons:
++          diskusage:
++            - /: 63%
++            - /mnt/nfs:
++                min: 15%
++                max: 80%
++            - /mnt/other:
++                min: 15%
++
+     """
+     whitelist = []
+     config = salt.utils.beacons.remove_hidden_options(config, whitelist)
+@@ -90,6 +130,18 @@ def beacon(config):
+     ret = []
+     for mounts in config:
+         mount = next(iter(mounts))
++        monitor_usage = mounts[mount]
++
++        if isinstance(monitor_usage, dict):
++            min_usage = (
++                _to_percent(monitor_usage["min"]) if "min" in monitor_usage else None
++            )
++            max_usage = (
++                _to_percent(monitor_usage["max"]) if "max" in monitor_usage else None
++            )
++        else:
++            min_usage = None
++            max_usage = _to_percent(monitor_usage)
+ 
+         # Because we're using regular expressions
+         # if our mount doesn't end with a $, insert one.
+@@ -117,10 +169,10 @@ def beacon(config):
+                     continue
+ 
+                 current_usage = _current_usage.percent
+-                monitor_usage = mounts[mount]
+-                if isinstance(monitor_usage, str) and "%" in monitor_usage:
+-                    monitor_usage = re.sub("%", "", monitor_usage)
+-                monitor_usage = float(monitor_usage)
+-                if current_usage >= monitor_usage:
++                if max_usage is not None and current_usage >= max_usage:
+                     ret.append({"diskusage": current_usage, "mount": _mount})
++                if min_usage is not None and current_usage <= min_usage:
++                    ret.append(
++                        {"diskusage": current_usage, "mount": _mount, "match": "min"}
++                    )
+     return ret
+diff --git a/tests/pytests/unit/beacons/test_diskusage.py b/tests/pytests/unit/beacons/test_diskusage.py
+index 94fff2f..c34a662 100644
+--- a/tests/pytests/unit/beacons/test_diskusage.py
++++ b/tests/pytests/unit/beacons/test_diskusage.py
+@@ -190,6 +190,68 @@ def test_diskusage_windows_lowercase(
+             assert ret == [{"diskusage": 50, "mount": "C:\\"}]
+ 
+ 
++def test_min_config_missing_min_and_max():
++    config = [{"/": {}}]
++
++    ret = diskusage.validate(config)
++    assert ret == (
++        False,
++        "Configuration for diskusage beacon mount / must specify 'min' and/or 'max'.",
++    )
++
++
++def test_min_config_valid():
++    config = [{"/": {"min": "10%"}}]
++
++    ret = diskusage.validate(config)
++    assert ret == (True, "Valid beacon configuration")
++
++
++def test_diskusage_min_match(stub_disk_usage, stub_disk_partition):
++    disk_usage_mock = Mock(side_effect=stub_disk_usage)
++    with patch("salt.utils.platform.is_windows", MagicMock(return_value=False)), patch(
++        "psutil.disk_partitions", MagicMock(return_value=stub_disk_partition)
++    ), patch("psutil.disk_usage", disk_usage_mock):
++        config = [{"/": {"min": "60%"}}]
++
++        ret = diskusage.validate(config)
++        assert ret == (True, "Valid beacon configuration")
++
++        ret = diskusage.beacon(config)
++        assert ret == [{"diskusage": 50, "mount": "/", "match": "min"}]
++
++
++def test_diskusage_min_nomatch(stub_disk_usage, stub_disk_partition):
++    disk_usage_mock = Mock(side_effect=stub_disk_usage)
++    with patch("salt.utils.platform.is_windows", MagicMock(return_value=False)), patch(
++        "psutil.disk_partitions", MagicMock(return_value=stub_disk_partition)
++    ), patch("psutil.disk_usage", disk_usage_mock):
++        config = [{"/": {"min": "10%"}}]
++
++        ret = diskusage.validate(config)
++        assert ret == (True, "Valid beacon configuration")
++
++        ret = diskusage.beacon(config)
++        assert ret == []
++
++
++def test_diskusage_min_and_max(stub_disk_usage, stub_disk_partition):
++    disk_usage_mock = Mock(side_effect=stub_disk_usage)
++    with patch("salt.utils.platform.is_windows", MagicMock(return_value=False)), patch(
++        "psutil.disk_partitions", MagicMock(return_value=stub_disk_partition)
++    ), patch("psutil.disk_usage", disk_usage_mock):
++        config = [{"/": {"min": "60%", "max": "40%"}}]
++
++        ret = diskusage.validate(config)
++        assert ret == (True, "Valid beacon configuration")
++
++        ret = diskusage.beacon(config)
++        assert ret == [
++            {"diskusage": 50, "mount": "/"},
++            {"diskusage": 50, "mount": "/", "match": "min"},
++        ]
++
++
+ def test_diskusage_windows_match_regex(
+     windows_stub_disk_usage, windows_stub_disk_partition
+ ):

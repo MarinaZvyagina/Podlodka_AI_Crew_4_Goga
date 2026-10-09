@@ -1,0 +1,306 @@
+diff --git a/Signal/src/ViewControllers/ThreadSettings/ConversationSettingsViewController+Contents.swift b/Signal/src/ViewControllers/ThreadSettings/ConversationSettingsViewController+Contents.swift
+index 34d698f..6586f0b 100644
+--- a/Signal/src/ViewControllers/ThreadSettings/ConversationSettingsViewController+Contents.swift
++++ b/Signal/src/ViewControllers/ThreadSettings/ConversationSettingsViewController+Contents.swift
+@@ -828,6 +828,30 @@ extension ConversationSettingsViewController {
+             ))
+         }
+ 
++        if !isTerminatedGroup {
++            section.add(OWSTableItem(
++                customCellBlock: { [weak self] in
++                    guard let self else {
++                        owsFailDebug("Missing self")
++                        return OWSTableItem.newCell()
++                    }
++
++                    return OWSTableItem.buildCell(
++                        icon: .contextMenuDelete,
++                        itemName: OWSLocalizedString(
++                            "CONVERSATION_SETTINGS_DELETE_MY_MESSAGES",
++                            comment: "Label for 'delete my messages' action in conversation settings view.",
++                        ),
++                        customColor: UIColor.ows_accentRed,
++                        accessibilityIdentifier: UIView.accessibilityIdentifier(in: self, name: "delete_my_messages"),
++                    )
++                },
++                actionBlock: { [weak self] in
++                    self?.didTapDeleteMyMessages()
++                },
++            ))
++        }
++
+         let hasReportedSpam = SSKEnvironment.shared.databaseStorageRef.read { tx in
+             return InteractionFinder(threadUniqueId: thread.uniqueId).hasUserReportedSpam(transaction: tx)
+         }
+diff --git a/Signal/src/ViewControllers/ThreadSettings/ConversationSettingsViewController.swift b/Signal/src/ViewControllers/ThreadSettings/ConversationSettingsViewController.swift
+index 27ade23..97800f3 100644
+--- a/Signal/src/ViewControllers/ThreadSettings/ConversationSettingsViewController.swift
++++ b/Signal/src/ViewControllers/ThreadSettings/ConversationSettingsViewController.swift
+@@ -749,6 +749,51 @@ class ConversationSettingsViewController: OWSTableViewController2, BadgeCollecti
+         )
+     }
+ 
++    func didTapDeleteMyMessages() {
++        let db = DependenciesBridge.shared.db
++        let threadDeletionManager = DependenciesBridge.shared.threadDeletionManager
++        let tsAccountManager = DependenciesBridge.shared.tsAccountManager
++
++        let thread = self.thread
++        let alert = ActionSheetController(
++            title: nil,
++            message: OWSLocalizedString(
++                "DELETE_MY_MESSAGES_IN_CONVERSATION_ALERT_BODY",
++                comment: "action sheet body for confirming deletion of only the local user's own messages in a conversation",
++            ),
++        )
++        alert.addAction(OWSActionSheets.cancelAction)
++        let deleteTitle = OWSLocalizedString(
++            "DELETE_MY_MESSAGES_IN_CONVERSATION_BUTTON",
++            comment: "button text to delete only the local user's own messages in the current conversation",
++        )
++        alert.addAction(ActionSheetAction(title: deleteTitle, style: .destructive) { [weak self] _ in
++            guard let self else { return }
++            ModalActivityIndicatorViewController.present(
++                fromViewController: self,
++                title: CommonStrings.deletingModal,
++                canCancel: false,
++            ) { [weak self] modal in
++                guard let self else { return }
++
++                await db.awaitableWrite { tx in
++                    let localIdentifiers = tsAccountManager.localIdentifiers(tx: tx).owsFailUnwrap("never registered")
++                    threadDeletionManager.removeAllInteractionsAuthoredByLocalUser(
++                        thread: thread,
++                        localIdentifiers: localIdentifiers,
++                        tx: tx,
++                    )
++                }
++
++                modal.dismiss {
++                    self.reloadThreadAndUpdateContent()
++                }
++            }
++        })
++
++        presentActionSheet(alert)
++    }
++
+     func didTapInternalSettings() {
+         let view = ConversationInternalViewController(thread: thread)
+         navigationController?.pushViewController(view, animated: true)
+diff --git a/Signal/translations/en.lproj/Localizable.strings b/Signal/translations/en.lproj/Localizable.strings
+index c811732..f1bde56 100644
+--- a/Signal/translations/en.lproj/Localizable.strings
++++ b/Signal/translations/en.lproj/Localizable.strings
+@@ -2635,6 +2635,9 @@
+ /* Label for 'delete chat' action in conversation settings view. */
+ "CONVERSATION_SETTINGS_DELETE_CHAT" = "Delete Chat";
+ 
++/* Label for 'delete my messages' action in conversation settings view. */
++"CONVERSATION_SETTINGS_DELETE_MY_MESSAGES" = "Delete My Messages";
++
+ /* Label for 'edit attributes access' action in conversation settings view. */
+ "CONVERSATION_SETTINGS_EDIT_ATTRIBUTES_ACCESS" = "Edit Group Info";
+ 
+@@ -3037,6 +3040,12 @@
+ /* button text */
+ "DELETE_ALL_MESSAGES_IN_CONVERSATION_BUTTON" = "Delete All Messages";
+ 
++/* action sheet body for confirming deletion of only the local user's own messages in a conversation */
++"DELETE_MY_MESSAGES_IN_CONVERSATION_ALERT_BODY" = "Delete all of your messages in this chat? This can’t be undone.";
++
++/* button text to delete only the local user's own messages in the current conversation */
++"DELETE_MY_MESSAGES_IN_CONVERSATION_BUTTON" = "Delete My Messages";
++
+ /* 'Delete' button label on the delete contact confirmation action sheet */
+ "DELETE_CONTACT_ACTION_SHEET_BUTTON" = "Delete";
+ 
+diff --git a/SignalServiceKit/Environment/AppSetup.swift b/SignalServiceKit/Environment/AppSetup.swift
+index 5d89a51..bddfc40 100644
+--- a/SignalServiceKit/Environment/AppSetup.swift
++++ b/SignalServiceKit/Environment/AppSetup.swift
+@@ -951,6 +951,7 @@ extension AppSetup.GlobalsContinuation {
+         )
+ 
+         let threadDeletionManager = ThreadDeletionManagerImpl(
++            callRecordQuerier: callRecordQuerier,
+             db: db,
+             deleteForMeOutgoingSyncMessageManager: deleteForMeOutgoingSyncMessageManager,
+             intentsManager: ThreadDeletionManagerImpl.Wrappers.IntentsManager(),
+diff --git a/SignalServiceKit/Storage/Database/Records/InteractionFinder.swift b/SignalServiceKit/Storage/Database/Records/InteractionFinder.swift
+index 10ddd2a..dc2c4cf 100644
+--- a/SignalServiceKit/Storage/Database/Records/InteractionFinder.swift
++++ b/SignalServiceKit/Storage/Database/Records/InteractionFinder.swift
+@@ -1162,6 +1162,27 @@ public class InteractionFinder: NSObject {
+         return interactions
+     }
+ 
++    /// Fetch all ``TSOutgoingMessage``s covered by this finder.
++    func fetchAllOutgoingInteractions(
++        rowIdFilter: RowIdFilter,
++        limit: Int,
++        tx: DBReadTransaction,
++    ) throws -> [TSInteraction] {
++        var interactions: [TSInteraction] = []
++
++        try buildInteractionCursor(
++            rowIdFilter: rowIdFilter,
++            additionalFiltering: .filterForOutgoingMessages,
++            limit: limit,
++            tx: tx,
++        ).enumerate { interaction -> Bool in
++            interactions.append(interaction)
++            return true
++        }
++
++        return interactions
++    }
++
+     /// Returns a cursor over all ``TSIncomingMessage``s covered by this finder
+     /// that returns its next element in O(1) time.
+     ///
+diff --git a/SignalServiceKit/Threads/ThreadDeletionManager.swift b/SignalServiceKit/Threads/ThreadDeletionManager.swift
+index 96f477e..8c29f40 100644
+--- a/SignalServiceKit/Threads/ThreadDeletionManager.swift
++++ b/SignalServiceKit/Threads/ThreadDeletionManager.swift
+@@ -34,6 +34,17 @@ public protocol ThreadDeletionManager {
+         tx: DBWriteTransaction,
+     )
+ 
++    /// Removes only those messages and calls in the given thread that were
++    /// authored/placed by the local user, leaving other participants'
++    /// interactions untouched. Sends a `DeleteForMe` sync message for the
++    /// removed messages, and a `CallEvent` sync message for each removed
++    /// call, so linked devices reflect the same removal.
++    func removeAllInteractionsAuthoredByLocalUser(
++        thread: TSThread,
++        localIdentifiers: LocalIdentifiers,
++        tx: DBWriteTransaction,
++    )
++
+     func removeIntentsForTerminatedGroup(threadUniqueId: String)
+ }
+ 
+@@ -48,6 +59,7 @@ final class ThreadDeletionManagerImpl: ThreadDeletionManager {
+ 
+     private typealias SyncMessageContext = DeleteForMeSyncMessage.Outgoing.ThreadDeletionContext
+ 
++    private let callRecordQuerier: CallRecordQuerier
+     private let db: any DB
+     private let deleteForMeOutgoingSyncMessageManager: DeleteForMeOutgoingSyncMessageManager
+     private let intentsManager: Shims.IntentsManager
+@@ -61,6 +73,7 @@ final class ThreadDeletionManagerImpl: ThreadDeletionManager {
+     private let logger = PrefixedLogger(prefix: "[ThreadDeleteMgr]")
+ 
+     init(
++        callRecordQuerier: CallRecordQuerier,
+         db: any DB,
+         deleteForMeOutgoingSyncMessageManager: DeleteForMeOutgoingSyncMessageManager,
+         intentsManager: Shims.IntentsManager,
+@@ -71,6 +84,7 @@ final class ThreadDeletionManagerImpl: ThreadDeletionManager {
+         threadRemover: any ThreadRemover,
+         threadReplyInfoStore: ThreadReplyInfoStore,
+     ) {
++        self.callRecordQuerier = callRecordQuerier
+         self.db = db
+         self.deleteForMeOutgoingSyncMessageManager = deleteForMeOutgoingSyncMessageManager
+         self.intentsManager = intentsManager
+@@ -155,10 +169,89 @@ final class ThreadDeletionManagerImpl: ThreadDeletionManager {
+         }
+     }
+ 
++    func removeAllInteractionsAuthoredByLocalUser(
++        thread: TSThread,
++        localIdentifiers: LocalIdentifiers,
++        tx: DBWriteTransaction,
++    ) {
++        removeAllOutgoingMessages(thread: thread, tx: tx)
++        removeAllOutgoingCalls(thread: thread, tx: tx)
++    }
++
+     func removeIntentsForTerminatedGroup(threadUniqueId: String) {
+         intentsManager.deleteAllIntents(withGroupIdentifier: threadUniqueId)
+     }
+ 
++    private func removeAllOutgoingMessages(
++        thread: TSThread,
++        tx: DBWriteTransaction,
++    ) {
++        do {
++            var moreMessagesRemaining = true
++            while moreMessagesRemaining {
++                try autoreleasepool {
++                    let messageBatch = try InteractionFinder(
++                        threadUniqueId: thread.uniqueId,
++                    ).fetchAllOutgoingInteractions(
++                        rowIdFilter: .newest,
++                        limit: Constants.interactionDeletionBatchSize,
++                        tx: tx,
++                    )
++
++                    interactionDeleteManager.delete(
++                        interactions: messageBatch,
++                        sideEffects: .custom(
++                            deleteForMeSyncMessage: .sendSyncMessage(interactionsThread: thread),
++                        ),
++                        tx: tx,
++                    )
++
++                    moreMessagesRemaining = !messageBatch.isEmpty
++                }
++            }
++        } catch {
++            owsFailDebug("Failed to delete batch of locally-authored messages!")
++        }
++    }
++
++    /// Removes calls the local user placed in the given thread.
++    ///
++    /// - Note
++    /// Calls aren't ``TSMessage``s, so they're not covered by the
++    /// `DeleteForMe` sync message sent for outgoing messages; deleting their
++    /// associated ``CallRecord``s instead triggers a `CallEvent` sync
++    /// message, keeping linked devices' call history consistent.
++    private func removeAllOutgoingCalls(
++        thread: TSThread,
++        tx: DBWriteTransaction,
++    ) {
++        guard
++            let threadRowId = thread.sqliteRowId,
++            let cursor = callRecordQuerier.fetchCursor(
++                threadRowId: threadRowId,
++                ordering: .descending,
++                tx: tx,
++            )
++        else { return }
++
++        do {
++            var outgoingCallRecords = [CallRecord]()
++            while let callRecord = try cursor.next() {
++                if callRecord.callDirection == .outgoing {
++                    outgoingCallRecords.append(callRecord)
++                }
++            }
++
++            interactionDeleteManager.delete(
++                alongsideAssociatedCallRecords: outgoingCallRecords,
++                sideEffects: .default(),
++                tx: tx,
++            )
++        } catch {
++            owsFailDebug("Failed to delete batch of locally-placed calls!")
++        }
++    }
++
+     private func deleteThread(
+         _ thread: TSThread,
+         syncMessageContext: SyncMessageContext?,
+@@ -325,6 +418,7 @@ final class _ThreadDeletionManagerImpl_IntentsManager_Wrapper: _ThreadDeletionMa
+ open class MockThreadDeletionManager: ThreadDeletionManager {
+     open func deleteThreads(_ threads: [TSThread], sendDeleteForMeSyncMessage: Bool, updateStorageService: Bool, localIdentifiers: LocalIdentifiers, tx: DBWriteTransaction) {}
+     open func removeAllInteractions(thread: TSThread, deleteForMeSyncMessagePolicy: DeleteForMeSyncMessagePolicy?, tx: DBWriteTransaction) {}
++    open func removeAllInteractionsAuthoredByLocalUser(thread: TSThread, localIdentifiers: LocalIdentifiers, tx: DBWriteTransaction) {}
+     open func removeIntentsForTerminatedGroup(threadUniqueId: String) {}
+ }
+ 

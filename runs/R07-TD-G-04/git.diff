@@ -1,0 +1,294 @@
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/BrowseSourceScreen.kt b/app/src/main/java/eu/kanade/presentation/browse/BrowseSourceScreen.kt
+index a69c9ff..bfc4a50 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/BrowseSourceScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/BrowseSourceScreen.kt
+@@ -48,6 +48,7 @@ fun BrowseSourceContent(
+     onLocalSourceHelpClick: () -> Unit,
+     onMangaClick: (Manga) -> Unit,
+     onMangaLongClick: (Manga) -> Unit,
++    onReload: () -> Unit,
+ ) {
+     val context = LocalContext.current
+ 
+@@ -97,7 +98,10 @@ fun BrowseSourceContent(
+                     EmptyScreenAction(
+                         stringRes = MR.strings.action_retry,
+                         icon = Icons.Outlined.Refresh,
+-                        onClick = mangaList::refresh,
++                        onClick = {
++                            onReload()
++                            mangaList.refresh()
++                        },
+                     ),
+                     EmptyScreenAction(
+                         stringRes = MR.strings.action_open_in_web_view,
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/browse/migration/search/MigrateSourceSearchScreen.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/browse/migration/search/MigrateSourceSearchScreen.kt
+index a451b8f..4fe1779 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/browse/migration/search/MigrateSourceSearchScreen.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/browse/migration/search/MigrateSourceSearchScreen.kt
+@@ -123,6 +123,7 @@ data class MigrateSourceSearchScreen(
+                 onLocalSourceHelpClick = { uriHandler.openUri(LocalSource.HELP_URL) },
+                 onMangaClick = openMigrateDialog,
+                 onMangaLongClick = { navigator.push(MangaScreen(it.id, true)) },
++                onReload = viewModel::refresh,
+             )
+         }
+ 
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceScreen.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceScreen.kt
+index 0770e60..d4529cc 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceScreen.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceScreen.kt
+@@ -236,6 +236,7 @@ data class BrowseSourceScreen(
+                         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                     }
+                 },
++                onReload = viewModel::refresh,
+             )
+         }
+ 
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceViewModel.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceViewModel.kt
+index 7b46f1a..9e43c54 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceViewModel.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceViewModel.kt
+@@ -142,6 +142,14 @@ class BrowseSourceViewModel(
+         return if (columns == 0) GridCells.Adaptive(128.dp) else GridCells.Fixed(columns)
+     }
+ 
++    /**
++     * Forces the current listing to bypass the cache and re-fetch from the network.
++     */
++    fun refresh() {
++        val listing = state.value.listing
++        getRemoteManga.invalidate(sourceId, listing.query ?: "", listing.filters)
++    }
++
+     fun resetFilters() {
+         state.update { it.copy(filters = source.getFilterList()) }
+     }
+diff --git a/data/src/main/java/tachiyomi/data/source/SourcePagingCache.kt b/data/src/main/java/tachiyomi/data/source/SourcePagingCache.kt
+new file mode 100644
+index 0000000..0bc8901
+--- /dev/null
++++ b/data/src/main/java/tachiyomi/data/source/SourcePagingCache.kt
+@@ -0,0 +1,54 @@
++package tachiyomi.data.source
++
++import dev.zacsweers.metro.AppScope
++import dev.zacsweers.metro.Inject
++import dev.zacsweers.metro.SingleIn
++import eu.kanade.tachiyomi.source.model.MangasPage
++import java.util.concurrent.ConcurrentHashMap
++import kotlin.time.Clock
++import kotlin.time.Duration.Companion.minutes
++import kotlin.time.Instant
++
++/**
++ * In-memory cache of source listing results (popular/latest/search), so that repeating the same
++ * listing shortly after fetching it (e.g. navigating back, or re-running the same search) does
++ * not hit the network again. Entries expire after [EXPIRY] and can be force-invalidated to make
++ * the next request bypass the cache.
++ */
++@Inject
++@SingleIn(AppScope::class)
++class SourcePagingCache {
++
++    data class Listing(val sourceId: Long, val mode: String, val query: String, val filtersHash: Int)
++
++    private data class PageKey(val listing: Listing, val page: Int)
++    private class Entry(val mangasPage: MangasPage, val savedAt: Instant)
++
++    private val entries = ConcurrentHashMap<PageKey, Entry>()
++
++    suspend fun getOrPut(listing: Listing, page: Int, fetch: suspend () -> MangasPage): MangasPage {
++        val key = PageKey(listing, page)
++        val cached = entries[key]
++        if (cached != null && Clock.System.now() - cached.savedAt < EXPIRY) {
++            return cached.mangasPage
++        }
++
++        val mangasPage = fetch()
++        entries[key] = Entry(mangasPage, Clock.System.now())
++        evictExpired()
++        return mangasPage
++    }
++
++    fun invalidate(listing: Listing) {
++        entries.keys.removeAll { it.listing == listing }
++    }
++
++    private fun evictExpired() {
++        val now = Clock.System.now()
++        entries.entries.removeAll { now - it.value.savedAt >= EXPIRY }
++    }
++
++    companion object {
++        private val EXPIRY = 5.minutes
++    }
++}
+diff --git a/data/src/main/java/tachiyomi/data/source/SourcePagingSource.kt b/data/src/main/java/tachiyomi/data/source/SourcePagingSource.kt
+index bc9ea3f..dce7cf8 100644
+--- a/data/src/main/java/tachiyomi/data/source/SourcePagingSource.kt
++++ b/data/src/main/java/tachiyomi/data/source/SourcePagingSource.kt
+@@ -15,37 +15,58 @@ class SourceSearchPagingSource(
+     private val query: String,
+     private val filters: FilterList,
+     networkToLocalManga: NetworkToLocalManga,
+-) : BaseSourcePagingSource(source, networkToLocalManga) {
++    pagingCache: SourcePagingCache,
++) : BaseSourcePagingSource(source, networkToLocalManga, pagingCache) {
++    override val listing = SourcePagingCache.Listing(source.id, MODE_SEARCH, query, filters.list.hashCode())
+     override suspend fun requestNextPage(currentPage: Int): MangasPage {
+         return source.getSearchManga(currentPage, query, filters)
+     }
++
++    companion object {
++        const val MODE_SEARCH = "search"
++    }
+ }
+ 
+ class SourcePopularPagingSource(
+     source: Source,
+     networkToLocalManga: NetworkToLocalManga,
+-) : BaseSourcePagingSource(source, networkToLocalManga) {
++    pagingCache: SourcePagingCache,
++) : BaseSourcePagingSource(source, networkToLocalManga, pagingCache) {
++    override val listing = SourcePagingCache.Listing(source.id, MODE_POPULAR, "", 0)
+     override suspend fun requestNextPage(currentPage: Int): MangasPage {
+         return source.getPopularManga(currentPage)
+     }
++
++    companion object {
++        const val MODE_POPULAR = "popular"
++    }
+ }
+ 
+ class SourceLatestPagingSource(
+     source: Source,
+     networkToLocalManga: NetworkToLocalManga,
+-) : BaseSourcePagingSource(source, networkToLocalManga) {
++    pagingCache: SourcePagingCache,
++) : BaseSourcePagingSource(source, networkToLocalManga, pagingCache) {
++    override val listing = SourcePagingCache.Listing(source.id, MODE_LATEST, "", 0)
+     override suspend fun requestNextPage(currentPage: Int): MangasPage {
+         return source.getLatestUpdates(currentPage)
+     }
++
++    companion object {
++        const val MODE_LATEST = "latest"
++    }
+ }
+ 
+ abstract class BaseSourcePagingSource(
+     protected val source: Source,
+     private val networkToLocalManga: NetworkToLocalManga,
++    private val pagingCache: SourcePagingCache,
+ ) : SourcePagingSource() {
+ 
+     private val seenManga = hashSetOf<String>()
+ 
++    protected abstract val listing: SourcePagingCache.Listing
++
+     abstract suspend fun requestNextPage(currentPage: Int): MangasPage
+ 
+     override suspend fun load(params: LoadParams<Long>): LoadResult<Long, Manga> {
+@@ -53,7 +74,7 @@ abstract class BaseSourcePagingSource(
+ 
+         return try {
+             val mangasPage = withIOContext {
+-                requestNextPage(page.toInt())
++                pagingCache.getOrPut(listing, page.toInt()) { requestNextPage(page.toInt()) }
+                     .takeIf { it.mangas.isNotEmpty() }
+                     ?: throw NoResultsException()
+             }
+diff --git a/data/src/main/java/tachiyomi/data/source/SourceRepositoryImpl.kt b/data/src/main/java/tachiyomi/data/source/SourceRepositoryImpl.kt
+index f6c88b2..7b072c8 100644
+--- a/data/src/main/java/tachiyomi/data/source/SourceRepositoryImpl.kt
++++ b/data/src/main/java/tachiyomi/data/source/SourceRepositoryImpl.kt
+@@ -27,6 +27,7 @@ class SourceRepositoryImpl(
+     private val sourceManager: SourceManager,
+     private val database: Database,
+     private val networkToLocalManga: NetworkToLocalManga,
++    private val pagingCache: SourcePagingCache,
+ ) : SourceRepository {
+ 
+     override fun getSources(): Flow<List<DomainSource>> {
+@@ -85,15 +86,39 @@ class SourceRepositoryImpl(
+         query: String,
+         filterList: FilterList,
+     ): SourcePagingSource {
+-        return SourceSearchPagingSource(sourceManager.getOrStub(sourceId), query, filterList, networkToLocalManga)
++        return SourceSearchPagingSource(
++            sourceManager.getOrStub(sourceId),
++            query,
++            filterList,
++            networkToLocalManga,
++            pagingCache,
++        )
+     }
+ 
+     override fun getPopular(sourceId: Long): SourcePagingSource {
+-        return SourcePopularPagingSource(sourceManager.getOrStub(sourceId), networkToLocalManga)
++        return SourcePopularPagingSource(sourceManager.getOrStub(sourceId), networkToLocalManga, pagingCache)
+     }
+ 
+     override fun getLatest(sourceId: Long): SourcePagingSource {
+-        return SourceLatestPagingSource(sourceManager.getOrStub(sourceId), networkToLocalManga)
++        return SourceLatestPagingSource(sourceManager.getOrStub(sourceId), networkToLocalManga, pagingCache)
++    }
++
++    override fun invalidateSearchCache(sourceId: Long, query: String, filterList: FilterList) {
++        val listing = SourcePagingCache.Listing(
++            sourceId,
++            SourceSearchPagingSource.MODE_SEARCH,
++            query,
++            filterList.list.hashCode(),
++        )
++        pagingCache.invalidate(listing)
++    }
++
++    override fun invalidatePopularCache(sourceId: Long) {
++        pagingCache.invalidate(SourcePagingCache.Listing(sourceId, SourcePopularPagingSource.MODE_POPULAR, "", 0))
++    }
++
++    override fun invalidateLatestCache(sourceId: Long) {
++        pagingCache.invalidate(SourcePagingCache.Listing(sourceId, SourceLatestPagingSource.MODE_LATEST, "", 0))
+     }
+ 
+     private fun mapSourceToDomainSource(source: Source): DomainSource = DomainSource(
+diff --git a/domain/src/main/java/tachiyomi/domain/source/interactor/GetRemoteManga.kt b/domain/src/main/java/tachiyomi/domain/source/interactor/GetRemoteManga.kt
+index 772fd6b..0471d66 100644
+--- a/domain/src/main/java/tachiyomi/domain/source/interactor/GetRemoteManga.kt
++++ b/domain/src/main/java/tachiyomi/domain/source/interactor/GetRemoteManga.kt
+@@ -18,6 +18,17 @@ class GetRemoteManga(
+         }
+     }
+ 
++    /**
++     * Forces the next request for the given listing to bypass the cache and hit the network.
++     */
++    fun invalidate(sourceId: Long, query: String, filterList: FilterList) {
++        when (query) {
++            QUERY_POPULAR -> repository.invalidatePopularCache(sourceId)
++            QUERY_LATEST -> repository.invalidateLatestCache(sourceId)
++            else -> repository.invalidateSearchCache(sourceId, query, filterList)
++        }
++    }
++
+     companion object {
+         const val QUERY_POPULAR = "eu.kanade.domain.source.interactor.POPULAR"
+         const val QUERY_LATEST = "eu.kanade.domain.source.interactor.LATEST"
+diff --git a/domain/src/main/java/tachiyomi/domain/source/repository/SourceRepository.kt b/domain/src/main/java/tachiyomi/domain/source/repository/SourceRepository.kt
+index e10e72d..1477d16 100644
+--- a/domain/src/main/java/tachiyomi/domain/source/repository/SourceRepository.kt
++++ b/domain/src/main/java/tachiyomi/domain/source/repository/SourceRepository.kt
+@@ -24,4 +24,10 @@ interface SourceRepository {
+     fun getPopular(sourceId: Long): SourcePagingSource
+ 
+     fun getLatest(sourceId: Long): SourcePagingSource
++
++    fun invalidateSearchCache(sourceId: Long, query: String, filterList: FilterList)
++
++    fun invalidatePopularCache(sourceId: Long)
++
++    fun invalidateLatestCache(sourceId: Long)
+ }

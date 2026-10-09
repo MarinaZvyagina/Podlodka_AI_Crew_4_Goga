@@ -1,0 +1,134 @@
+diff --git a/docs/strategy-customization.md b/docs/strategy-customization.md
+index 294d220..b672818 100644
+--- a/docs/strategy-customization.md
++++ b/docs/strategy-customization.md
+@@ -926,6 +926,9 @@ if self.dp.runmode.value in ('live', 'dry_run'):
+ !!! Warning "Warning about backtesting"
+     This method will always return up-to-date / real-time values. As such, usage during backtesting / hyperopt without runmode checks will lead to wrong results, e.g. your whole dataframe will contain the same single value in all rows.
+ 
++!!! Note
++    To avoid hammering the exchange when the same pair's ticker is requested multiple times in quick succession (e.g. from different callbacks within the same iteration), results are cached for a few seconds. Only live/dry-run is affected - backtesting and hyperopt don't call this method.
++
+ ### *check_delisting(pair)*
+ 
+ Return Datetime of the pair delisting schedule if any, otherwise return None
+diff --git a/freqtrade/data/dataprovider.py b/freqtrade/data/dataprovider.py
+index ed396ba..644ef3b 100644
+--- a/freqtrade/data/dataprovider.py
++++ b/freqtrade/data/dataprovider.py
+@@ -8,6 +8,7 @@ Common Interface for bot and strategy to access data.
+ import logging
+ from collections import deque
+ from datetime import UTC, datetime
++from threading import Lock
+ from typing import Any
+ 
+ from pandas import DataFrame, Timedelta, Timestamp, to_timedelta
+@@ -27,13 +28,16 @@ from freqtrade.exchange.exchange_types import FundingRate, OrderBook
+ from freqtrade.misc import append_candles_to_dataframe
+ from freqtrade.rpc import RPCManager
+ from freqtrade.rpc.rpc_types import RPCAnalyzedDFMsg
+-from freqtrade.util import PeriodicCache
++from freqtrade.util import FtTTLCache, PeriodicCache
+ 
+ 
+ logger = logging.getLogger(__name__)
+ 
+ NO_EXCHANGE_EXCEPTION = "Exchange is not available to DataProvider."
+ MAX_DATAFRAME_CANDLES = 1000
++# Ticker cache lifetime - long enough to avoid duplicate exchange calls for the
++# same pair within a single processing iteration, short enough to stay fresh.
++TICKER_CACHE_TTL = 2
+ 
+ 
+ class DataProvider:
+@@ -66,6 +70,9 @@ class DataProvider:
+             maxsize=1000, ttl=timeframe_to_seconds(self._default_timeframe)
+         )
+ 
++        self.__ticker_cache_lock = Lock()
++        self.__ticker_cache: FtTTLCache = FtTTLCache(maxsize=1000, ttl=TICKER_CACHE_TTL)
++
+         self.producers = self._config.get("external_message_consumer", {}).get("producers", [])
+         self.external_data_enabled = len(self.producers) > 0
+ 
+@@ -565,16 +572,26 @@ class DataProvider:
+     def ticker(self, pair: str):
+         """
+         Return last ticker data from exchange
++        Uses a short-lived cache so repeated calls for the same pair within a few
++        seconds (e.g. from different strategy callbacks in the same iteration) don't
++        each trigger a separate network request.
+         Warning: Performs a network request - so use with common sense.
+         :param pair: Pair to get the data for
+         :return: Ticker dict from exchange or empty dict if ticker is not available for the pair
+         """
+         if self._exchange is None:
+             raise OperationalException(NO_EXCHANGE_EXCEPTION)
++        with self.__ticker_cache_lock:
++            cached_ticker = self.__ticker_cache.get(pair)
++        if cached_ticker is not None:
++            return cached_ticker
+         try:
+-            return self._exchange.fetch_ticker(pair)
++            ticker = self._exchange.fetch_ticker(pair)
+         except ExchangeError:
+             return {}
++        with self.__ticker_cache_lock:
++            self.__ticker_cache[pair] = ticker
++        return ticker
+ 
+     def orderbook(self, pair: str, maximum: int) -> OrderBook:
+         """
+diff --git a/tests/data/test_dataprovider.py b/tests/data/test_dataprovider.py
+index 7d9773a..f23b243 100644
+--- a/tests/data/test_dataprovider.py
++++ b/tests/data/test_dataprovider.py
+@@ -1,4 +1,4 @@
+-from datetime import UTC, datetime
++from datetime import UTC, datetime, timedelta
+ from unittest.mock import MagicMock
+ 
+ import pytest
+@@ -391,6 +391,41 @@ def test_ticker(mocker, default_conf, tickers):
+     assert res == {}
+ 
+ 
++def test_ticker_cache(mocker, default_conf, tickers, time_machine):
++    start_dt = datetime.now(UTC)
++    time_machine.move_to(start_dt, tick=False)
++
++    ticker_mock = MagicMock(return_value=tickers()["ETH/BTC"])
++    mocker.patch(f"{EXMS}.fetch_ticker", ticker_mock)
++    exchange = get_patched_exchange(mocker, default_conf)
++    dp = DataProvider(default_conf, exchange)
++
++    res = dp.ticker("ETH/BTC")
++    assert res["symbol"] == "ETH/BTC"
++    assert ticker_mock.call_count == 1
++
++    # Requesting again within the cache window must not hit the exchange again.
++    res = dp.ticker("ETH/BTC")
++    assert res["symbol"] == "ETH/BTC"
++    assert ticker_mock.call_count == 1
++
++    # A different pair is not affected by the cache for "ETH/BTC".
++    dp.ticker("BTC/USDT")
++    assert ticker_mock.call_count == 2
++
++    # Once the cache expires, the ticker is fetched again.
++    time_machine.move_to(start_dt + timedelta(seconds=5), tick=False)
++    dp.ticker("ETH/BTC")
++    assert ticker_mock.call_count == 3
++
++    # A failed fetch must not be cached - the next call should retry.
++    ticker_mock.reset_mock()
++    ticker_mock.side_effect = ExchangeError("Pair not found")
++    assert dp.ticker("XRP/USDT") == {}
++    assert dp.ticker("XRP/USDT") == {}
++    assert ticker_mock.call_count == 2
++
++
+ def test_current_whitelist(mocker, default_conf, tickers):
+     # patch default conf to volumepairlist
+     default_conf["pairlists"][0] = {"method": "VolumePairList", "number_assets": 5}

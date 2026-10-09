@@ -1,0 +1,348 @@
+diff --git a/server/etcdserver/server.go b/server/etcdserver/server.go
+index ac782a8..0884f05 100644
+--- a/server/etcdserver/server.go
++++ b/server/etcdserver/server.go
+@@ -62,6 +62,7 @@ import (
+ 	"go.etcd.io/etcd/server/v3/etcdserver/cindex"
+ 	"go.etcd.io/etcd/server/v3/etcdserver/errors"
+ 	"go.etcd.io/etcd/server/v3/etcdserver/read"
++	"go.etcd.io/etcd/server/v3/etcdserver/txn"
+ 	serverversion "go.etcd.io/etcd/server/v3/etcdserver/version"
+ 	"go.etcd.io/etcd/server/v3/features"
+ 	"go.etcd.io/etcd/server/v3/lease"
+@@ -252,6 +253,7 @@ type EtcdServer struct {
+ 	applyWait wait.WaitTime
+ 
+ 	kv         mvcc.WatchableKV
++	readCache  *txn.RangeCache
+ 	lessor     lease.Lessor
+ 	bemu       sync.RWMutex
+ 	be         backend.Backend
+@@ -368,6 +370,7 @@ func NewServer(cfg config.ServerConfig) (srv *EtcdServer, err error) {
+ 		CompactionSleepInterval: cfg.CompactionSleepInterval,
+ 	}
+ 	srv.kv = mvcc.New(srv.Logger(), srv.be, srv.lessor, mvccStoreConfig)
++	srv.readCache = txn.NewRangeCache(txn.DefaultRangeCacheEntries)
+ 	srv.corruptionChecker = newCorruptionChecker(cfg.Logger, srv, srv.kv.HashStorage())
+ 
+ 	srv.authStore = auth.NewAuthStore(srv.Logger(), schema.NewAuthBackend(srv.Logger(), srv.be), tp, int(cfg.BcryptCost))
+@@ -575,6 +578,11 @@ func (s *EtcdServer) start() {
+ 	s.ctx, s.cancel = context.WithCancel(context.Background())
+ 	s.read = read.NewRead(s, &s.r)
+ 	s.leaderChanged = notify.NewNotifier()
++	if s.readCache == nil {
++		// Tests that build an *EtcdServer by hand, bypassing NewServer,
++		// otherwise reach the read-cache wiring below with a nil cache.
++		s.readCache = txn.NewRangeCache(txn.DefaultRangeCacheEntries)
++	}
+ 	if s.ClusterVersion() != nil {
+ 		lg.Info(
+ 			"starting etcd server",
+@@ -1064,6 +1072,9 @@ func (s *EtcdServer) applySnapshot(ep *etcdProgress, toApply *toApply) {
+ 	if err := s.kv.Restore(newbe); err != nil {
+ 		lg.Panic("failed to restore mvcc store", zap.Error(err))
+ 	}
++	// Reads are not blocked on bemu, so drop the read cache as soon as the
++	// restored data is visible rather than waiting for NewUberApplier below.
++	s.readCache.Reset(s.kv.Rev())
+ 
+ 	newbe.SetTxPostLockInsideApplyHook(s.getTxPostLockInsideApplyHook())
+ 
+@@ -1139,6 +1150,15 @@ func (s *EtcdServer) applySnapshot(ep *etcdProgress, toApply *toApply) {
+ }
+ 
+ func (s *EtcdServer) NewUberApplier() apply.UberApplier {
++	// The read cache only knows how to invalidate itself against writes
++	// applied through the change hook below; a wholesale store rebuild
++	// (startup, or the restore below) must instead be reflected by
++	// dropping every entry and re-anchoring to the store's current
++	// revision, since old entries may not correspond to the same data
++	// even if the revision number happens to coincide.
++	s.readCache.Reset(s.KV().Rev())
++	s.KV().SetChangeHook(s.readCache.OnChange)
++
+ 	opts := apply.ApplierOptions{
+ 		Logger:                       s.lg,
+ 		KV:                           s.KV(),
+diff --git a/server/etcdserver/txn/rangecache.go b/server/etcdserver/txn/rangecache.go
+new file mode 100644
+index 0000000..3e7d853
+--- /dev/null
++++ b/server/etcdserver/txn/rangecache.go
+@@ -0,0 +1,187 @@
++// Copyright 2026 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package txn
++
++import (
++	"sync"
++
++	"github.com/prometheus/client_golang/prometheus"
++	"google.golang.org/protobuf/proto"
++	"k8s.io/utils/lru"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/api/v3/mvccpb"
++	"go.etcd.io/etcd/pkg/v3/adt"
++)
++
++// DefaultRangeCacheEntries bounds how many distinct RangeRequests a
++// RangeCache remembers at once.
++const DefaultRangeCacheEntries = 2048
++
++// RangeCache memoizes RangeResponses for RangeRequests that ask for the
++// current state of the store (Revision == 0), so that bursts of identical
++// reads -- e.g. many replicas polling the same keys at startup, or on a
++// timer -- don't each have to redo the underlying index/backend scan.
++//
++// A cached entry is only ever handed back while it still reflects the live
++// store. OnChange must be wired to fire synchronously, in revision order,
++// for every write the store commits (including lease-expiry deletes),
++// before that write's revision becomes visible to new read transactions --
++// see mvcc.Watchable.SetChangeHook. Add only admits a response that is
++// still current, as of that same call under the cache's own lock, so a
++// response racing a concurrent write is simply left uncached rather than
++// risking a stale hit; the next repeated read just misses and recomputes.
++// Reset must be called whenever the underlying store is replaced or
++// rebuilt wholesale (startup, snapshot restore), since previously cached
++// entries may no longer correspond to the same data even if the revision
++// number happens to coincide.
++//
++// RangeCache is safe for concurrent use.
++type RangeCache struct {
++	mu         sync.Mutex
++	maxEntries int
++	lru        *lru.Cache
++	// spans indexes cached entries by the key range their RangeRequest
++	// covers, so that a write to a single key can invalidate every cached
++	// response whose range contains it without scanning the whole cache.
++	spans adt.IntervalTree
++	// rev is the revision as of the most recently processed write (or the
++	// revision passed to the last Reset). A response is only cached, or
++	// served from cache, while its own revision still equals rev.
++	rev int64
++}
++
++// NewRangeCache returns an empty RangeCache that admits up to maxEntries
++// responses at a time.
++func NewRangeCache(maxEntries int) *RangeCache {
++	c := &RangeCache{maxEntries: maxEntries}
++	c.Reset(0)
++	return c
++}
++
++// Reset drops every cached entry and re-anchors the cache to rev, the
++// current store revision.
++func (c *RangeCache) Reset(rev int64) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.lru = lru.New(c.maxEntries)
++	c.spans = adt.NewIntervalTree()
++	c.rev = rev
++}
++
++// Get returns the cached response for req, if any. A request pinned to a
++// specific historical revision (Revision != 0) always misses; it is left
++// to the normal read path since RangeCache only tracks the current state
++// of the store.
++func (c *RangeCache) Get(req *pb.RangeRequest) (*pb.RangeResponse, bool) {
++	if req.Revision != 0 {
++		return nil, false
++	}
++	key := rangeCacheKey(req)
++
++	c.mu.Lock()
++	v, ok := c.lru.Get(key)
++	c.mu.Unlock()
++	if !ok {
++		rangeCacheMisses.Inc()
++		return nil, false
++	}
++	rangeCacheHits.Inc()
++	return proto.Clone(v.(*pb.RangeResponse)).(*pb.RangeResponse), true
++}
++
++// Add caches resp as the answer for req, provided resp still reflects the
++// live store, i.e. nothing has changed the cache's notion of the current
++// revision since resp was computed.
++func (c *RangeCache) Add(req *pb.RangeRequest, resp *pb.RangeResponse) {
++	if req.Revision != 0 || resp.GetHeader() == nil {
++		return
++	}
++	key := rangeCacheKey(req)
++
++	var span adt.Interval
++	if len(req.RangeEnd) != 0 {
++		span = adt.NewBytesAffineInterval(req.Key, req.RangeEnd)
++	} else {
++		span = adt.NewBytesAffinePoint(req.Key)
++	}
++
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if resp.Header.Revision != c.rev {
++		// A write raced with the read that produced resp: it may already
++		// be stale relative to the store, so don't risk caching it.
++		return
++	}
++	c.lru.Add(key, proto.Clone(resp))
++	if iv := c.spans.Find(span); iv != nil {
++		iv.Val.(map[string]struct{})[key] = struct{}{}
++	} else {
++		c.spans.Insert(span, map[string]struct{}{key: {}})
++	}
++}
++
++// OnChange is an mvcc.ChangeHook. It advances the cache's notion of the
++// current revision and evicts every cached entry whose range contains a
++// changed key.
++func (c *RangeCache) OnChange(rev int64, changes []*mvccpb.KeyValue) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.rev = rev
++	for _, kv := range changes {
++		hits := c.spans.Stab(adt.NewBytesAffinePoint(kv.Key))
++		for _, iv := range hits {
++			for key := range iv.Val.(map[string]struct{}) {
++				c.lru.Remove(key)
++			}
++		}
++		for _, iv := range hits {
++			c.spans.Delete(iv.Ivl)
++		}
++	}
++}
++
++// rangeCacheKey returns a canonical key for req covering only the
++// parameters that can change its answer, so that a serializable and a
++// linearizable request for the same range share a cache entry.
++func rangeCacheKey(req *pb.RangeRequest) string {
++	norm := proto.Clone(req).(*pb.RangeRequest)
++	norm.Serializable = false
++	b, err := proto.Marshal(norm)
++	if err != nil {
++		panic(err)
++	}
++	return string(b)
++}
++
++var (
++	rangeCacheHits = prometheus.NewCounter(prometheus.CounterOpts{
++		Namespace: "etcd",
++		Subsystem: "server",
++		Name:      "range_cache_hits_total",
++		Help:      "The total number of Range requests served from the read cache.",
++	})
++	rangeCacheMisses = prometheus.NewCounter(prometheus.CounterOpts{
++		Namespace: "etcd",
++		Subsystem: "server",
++		Name:      "range_cache_misses_total",
++		Help:      "The total number of Range requests not served from the read cache.",
++	})
++)
++
++func init() {
++	prometheus.MustRegister(rangeCacheHits)
++	prometheus.MustRegister(rangeCacheMisses)
++}
+diff --git a/server/etcdserver/v3_server.go b/server/etcdserver/v3_server.go
+index a357705..88decd0 100644
+--- a/server/etcdserver/v3_server.go
++++ b/server/etcdserver/v3_server.go
+@@ -146,7 +146,16 @@ func (s *EtcdServer) Range(ctx context.Context, r *pb.RangeRequest) (*pb.RangeRe
+ 		return s.authStore.IsRangePermitted(ai, r.Key, r.RangeEnd)
+ 	}
+ 
+-	get := func() { resp, _, err = txn.Range(ctx, s.Logger(), s.KV(), r, true) }
++	get := func() {
++		if cached, ok := s.readCache.Get(r); ok {
++			resp, err = cached, nil
++			return
++		}
++		resp, _, err = txn.Range(ctx, s.Logger(), s.KV(), r, true)
++		if err == nil {
++			s.readCache.Add(r, resp)
++		}
++	}
+ 	if serr := s.doSerialize(ctx, chk, get); serr != nil {
+ 		err = serr
+ 		return nil, err
+diff --git a/server/storage/mvcc/kv.go b/server/storage/mvcc/kv.go
+index 4162027..99de467 100644
+--- a/server/storage/mvcc/kv.go
++++ b/server/storage/mvcc/kv.go
+@@ -146,4 +146,17 @@ type Watchable interface {
+ 	// NewWatchStream returns a WatchStream that can be used to
+ 	// watch events happened or happening on the KV.
+ 	NewWatchStream() WatchStream
++
++	// SetChangeHook registers a callback that is invoked synchronously,
++	// once per committed write (including lease-expiry deletes), with the
++	// write's new revision and the exact key-value changes it produced.
++	// The hook runs before that write's revision becomes visible to new
++	// read transactions, and writes are never concurrent with each other,
++	// so the hook observes every write exactly once, in revision order.
++	// Registering a hook replaces any previously registered one; passing
++	// nil disables the hook.
++	SetChangeHook(hook ChangeHook)
+ }
++
++// ChangeHook is the callback type accepted by Watchable.SetChangeHook.
++type ChangeHook func(rev int64, changes []*mvccpb.KeyValue)
+diff --git a/server/storage/mvcc/watchable_store.go b/server/storage/mvcc/watchable_store.go
+index 7d2e5b6..3df208b 100644
+--- a/server/storage/mvcc/watchable_store.go
++++ b/server/storage/mvcc/watchable_store.go
+@@ -60,6 +60,10 @@ type watchableStore struct {
+ 	// before locking store.mu to avoid deadlock.
+ 	mu sync.RWMutex
+ 
++	// changeHook, if set, is invoked for every write this store commits;
++	// see Watchable.SetChangeHook. Guarded by mu.
++	changeHook ChangeHook
++
+ 	// victims are watcher batches that were blocked on the watch channel
+ 	victims []watcherBatch
+ 	victimc chan struct{}
+@@ -115,6 +119,12 @@ func (s *watchableStore) Close() error {
+ 	return s.store.Close()
+ }
+ 
++func (s *watchableStore) SetChangeHook(hook ChangeHook) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	s.changeHook = hook
++}
++
+ func (s *watchableStore) NewWatchStream() WatchStream {
+ 	watchStreamGauge.Inc()
+ 	return &watchStream{
+diff --git a/server/storage/mvcc/watchable_store_txn.go b/server/storage/mvcc/watchable_store_txn.go
+index 42eb6ca..943cf51 100644
+--- a/server/storage/mvcc/watchable_store_txn.go
++++ b/server/storage/mvcc/watchable_store_txn.go
+@@ -41,6 +41,12 @@ func (tw *watchableStoreTxnWrite) End() {
+ 	// end write txn under watchable store lock so the updates are visible
+ 	// when asynchronous event posting checks the current store revision
+ 	tw.s.mu.Lock()
++	if tw.s.changeHook != nil {
++		// Fire before TxnWrite.End() bumps the store's current revision, so
++		// that the hook's view of "as of" a revision is never behind what a
++		// concurrent reader can observe once that revision becomes visible.
++		tw.s.changeHook(rev, changes)
++	}
+ 	tw.s.notify(rev, evs)
+ 	tw.TxnWrite.End()
+ 	tw.s.mu.Unlock()

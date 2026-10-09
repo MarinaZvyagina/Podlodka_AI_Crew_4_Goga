@@ -1,0 +1,177 @@
+diff --git a/server/etcdserver/api/v3rpc/audit.go b/server/etcdserver/api/v3rpc/audit.go
+new file mode 100644
+index 000000000..ebc760a26
+--- /dev/null
++++ b/server/etcdserver/api/v3rpc/audit.go
+@@ -0,0 +1,159 @@
++// Copyright 2026 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package v3rpc
++
++import (
++	"context"
++	"time"
++
++	"go.uber.org/zap"
++	"google.golang.org/grpc"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/server/v3/etcdserver"
++)
++
++// auditOperation identifies the kind of key-value operation being audited.
++type auditOperation string
++
++const (
++	auditOperationRead        auditOperation = "read"
++	auditOperationWrite       auditOperation = "write"
++	auditOperationDelete      auditOperation = "delete"
++	auditOperationTransaction auditOperation = "transaction"
++)
++
++// auditKeyRange describes a single key, or key range when RangeEnd is set,
++// touched by an audited request.
++type auditKeyRange struct {
++	Key      []byte
++	RangeEnd []byte
++}
++
++// newAuditUnaryInterceptor returns a gRPC unary interceptor that emits a
++// uniform audit record for every key-value read, write, delete, and
++// transaction request handled by the server.
++//
++// Requests are classified by inspecting the request message type at the
++// interceptor level rather than from within individual RPC handlers, so any
++// KV request type - present today or added later - is covered automatically
++// without relying on per-handler instrumentation.
++func newAuditUnaryInterceptor(s *etcdserver.EtcdServer) grpc.UnaryServerInterceptor {
++	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
++		op, keyRanges, ok := classifyKVRequest(req)
++		if !ok {
++			return handler(ctx, req)
++		}
++
++		startTime := time.Now()
++		resp, err := handler(ctx, req)
++		duration := time.Since(startTime)
++
++		if lg := s.Logger(); lg != nil {
++			outcome := "success"
++			if err != nil {
++				outcome = "failure"
++			}
++			lg.Info("audit",
++				zap.String("identity", auditIdentity(ctx, s)),
++				zap.String("operation", string(op)),
++				zap.Strings("keys", auditKeyRangeStrings(keyRanges)),
++				zap.Duration("duration", duration),
++				zap.String("outcome", outcome),
++			)
++		}
++
++		return resp, err
++	}
++}
++
++// auditIdentity returns the caller identity established by the auth store
++// for ctx, or "unauthenticated" if authentication is disabled or no
++// identity could be established.
++func auditIdentity(ctx context.Context, s *etcdserver.EtcdServer) string {
++	as := s.AuthStore()
++	if as == nil {
++		return "unauthenticated"
++	}
++	authInfo, err := as.AuthInfoFromCtx(ctx)
++	if err != nil || authInfo == nil || authInfo.Username == "" {
++		return "unauthenticated"
++	}
++	return authInfo.Username
++}
++
++// classifyKVRequest reports the audit operation kind and the key ranges
++// touched by req, and whether req is a key-value request that should be
++// audited at all.
++func classifyKVRequest(req any) (auditOperation, []auditKeyRange, bool) {
++	switch r := req.(type) {
++	case *pb.RangeRequest:
++		return auditOperationRead, []auditKeyRange{{Key: r.GetKey(), RangeEnd: r.GetRangeEnd()}}, true
++	case *pb.PutRequest:
++		return auditOperationWrite, []auditKeyRange{{Key: r.GetKey()}}, true
++	case *pb.DeleteRangeRequest:
++		return auditOperationDelete, []auditKeyRange{{Key: r.GetKey(), RangeEnd: r.GetRangeEnd()}}, true
++	case *pb.TxnRequest:
++		return auditOperationTransaction, txnKeyRanges(r), true
++	default:
++		return "", nil, false
++	}
++}
++
++// txnKeyRanges collects every key range referenced by a transaction's
++// comparisons and by its success/failure request lists, recursing into any
++// nested transactions.
++func txnKeyRanges(txn *pb.TxnRequest) []auditKeyRange {
++	var keyRanges []auditKeyRange
++	for _, cmp := range txn.GetCompare() {
++		keyRanges = append(keyRanges, auditKeyRange{Key: cmp.GetKey(), RangeEnd: cmp.GetRangeEnd()})
++	}
++	keyRanges = append(keyRanges, requestOpKeyRanges(txn.GetSuccess())...)
++	keyRanges = append(keyRanges, requestOpKeyRanges(txn.GetFailure())...)
++	return keyRanges
++}
++
++func requestOpKeyRanges(ops []*pb.RequestOp) []auditKeyRange {
++	var keyRanges []auditKeyRange
++	for _, op := range ops {
++		switch {
++		case op.GetRequestRange() != nil:
++			r := op.GetRequestRange()
++			keyRanges = append(keyRanges, auditKeyRange{Key: r.GetKey(), RangeEnd: r.GetRangeEnd()})
++		case op.GetRequestPut() != nil:
++			keyRanges = append(keyRanges, auditKeyRange{Key: op.GetRequestPut().GetKey()})
++		case op.GetRequestDeleteRange() != nil:
++			r := op.GetRequestDeleteRange()
++			keyRanges = append(keyRanges, auditKeyRange{Key: r.GetKey(), RangeEnd: r.GetRangeEnd()})
++		case op.GetRequestTxn() != nil:
++			keyRanges = append(keyRanges, txnKeyRanges(op.GetRequestTxn())...)
++		}
++	}
++	return keyRanges
++}
++
++// auditKeyRangeStrings renders key ranges for logging as either "key" or
++// "[key,rangeEnd)" when a range end is present.
++func auditKeyRangeStrings(keyRanges []auditKeyRange) []string {
++	out := make([]string, 0, len(keyRanges))
++	for _, kr := range keyRanges {
++		if len(kr.RangeEnd) == 0 {
++			out = append(out, string(kr.Key))
++		} else {
++			out = append(out, "["+string(kr.Key)+","+string(kr.RangeEnd)+")")
++		}
++	}
++	return out
++}
+diff --git a/server/etcdserver/api/v3rpc/grpc.go b/server/etcdserver/api/v3rpc/grpc.go
+index 91863e294..a462896c5 100644
+--- a/server/etcdserver/api/v3rpc/grpc.go
++++ b/server/etcdserver/api/v3rpc/grpc.go
+@@ -52,6 +52,7 @@ func Server(s *etcdserver.EtcdServer, tls *tls.Config, interceptor grpc.UnarySer
+ 
+ 	chainUnaryInterceptors := []grpc.UnaryServerInterceptor{
+ 		newLogUnaryInterceptor(s),
++		newAuditUnaryInterceptor(s),
+ 		serverMetrics.UnaryServerInterceptor(),
+ 		newUnaryInterceptor(s),
+ 	}

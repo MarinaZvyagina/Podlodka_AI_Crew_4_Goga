@@ -1,0 +1,387 @@
+diff --git a/server/etcdserver/api/v3rpc/audit.go b/server/etcdserver/api/v3rpc/audit.go
+new file mode 100644
+index 000000000..979077428
+--- /dev/null
++++ b/server/etcdserver/api/v3rpc/audit.go
+@@ -0,0 +1,150 @@
++// Copyright 2026 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package v3rpc
++
++import (
++	"context"
++	"fmt"
++	"time"
++
++	"go.uber.org/zap"
++	"google.golang.org/grpc"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/server/v3/etcdserver"
++)
++
++// unauthenticatedIdentity is recorded on an audit record when authentication
++// is disabled, when the request carries no token, or when no verifiable
++// identity could otherwise be established for it.
++const unauthenticatedIdentity = "unauthenticated"
++
++// auditKeyRange is a single key, or [key, rangeEnd) range, touched by a
++// key-value request.
++type auditKeyRange struct {
++	Key      []byte
++	RangeEnd []byte
++}
++
++// describeKVRequest recognizes the request messages behind the KV service's
++// read/write/delete/transaction RPCs (Range, Put, DeleteRange, Txn) by their
++// concrete type, independent of which gRPC method or decorator
++// (quota/auth) delivered them. Any request that isn't one of those types is
++// reported as not-a-KV-request so the caller can skip auditing it.
++func describeKVRequest(req any) (operation string, ranges []auditKeyRange, ok bool) {
++	switch r := req.(type) {
++	case *pb.RangeRequest:
++		return "read", []auditKeyRange{{Key: r.GetKey(), RangeEnd: r.GetRangeEnd()}}, true
++	case *pb.PutRequest:
++		return "write", []auditKeyRange{{Key: r.GetKey()}}, true
++	case *pb.DeleteRangeRequest:
++		return "delete", []auditKeyRange{{Key: r.GetKey(), RangeEnd: r.GetRangeEnd()}}, true
++	case *pb.TxnRequest:
++		return "transaction", txnKeyRanges(r), true
++	default:
++		return "", nil, false
++	}
++}
++
++// txnKeyRanges collects every key or key range a transaction touches: the
++// keys compared, plus the keys of every nested success/failure operation
++// (recursing into nested transactions, since RequestOp can itself wrap a
++// TxnRequest).
++func txnKeyRanges(t *pb.TxnRequest) []auditKeyRange {
++	var ranges []auditKeyRange
++	for _, c := range t.GetCompare() {
++		ranges = append(ranges, auditKeyRange{Key: c.GetKey(), RangeEnd: c.GetRangeEnd()})
++	}
++	ranges = append(ranges, requestOpKeyRanges(t.GetSuccess())...)
++	ranges = append(ranges, requestOpKeyRanges(t.GetFailure())...)
++	return ranges
++}
++
++func requestOpKeyRanges(ops []*pb.RequestOp) []auditKeyRange {
++	var ranges []auditKeyRange
++	for _, op := range ops {
++		switch {
++		case op.GetRequestRange() != nil:
++			r := op.GetRequestRange()
++			ranges = append(ranges, auditKeyRange{Key: r.GetKey(), RangeEnd: r.GetRangeEnd()})
++		case op.GetRequestPut() != nil:
++			ranges = append(ranges, auditKeyRange{Key: op.GetRequestPut().GetKey()})
++		case op.GetRequestDeleteRange() != nil:
++			r := op.GetRequestDeleteRange()
++			ranges = append(ranges, auditKeyRange{Key: r.GetKey(), RangeEnd: r.GetRangeEnd()})
++		case op.GetRequestTxn() != nil:
++			ranges = append(ranges, txnKeyRanges(op.GetRequestTxn())...)
++		}
++	}
++	return ranges
++}
++
++// requestorIdentity returns the caller identity for ctx, falling back to
++// unauthenticatedIdentity whenever auth is disabled, the request carries no
++// token, or the token doesn't resolve to a valid identity.
++func requestorIdentity(ctx context.Context, s *etcdserver.EtcdServer) string {
++	authInfo, err := s.AuthStore().AuthInfoFromCtx(ctx)
++	if err != nil || authInfo == nil || authInfo.Username == "" {
++		return unauthenticatedIdentity
++	}
++	return authInfo.Username
++}
++
++// newAuditUnaryInterceptor returns a gRPC unary interceptor that produces
++// exactly one audit record for every key-value read, write, delete, and
++// transaction request the server handles, recording the caller's identity,
++// the operation kind, the key(s)/range(s) involved, how long it took, and
++// whether it succeeded.
++//
++// Coverage comes from recognizing the request message type itself
++// (describeKVRequest), not from a hand-maintained list of RPC methods or
++// per-handler instrumentation, so it stays uniform across every request
++// that flows through this interceptor regardless of which decorators
++// (quota, auth) wrap the underlying KV service. It runs alongside, and does
++// not alter, the existing request-stats/latency-warning logging performed
++// by newLogUnaryInterceptor.
++func newAuditUnaryInterceptor(s *etcdserver.EtcdServer) grpc.UnaryServerInterceptor {
++	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
++		operation, ranges, ok := describeKVRequest(req)
++		if !ok {
++			return handler(ctx, req)
++		}
++
++		start := time.Now()
++		resp, err := handler(ctx, req)
++		duration := time.Since(start)
++
++		if lg := s.Logger(); lg != nil {
++			keys := make([]string, len(ranges))
++			for i, kr := range ranges {
++				if len(kr.RangeEnd) > 0 {
++					keys[i] = fmt.Sprintf("[%q,%q)", kr.Key, kr.RangeEnd)
++				} else {
++					keys[i] = fmt.Sprintf("%q", kr.Key)
++				}
++			}
++
++			lg.Named("audit").Info("kv request audit",
++				zap.String("identity", requestorIdentity(ctx, s)),
++				zap.String("operation", operation),
++				zap.Strings("keys", keys),
++				zap.Duration("duration", duration),
++				zap.Bool("success", err == nil),
++			)
++		}
++
++		return resp, err
++	}
++}
+diff --git a/server/etcdserver/api/v3rpc/audit_test.go b/server/etcdserver/api/v3rpc/audit_test.go
+new file mode 100644
+index 000000000..561a5cd2f
+--- /dev/null
++++ b/server/etcdserver/api/v3rpc/audit_test.go
+@@ -0,0 +1,104 @@
++// Copyright 2026 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package v3rpc
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/require"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++)
++
++func TestDescribeKVRequest(t *testing.T) {
++	tests := []struct {
++		name     string
++		req      any
++		wantOp   string
++		wantOK   bool
++		wantKeys []auditKeyRange
++	}{
++		{
++			name:     "range",
++			req:      &pb.RangeRequest{Key: []byte("a"), RangeEnd: []byte("z")},
++			wantOp:   "read",
++			wantOK:   true,
++			wantKeys: []auditKeyRange{{Key: []byte("a"), RangeEnd: []byte("z")}},
++		},
++		{
++			name:     "put",
++			req:      &pb.PutRequest{Key: []byte("a"), Value: []byte("v")},
++			wantOp:   "write",
++			wantOK:   true,
++			wantKeys: []auditKeyRange{{Key: []byte("a")}},
++		},
++		{
++			name:     "delete range",
++			req:      &pb.DeleteRangeRequest{Key: []byte("a"), RangeEnd: []byte("z")},
++			wantOp:   "delete",
++			wantOK:   true,
++			wantKeys: []auditKeyRange{{Key: []byte("a"), RangeEnd: []byte("z")}},
++		},
++		{
++			name: "txn",
++			req: &pb.TxnRequest{
++				Compare: []*pb.Compare{{Key: []byte("cmp")}},
++				Success: []*pb.RequestOp{
++					{Request: &pb.RequestOp_RequestPut{RequestPut: &pb.PutRequest{Key: []byte("succ-put")}}},
++				},
++				Failure: []*pb.RequestOp{
++					{Request: &pb.RequestOp_RequestRange{RequestRange: &pb.RangeRequest{Key: []byte("fail-range"), RangeEnd: []byte("z")}}},
++				},
++			},
++			wantOp: "transaction",
++			wantOK: true,
++			wantKeys: []auditKeyRange{
++				{Key: []byte("cmp")},
++				{Key: []byte("succ-put")},
++				{Key: []byte("fail-range"), RangeEnd: []byte("z")},
++			},
++		},
++		{
++			name: "nested txn",
++			req: &pb.TxnRequest{
++				Success: []*pb.RequestOp{
++					{Request: &pb.RequestOp_RequestTxn{RequestTxn: &pb.TxnRequest{
++						Success: []*pb.RequestOp{
++							{Request: &pb.RequestOp_RequestDeleteRange{RequestDeleteRange: &pb.DeleteRangeRequest{Key: []byte("nested")}}},
++						},
++					}}},
++				},
++			},
++			wantOp:   "transaction",
++			wantOK:   true,
++			wantKeys: []auditKeyRange{{Key: []byte("nested")}},
++		},
++		{
++			name:   "not a kv request",
++			req:    &pb.LeaseGrantRequest{},
++			wantOp: "",
++			wantOK: false,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			op, ranges, ok := describeKVRequest(tt.req)
++			require.Equal(t, tt.wantOK, ok)
++			require.Equal(t, tt.wantOp, op)
++			require.Equal(t, tt.wantKeys, ranges)
++		})
++	}
++}
+diff --git a/server/etcdserver/api/v3rpc/grpc.go b/server/etcdserver/api/v3rpc/grpc.go
+index 91863e294..a462896c5 100644
+--- a/server/etcdserver/api/v3rpc/grpc.go
++++ b/server/etcdserver/api/v3rpc/grpc.go
+@@ -52,6 +52,7 @@ func Server(s *etcdserver.EtcdServer, tls *tls.Config, interceptor grpc.UnarySer
+ 
+ 	chainUnaryInterceptors := []grpc.UnaryServerInterceptor{
+ 		newLogUnaryInterceptor(s),
++		newAuditUnaryInterceptor(s),
+ 		serverMetrics.UnaryServerInterceptor(),
+ 		newUnaryInterceptor(s),
+ 	}
+diff --git a/tests/integration/clientv3/audit_test.go b/tests/integration/clientv3/audit_test.go
+new file mode 100644
+index 000000000..578af9ed6
+--- /dev/null
++++ b/tests/integration/clientv3/audit_test.go
+@@ -0,0 +1,103 @@
++// Copyright 2026 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package clientv3test
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++
++	clientv3 "go.etcd.io/etcd/client/v3"
++	"go.etcd.io/etcd/tests/v3/framework/integration"
++)
++
++// TestKVAuditLogUnauthenticated verifies that every key-value read, write,
++// delete, and transaction request produces an audit log entry with the
++// caller identity, operation kind, key(s) involved, duration, and outcome,
++// even when authentication is disabled.
++func TestKVAuditLogUnauthenticated(t *testing.T) {
++	integration.BeforeTest(t)
++
++	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 1})
++	defer clus.Terminate(t)
++
++	cli := clus.Client(0)
++	m := clus.Members[0]
++
++	_, err := cli.Put(t.Context(), "audit-key", "value")
++	require.NoError(t, err)
++	expectMemberLog(t, m, 5*time.Second, `"operation": "write"`, 1)
++	expectMemberLog(t, m, 5*time.Second, `"identity": "unauthenticated"`, 1)
++
++	_, err = cli.Get(t.Context(), "audit-key")
++	require.NoError(t, err)
++	expectMemberLog(t, m, 5*time.Second, `"operation": "read"`, 1)
++
++	_, err = cli.Delete(t.Context(), "audit-key")
++	require.NoError(t, err)
++	expectMemberLog(t, m, 5*time.Second, `"operation": "delete"`, 1)
++
++	_, err = cli.Txn(t.Context()).
++		If(clientv3.Compare(clientv3.CreateRevision("audit-key"), "=", 0)).
++		Then(clientv3.OpPut("audit-key", "txn-value")).
++		Commit()
++	require.NoError(t, err)
++	expectMemberLog(t, m, 5*time.Second, `"operation": "transaction"`, 1)
++
++	lines, err := m.LogObserver.Expect(t.Context(), `"success": true`, 4)
++	require.NoError(t, err)
++	require.Len(t, lines, 4)
++}
++
++// TestKVAuditLogAuthenticated verifies that once authentication is enabled,
++// audit records carry the authenticated caller's username rather than
++// "unauthenticated".
++func TestKVAuditLogAuthenticated(t *testing.T) {
++	integration.BeforeTest(t)
++
++	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 1})
++	defer clus.Terminate(t)
++
++	m := clus.Members[0]
++	authSetupRoot(t, clus.Client(0).Auth)
++
++	cfg := clientv3.Config{
++		Endpoints:   clus.Client(0).Endpoints(),
++		DialTimeout: 5 * time.Second,
++		Username:    "root",
++		Password:    "123",
++	}
++	authed, err := integration.NewClient(t, cfg)
++	require.NoError(t, err)
++	defer authed.Close()
++
++	_, err = authed.Put(context.Background(), "audit-key", "value")
++	require.NoError(t, err)
++	expectMemberLog(t, m, 5*time.Second, `"identity": "root"`, 1)
++}
++
++func expectMemberLog(t *testing.T, m *integration.Member, timeout time.Duration, s string, count int) {
++	t.Helper()
++	ctx, cancel := context.WithTimeout(context.Background(), timeout)
++	defer cancel()
++
++	lines, err := m.LogObserver.Expect(ctx, s, count)
++	require.NoError(t, err)
++	for _, line := range lines {
++		t.Logf("[expected line]: %v", line)
++	}
++}

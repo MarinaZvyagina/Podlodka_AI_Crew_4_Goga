@@ -13,7 +13,9 @@ Per PROTOCOL.md / experiment.yaml:
 - Save all raw artifacts under runs/<run_id>/. Append one row to results/runs.csv.
 - Clean up the worktree unconditionally (even on failure).
 """
+import contextlib
 import csv
+import fcntl
 import json
 import os
 import shutil
@@ -23,18 +25,24 @@ import time
 from pathlib import Path
 
 BENCH_ROOT = Path("/Users/marinaoreshina/UK_Talant_Visa/Highload/architecture-agent-benchmark")
-SCRATCH_ROOT = Path("/tmp/benchmark-runs")
+# NOTE: deliberately NOT under /tmp. macOS's periodic daily cleanup silently deletes files
+# untouched for ~3 days anywhere under /tmp, which destroyed every base clone's .git object
+# database (HEAD/config/refs/most objects) partway through the unattended multi-day batch,
+# cascading into ~650 INVALID rows (see PROTOCOL.md Amendment 4). This scratch area lives
+# under the project's parent directory instead, which is not subject to that cleanup.
+SCRATCH_BASE = Path("/Users/marinaoreshina/UK_Talant_Visa/Highload/benchmark-scratch")
+SCRATCH_ROOT = SCRATCH_BASE / "runs"
 BASE_CLONES = {
-    "R01": Path("/tmp/benchmark-repos/R01"),
-    "R02": Path("/tmp/benchmark-repos/R02"),
-    "R03": Path("/tmp/benchmark-repos/R03/base"),
-    "R04": Path("/tmp/benchmark-repos/R04"),
-    "R05": Path("/tmp/benchmark-repos/R05"),
-    "R06": Path("/tmp/benchmark-repos/R06"),
-    "R07": Path("/tmp/benchmark-repos/R07"),
-    "R08": Path("/tmp/benchmark-repos/R08"),
-    "R09": Path("/tmp/benchmark-repos/R09"),
-    "R10": Path("/tmp/benchmark-repos/R10"),
+    "R01": SCRATCH_BASE / "repos" / "R01",
+    "R02": SCRATCH_BASE / "repos" / "R02",
+    "R03": SCRATCH_BASE / "repos" / "R03" / "base",
+    "R04": SCRATCH_BASE / "repos" / "R04",
+    "R05": SCRATCH_BASE / "repos" / "R05",
+    "R06": SCRATCH_BASE / "repos" / "R06",
+    "R07": SCRATCH_BASE / "repos" / "R07",
+    "R08": SCRATCH_BASE / "repos" / "R08",
+    "R09": SCRATCH_BASE / "repos" / "R09",
+    "R10": SCRATCH_BASE / "repos" / "R10",
 }
 COMMITS = {
     "R01": "936f28e28cbcd4e9e146cbc076c54933517a92eb",
@@ -151,6 +159,48 @@ def parse_verdict(out):
     return "FAIL"  # no recognizable verdict line at all -> treat conservatively as FAIL
 
 
+# R09 (firefox-ios) and R10 (signal-ios) are the only two Swift/Xcode repos, and both share
+# this machine's single global Xcode DerivedData + CoreSimulator state. Running two Xcode
+# builds concurrently -- whether both from the same condition's parallel workers, or one from
+# Condition C and one from Condition B'' at the same time, since those run as fully independent
+# processes with no awareness of each other -- has already caused a real disk-exhaustion/cache-
+# corruption incident once in this study (see STATUS.md). This lock file, shared across every
+# execute_run*.py process on the machine regardless of which experiment_plan/condition it's
+# running, serializes R09/R10 work machine-wide while leaving all other 8 repos fully parallel.
+XCODE_LOCK_PATH = BENCH_ROOT / "results" / ".xcode_repo.lock"
+XCODE_REPOS = {"R09", "R10"}
+
+
+def acquire_xcode_lock(repo_id):
+    """Returns an open, flock'd file handle for R09/R10, or None for every other repo (no-op).
+    Pair with release_xcode_lock() in a finally block -- see xcode_repo_lock() for the
+    context-manager form, used where the call site's structure allows a `with` block."""
+    if repo_id not in XCODE_REPOS:
+        return None
+    XCODE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(XCODE_LOCK_PATH, "w")
+    print(f"[{repo_id}] waiting for machine-wide Xcode lock...", flush=True)
+    fcntl.flock(lock_file, fcntl.LOCK_EX)
+    print(f"[{repo_id}] acquired machine-wide Xcode lock.", flush=True)
+    return lock_file
+
+
+def release_xcode_lock(lock_file):
+    if lock_file is None:
+        return
+    fcntl.flock(lock_file, fcntl.LOCK_UN)
+    lock_file.close()
+
+
+@contextlib.contextmanager
+def xcode_repo_lock(repo_id):
+    lock_file = acquire_xcode_lock(repo_id)
+    try:
+        yield
+    finally:
+        release_xcode_lock(lock_file)
+
+
 def run_validators(worktree, repo_id, task_letter, env):
     val_dir = BENCH_ROOT / "tasks" / repo_id / "validators"
     results = {}
@@ -186,16 +236,19 @@ def free_disk_gb():
 
 def clean_xcode_caches():
     """
-    Xcode DerivedData/CoreSimulator regrow every time an R09/R10 (Swift) run does a real
-    build, and are by far the largest recurring disk consumer on this machine (repeatedly
-    observed at 15-25GB each). The user explicitly approved clearing these as the standing
-    fix for low disk space; automate it here so the 800-run batch is self-sufficient rather
-    than needing a manual cleanup pass every time a Swift-heavy run pushes disk to the edge.
-    Safe: DerivedData/simulator state is a rebuildable cache, never the user's own data.
+    Xcode DerivedData/CoreSimulator (R09/R10, Swift) and Go's build cache (R05/R06, go build/go
+    test) both regrow every time their respective repos build, and have each independently been
+    observed as the largest disk consumer on this machine at different points (Xcode: 15-25GB;
+    go-build: repeatedly regrew to 24GB and once caused a multi-day hung run when disk hit ~98%
+    full mid-build -- see PROTOCOL.md Amendment 4 follow-up). The user explicitly approved
+    clearing these as the standing fix for low disk space; automate it here so the 800-run batch
+    is self-sufficient rather than needing a manual cleanup pass every time disk hits the edge.
+    Safe: both are rebuildable caches, never the user's own data.
     """
     subprocess.run(["rm", "-rf", os.path.expanduser("~/Library/Developer/Xcode/DerivedData")],
                     check=False)
     subprocess.run(["xcrun", "simctl", "delete", "unavailable"], check=False, capture_output=True)
+    subprocess.run(["go", "clean", "-cache"], check=False, capture_output=True)
 
 
 def wait_for_disk_space(min_gb=3.0, max_wait_s=1800, poll_s=30):
@@ -217,7 +270,12 @@ def wait_for_disk_space(min_gb=3.0, max_wait_s=1800, poll_s=30):
 
 
 def main():
-    wait_for_disk_space(min_gb=6.0)
+    # Higher floor than the single-worker default (6.0GB): scripts/run_batch_for_repos.sh runs
+    # several of these concurrently (one per repo-partitioned worker), so disk can be consumed
+    # by 2-3 simultaneous builds between any single worker's checks. A disk-exhaustion mid-build
+    # once caused a multi-day unkillable hang (uninterruptible I/O wait) -- see PROTOCOL.md
+    # Amendment 4 follow-up -- more headroom here reduces the chance of hitting that again.
+    wait_for_disk_space(min_gb=10.0)
     run_number = int(sys.argv[1])
     row = load_plan_row(run_number)
     repo_id = row["repository"]
@@ -270,7 +328,8 @@ def main():
             codemanifest_count = overlay_goga_treatment(worktree, repo_id)
             sh(["git", "add", "-A"], cwd=worktree)
             sh(["git", "-c", "user.name=Goga Treatment", "-c", "user.email=goga@localhost",
-                "commit", "-q", "-m", "Goga condition: apply frozen architecture forest"], cwd=worktree)
+                "commit", "-q", "--no-verify",
+                "-m", "Goga condition: apply frozen architecture forest"], cwd=worktree)
 
         # 3. Task prompt
         prompt_path = BENCH_ROOT / "tasks" / repo_id / f"task_{task_letter}.md"
@@ -409,15 +468,21 @@ def main():
         except Exception:
             shutil.rmtree(worktree, ignore_errors=True)
 
-    # Append to results/runs.csv
+    # Append to results/runs.csv. Locked (flock) because run_batch_for_repos.sh runs multiple
+    # execute_run.py processes concurrently (one per repo-partitioned worker) -- unlocked
+    # concurrent appends from separate Python csv writers are not guaranteed atomic and could
+    # interleave/corrupt rows.
     results_csv = BENCH_ROOT / "results" / "runs.csv"
     results_csv.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = BENCH_ROOT / "results" / ".runs.csv.lock"
     fieldnames = ["run_id", "repository", "task", "task_type", "condition", "repetition",
                   "functional_success", "architecture_conformance_rate", "full_architecture_conformance",
                   "dangerous_success", "architecture_checks_passed", "architecture_checks_failed",
                   "duration_ms", "tokens_input", "tokens_output", "tool_calls_num_turns",
                   "files_changed", "cost_usd", "model_used", "timeout", "invalid", "status", "timestamp"]
-    is_new = not results_csv.exists()
+    lock_file = open(lock_path, "w")
+    fcntl.flock(lock_file, fcntl.LOCK_EX)
+    is_new = not results_csv.exists() or results_csv.stat().st_size == 0
     with open(results_csv, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         if is_new:
@@ -443,6 +508,8 @@ def main():
             "status": status,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
         })
+    fcntl.flock(lock_file, fcntl.LOCK_UN)
+    lock_file.close()
 
     print(f"[{run_id}] status={status} functional_success={metrics.get('functional_success')} "
           f"full_arch_conformance={metrics.get('full_architecture_conformance')} "

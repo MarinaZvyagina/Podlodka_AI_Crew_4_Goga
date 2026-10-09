@@ -1,0 +1,291 @@
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index bbe6e02..17ea6d1 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -1535,6 +1535,14 @@
+             </intent-filter>
+         </receiver>
+ 
++        <receiver
++            android:name=".service.DeleteAbandonedAttachmentsAlarmListener"
++            android:exported="false">
++            <intent-filter>
++                <action android:name="android.intent.action.BOOT_COMPLETED" />
++            </intent-filter>
++        </receiver>
++
+         <receiver
+             android:name="org.signal.core.util.ForegroundServiceUtil$Receiver"
+             android:exported="false" />
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/ApplicationContext.java b/app/src/main/java/org/thoughtcrime/securesms/ApplicationContext.java
+index f706929..b8f48c2 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/ApplicationContext.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/ApplicationContext.java
+@@ -111,6 +111,7 @@ import org.thoughtcrime.securesms.registration.v2.AppRegistrationNetworkControll
+ import org.thoughtcrime.securesms.registration.v2.AppRegistrationStorageController;
+ import org.thoughtcrime.securesms.ringrtc.RingRtcLogger;
+ import org.thoughtcrime.securesms.service.AnalyzeDatabaseAlarmListener;
++import org.thoughtcrime.securesms.service.DeleteAbandonedAttachmentsAlarmListener;
+ import org.thoughtcrime.securesms.service.DirectoryRefreshListener;
+ import org.thoughtcrime.securesms.service.KeyCachingService;
+ import org.thoughtcrime.securesms.service.LocalBackupListener;
+@@ -542,6 +543,7 @@ public class ApplicationContext extends Application implements AppForegroundObse
+     RotateSenderCertificateListener.schedule(this);
+     RoutineMessageFetchReceiver.startOrUpdateAlarm(this);
+     AnalyzeDatabaseAlarmListener.schedule(this);
++    DeleteAbandonedAttachmentsAlarmListener.schedule(this);
+ 
+     if (BuildConfig.MANAGES_APP_UPDATES) {
+       ApkUpdateRefreshListener.schedule(this);
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/database/AttachmentTable.kt b/app/src/main/java/org/thoughtcrime/securesms/database/AttachmentTable.kt
+index 1e92473..4732d9d 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/database/AttachmentTable.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/database/AttachmentTable.kt
+@@ -1806,6 +1806,67 @@ class AttachmentTable(
+     return onDiskButNotInDatabase.size
+   }
+ 
++  /**
++   * Like [deleteAbandonedAttachmentFiles], but scans at most [limit] on-disk files whose name sorts after
++   * [afterFileName] instead of diffing the entire directory at once. This lets a caller sweep a large
++   * directory across multiple calls (e.g. separate job runs, possibly spanning process restarts) by feeding
++   * back [AbandonedAttachmentFilesPage.nextCursor] as [afterFileName] on the next call, rather than either
++   * re-scanning everything from the start or doing the whole directory in one long-running pass.
++   *
++   * @return the deleted count for this page, and the cursor to resume from, or a null cursor if this page
++   * reached the end of the directory.
++   */
++  fun deleteAbandonedAttachmentFilesPage(afterFileName: String?, limit: Int): AbandonedAttachmentFilesPage {
++    val diskFiles = context.getDir(DIRECTORY, Context.MODE_PRIVATE).listFiles() ?: return AbandonedAttachmentFilesPage(null, 0)
++
++    val page: List<File> = diskFiles
++      .filter { file: File -> !PartFileProtector.isProtected(file) }
++      .sortedBy { file: File -> file.name }
++      .filter { file: File -> afterFileName == null || file.name > afterFileName }
++      .take(limit)
++
++    if (page.isEmpty()) {
++      return AbandonedAttachmentFilesPage(null, 0)
++    }
++
++    val candidatePaths: Set<String> = page.map { it.absolutePath }.toSet()
++    val referencedPaths: MutableSet<String> = HashSet(candidatePaths.size)
++
++    readableDatabase.withinTransaction { db ->
++      for (query in SqlUtil.buildCollectionQuery(DATA_FILE, candidatePaths.toList())) {
++        db.select(DATA_FILE)
++          .from(TABLE_NAME)
++          .where(query.where, query.whereArgs)
++          .run()
++          .forEach { cursor -> cursor.requireString(DATA_FILE)?.let { referencedPaths += it } }
++      }
++
++      for (query in SqlUtil.buildCollectionQuery(THUMBNAIL_FILE, candidatePaths.toList())) {
++        db.select(THUMBNAIL_FILE)
++          .from(TABLE_NAME)
++          .where(query.where, query.whereArgs)
++          .run()
++          .forEach { cursor -> cursor.requireString(THUMBNAIL_FILE)?.let { referencedPaths += it } }
++      }
++    }
++
++    referencedPaths += SignalDatabase.stickers.getAllStickerFiles().filter { it in candidatePaths }
++
++    var deleteCount = 0
++    for (path in candidatePaths - referencedPaths) {
++      if (File(path).delete()) {
++        deleteCount++
++      } else {
++        Log.w(TAG, "[deleteAbandonedAttachmentFilesPage] Failed to delete attachment file. $path")
++      }
++    }
++
++    val nextCursor = if (page.size < limit) null else page.last().name
++    return AbandonedAttachmentFilesPage(nextCursor, deleteCount)
++  }
++
++  data class AbandonedAttachmentFilesPage(val nextCursor: String?, val deletedCount: Int)
++
+   /**
+    * Removes all references to the provided [DATA_FILE] from all attachments.
+    * Only do this if the file is known to not exist or has some other critical problem!
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/jobs/DeleteAbandonedAttachmentsJob.kt b/app/src/main/java/org/thoughtcrime/securesms/jobs/DeleteAbandonedAttachmentsJob.kt
+index 9077393..8fe5c9c 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/jobs/DeleteAbandonedAttachmentsJob.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/jobs/DeleteAbandonedAttachmentsJob.kt
+@@ -9,18 +9,36 @@ import org.signal.core.util.logging.Log
+ import org.thoughtcrime.securesms.database.SignalDatabase.Companion.attachments
+ import org.thoughtcrime.securesms.dependencies.AppDependencies
+ import org.thoughtcrime.securesms.jobmanager.Job
++import org.thoughtcrime.securesms.jobmanager.JsonJobData
++import org.thoughtcrime.securesms.jobmanager.impl.BatteryNotLowConstraint
+ import org.thoughtcrime.securesms.jobmanager.impl.DataRestoreConstraint
++import org.thoughtcrime.securesms.jobmanager.impl.NotInCallConstraint
+ import kotlin.time.Duration.Companion.days
++import kotlin.time.Duration.Companion.seconds
+ 
+ /**
+- * Deletes attachment files that are no longer referenced in the database.
++ * Deletes attachment and thumbnail cache files that are no longer referenced by any attachment in the database
++ * (e.g. because the attachment or the message that owned it was deleted).
++ *
++ * The attachment directory can hold a lot of files on a device that's been used for a long time, so this sweeps
++ * it in bounded pages rather than diffing the whole directory at once, persisting how far it's gotten
++ * ([cursor]) as part of the job's saved state. If the process dies mid-sweep, the job is reconstructed from
++ * that saved state on the next attempt and resumes from the page it was on instead of starting over or losing
++ * progress. [Parameters.setGlobalPriority] is set low and [NotInCallConstraint]/[BatteryNotLowConstraint] are
++ * required so this background maintenance never competes with anything the user is actively doing.
+  */
+-class DeleteAbandonedAttachmentsJob private constructor(parameters: Parameters) : Job(parameters) {
++class DeleteAbandonedAttachmentsJob private constructor(
++  parameters: Parameters,
++  private var cursor: String?
++) : Job(parameters) {
+ 
+   companion object {
+     private val TAG = Log.tag(DeleteAbandonedAttachmentsJob::class)
+     const val KEY = "DeleteAbandonedAttachmentsJob"
+ 
++    private const val KEY_CURSOR = "cursor"
++    private const val PAGE_SIZE = 500
++
+     @JvmStatic
+     fun enqueue() {
+       AppDependencies.jobManager.add(DeleteAbandonedAttachmentsJob())
+@@ -29,25 +47,48 @@ class DeleteAbandonedAttachmentsJob private constructor(parameters: Parameters)
+ 
+   constructor() : this(
+     parameters = Parameters.Builder()
++      .setQueue(KEY)
+       .setMaxInstancesForFactory(2)
++      .setMaxAttempts(Parameters.UNLIMITED)
+       .setLifespan(1.days.inWholeMilliseconds)
++      .setGlobalPriority(Parameters.PRIORITY_LOW)
+       .addConstraint(DataRestoreConstraint.KEY)
+-      .build()
++      .addConstraint(NotInCallConstraint.KEY)
++      .addConstraint(BatteryNotLowConstraint.KEY)
++      .build(),
++    cursor = null
+   )
+ 
+-  override fun serialize(): ByteArray? = null
++  override fun serialize(): ByteArray? {
++    return JsonJobData.Builder()
++      .putString(KEY_CURSOR, cursor)
++      .build()
++      .serialize()
++  }
++
+   override fun getFactoryKey(): String = KEY
++
+   override fun onFailure() = Unit
+ 
+   override fun run(): Result {
+-    val deletes = attachments.deleteAbandonedAttachmentFiles()
+-    Log.i(TAG, "Deleted $deletes abandoned attachments.")
+-    return Result.success()
++    val page = attachments.deleteAbandonedAttachmentFilesPage(cursor, PAGE_SIZE)
++
++    if (page.deletedCount > 0) {
++      Log.i(TAG, "Deleted ${page.deletedCount} abandoned attachment/thumbnail files.")
++    }
++
++    if (page.nextCursor == null) {
++      return Result.success()
++    }
++
++    cursor = page.nextCursor
++    return Result.retry(1.seconds.inWholeMilliseconds)
+   }
+ 
+   class Factory : Job.Factory<DeleteAbandonedAttachmentsJob> {
+     override fun create(parameters: Parameters, serializedData: ByteArray?): DeleteAbandonedAttachmentsJob {
+-      return DeleteAbandonedAttachmentsJob(parameters)
++      val data = JsonJobData.deserialize(serializedData)
++      return DeleteAbandonedAttachmentsJob(parameters, data.getStringOrDefault(KEY_CURSOR, null))
+     }
+   }
+ }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/keyvalue/MiscellaneousValues.kt b/app/src/main/java/org/thoughtcrime/securesms/keyvalue/MiscellaneousValues.kt
+index fa6a52f..a9f8ced 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/keyvalue/MiscellaneousValues.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/keyvalue/MiscellaneousValues.kt
+@@ -37,6 +37,7 @@ class MiscellaneousValues internal constructor(store: KeyValueStore) : SignalSto
+     private const val LINKED_DEVICE_LAST_ACTIVE_CHECK_TIME = "misc.linked_device.last_active_check_time"
+     private const val LEAST_ACTIVE_LINKED_DEVICE = "misc.linked_device.least_active"
+     private const val NEXT_DATABASE_ANALYSIS_TIME = "misc.next_database_analysis_time"
++    private const val NEXT_ABANDONED_ATTACHMENT_CLEANUP_TIME = "misc.next_abandoned_attachment_cleanup_time"
+     private const val LAST_NETWORK_RESET_TIME = "misc.last_network_reset_time"
+     private const val LAST_WEBSOCKET_CONNECT_TIME = "misc.last_websocket_connect_time"
+     private const val LAST_CONNECTIVITY_WARNING_TIME = "misc.last_connectivity_warning_time"
+@@ -287,6 +288,11 @@ class MiscellaneousValues internal constructor(store: KeyValueStore) : SignalSto
+    */
+   var nextDatabaseAnalysisTime: Long by longValue(NEXT_DATABASE_ANALYSIS_TIME, 0)
+ 
++  /**
++   * When the next scheduled sweep for abandoned attachment/thumbnail cache files is.
++   */
++  var nextAbandonedAttachmentCleanupTime: Long by longValue(NEXT_ABANDONED_ATTACHMENT_CLEANUP_TIME, 0)
++
+   var lastNetworkResetDueToStreamResets: Long by longValue(LAST_NETWORK_RESET_TIME, 0L)
+ 
+   /**
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/service/DeleteAbandonedAttachmentsAlarmListener.kt b/app/src/main/java/org/thoughtcrime/securesms/service/DeleteAbandonedAttachmentsAlarmListener.kt
+new file mode 100644
+index 0000000..4150fc4
+--- /dev/null
++++ b/app/src/main/java/org/thoughtcrime/securesms/service/DeleteAbandonedAttachmentsAlarmListener.kt
+@@ -0,0 +1,52 @@
++package org.thoughtcrime.securesms.service
++
++import android.content.Context
++import org.thoughtcrime.securesms.jobs.DeleteAbandonedAttachmentsJob
++import org.thoughtcrime.securesms.keyvalue.SignalStore
++import org.thoughtcrime.securesms.util.toMillis
++import java.security.SecureRandom
++import java.time.LocalDateTime
++
++/**
++ * Schedules a daily sweep for attachment/thumbnail cache files left behind by deleted attachments or messages,
++ * so cleanup happens automatically on a regular cadence rather than only once, right after an app update.
++ */
++class DeleteAbandonedAttachmentsAlarmListener : PersistentAlarmManagerListener() {
++  companion object {
++    @JvmStatic
++    fun schedule(context: Context?) {
++      DeleteAbandonedAttachmentsAlarmListener().onReceive(context, getScheduleIntent())
++    }
++  }
++
++  override fun getNextScheduledExecutionTime(context: Context): Long {
++    var nextTime = SignalStore.misc.nextAbandonedAttachmentCleanupTime
++
++    if (nextTime == 0L) {
++      nextTime = getNextTime()
++      SignalStore.misc.nextAbandonedAttachmentCleanupTime = nextTime
++    }
++
++    return nextTime
++  }
++
++  override fun onAlarm(context: Context, scheduledTime: Long): Long {
++    DeleteAbandonedAttachmentsJob.enqueue()
++
++    val nextTime = getNextTime()
++    SignalStore.misc.nextAbandonedAttachmentCleanupTime = nextTime
++
++    return nextTime
++  }
++
++  private fun getNextTime(): Long {
++    val random = SecureRandom()
++    return LocalDateTime
++      .now()
++      .plusDays(1)
++      .withHour(2 + random.nextInt(3))
++      .withMinute(random.nextInt(60))
++      .withSecond(random.nextInt(60))
++      .toMillis()
++  }
++}

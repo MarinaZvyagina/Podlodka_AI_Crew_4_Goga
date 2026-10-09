@@ -1,0 +1,68 @@
+# R04-TD-BF-05
+
+Condition: goga_forced_workflow
+Functional success: False
+Full architecture conformance: False
+ACR: 0.25
+Dangerous success: False
+Goga engagement signal: True
+Cost: $1.4894208
+Duration: 303722ms, turns: 48
+
+## Agent's own summary
+
+# Scope Resolution Report
+
+## Task Summary
+Add a one-click "snap to grid" action that rounds the position and size of the currently-selected shapes (or, if nothing is selected, every eligible shape) to the grid spacing configured in `appState.gridSize`, snapping each shape independently, applying the change as a single undoable/collaborator-synced scene mutation. This is implemented as a new `Action` registered in the existing `packages/excalidraw/actions` cell, using geometry/mutation primitives from `packages/element/src` and grid-rounding math currently living under `packages/common/src`.
+
+## Candidate Cells
+
+| Cell | Reason | Priority |
+|---|---|---|
+| `packages/excalidraw/actions` | This is where the new `snapToGrid` `Action` is registered (the extension point) — direct target of the change | High |
+| `packages/element/src` | Supplies `ExcalidrawElement`, `Scene`/`mutateElement`, `updateBoundElements`, and other element-mutation/geometry primitives the action's `perform` will call | High |
+| `packages/common/src` | Hosts `getGridPoint`/`DEFAULT_GRID_SIZE` (grid-rounding math) already used by drag/resize snapping; the new action reuses this same math | Medium |
+| `packages/math/src` | Provides `GlobalPoint`/`LocalPoint`/point helpers that `packages/element/src` and `packages/common/src` build on | Low |
+| `packages/fractional-indexing/src` | Leaf cell for element ordering; unrelated to geometry/snapping | Excluded |
+
+## Included Dependencies
+
+| Cell | Behavioral Relevance |
+|---|---|
+| `packages/element/src` | `perform()` reads `ExcalidrawElement`s, calls `Scene.mutateElement` to write new x/y/width/height (and points, for linear/freedraw elements), and calls `updateBoundElements` so bound arrows follow snapped shapes. `CaptureUpdateAction` (documented on the `Store` type in this cell) is returned by `perform()` to control undo/collab history capture. |
+| `packages/common/src` | `getGridPoint(x, y, gridSize)` is the exact rounding primitive already used for live drag/resize snap (`packages/element/src/dragElements.ts`); the new action must reuse it (not reimplement rounding) for both position and size so the result matches manual-drag behavior. |
+
+## Excluded Dependencies
+
+| Cell | Exclusion Reason |
+|---|---|
+| `packages/fractional-indexing/src` | No behavioral participation — order-key generation is unrelated to geometry/snapping and is not touched by this change |
+| `packages/math/src` | Only transitively relevant (point tuple types flow through `common`/`element`); the action itself does not call `packages/math/src` types directly — dependency relevance here is speculative/indirect, not behavioral |
+
+## Usage Relationships
+
+| Usage | Relevance |
+|---|---|
+| `host_app_state` (documented in `packages/excalidraw/actions` CODEMANIFEST) | Directly relevant — `perform(elements, appState, formData, app)` for the new action receives host app state exactly per this documented pattern; the action must treat `appState`/`app` opaquely per this usage's contract |
+| Project-level `.goga/usages/` | None found — `codemanifest.usages` / `codemanifest.annotations` are absent from `.goga/config.yml` (confirmed via `goga config`), so no project-wide practice applies |
+
+## Semantic Participation Summary
+- **`packages/excalidraw/actions`** is the primary participant: it owns the `Action` contract and `register()` extension point that the new `snapToGrid` action must conform to. This cell's CODEMANIFEST is the one directly amended.
+- **`packages/element/src`** participates behaviorally because the action's core logic (reading elements, mutating geometry, keeping bound arrows attached, controlling history capture via `CaptureUpdateAction`) all runs through primitives this cell exports. Note: `CaptureUpdateAction` and mutation-support types (e.g. a possible new/reused rescale helper) are not currently listed in this cell's documented `types` in `goga schema`, which is a pre-existing drift signal to carry into Investigation.
+- **`packages/common/src`** participates because it is the source of truth for grid-rounding math (`getGridPoint`, `DEFAULT_GRID_SIZE`). Confirmed via `goga schema` that neither symbol appears in this cell's documented `types` list (`BinaryHeap<T>`, `Emitter`, `VersionedSnapshotStore<T>`, `arrayToMap`, `debounce`, `isColorDark`, `matchKey`, `randomId`, `toBrandedType`) — this is manifest drift pre-dating this task, not something introduced by it, but it directly affects whether `packages/excalidraw/actions`'s CODEMANIFEST can legitimately declare an `Imports` entry for it.
+- **`packages/math/src`** does not behaviorally participate in the new contract surface itself (no direct import expected in the new action file), so it is excluded from the investigation scope proper, though Investigation should note it as background context if `GlobalPoint` types surface in signatures.
+
+## Final Investigation Scope
+1. `packages/excalidraw/actions` (primary — CODEMANIFEST + implementation files: `types.ts`, `register.ts`, `manager.tsx`, `index.ts`, `actionAlign.tsx`/`actionFlip.ts` as pattern references)
+2. `packages/element/src` (secondary — CODEMANIFEST + `Scene`/`mutateElement`, `updateBoundElements`, `CaptureUpdateAction`, `resizeElements.ts` exports actually used)
+3. `packages/common/src` (secondary — CODEMANIFEST + `points.ts` for `getGridPoint`, `constants.ts` for `DEFAULT_GRID_SIZE`)
+
+## Scope Risks
+- **Under-scoping risk**: if Investigation treats `packages/excalidraw/actions`'s CODEMANIFEST `Imports` list as authoritative (currently only `ExcalidrawElement`), it may wrongly flag the new action's additional imports (`CaptureUpdateAction`, `getSelectedElements`, `rescalePointsInElement`, `updateBoundElements`, `getGridPoint`, etc.) as new/unauthorized surface, when in fact this drift already exists in-tree (`actionAlign.tsx`, `actionFlip.ts` import far more than the manifest documents). Investigation and Manifest Reconciliation must treat this as **pre-existing drift to reconcile**, not a break introduced by this change.
+- **Over-scoping risk**: pulling `packages/math/src` fully into scope would add noise — its point/vector primitives are several layers removed from the actual action contract and are not directly touched.
+- **Boundary risk**: the action's `perform()` receives `appState`/`app` opaquely per `host_app_state`; care must be taken in Planning/Implementation not to introduce a new formal type dependency on the root `packages/excalidraw` cell (which is intentionally out of scope for this forest per the actions CODEMANIFEST's own note).
+
+## Notes
+- `goga config codemanifest.usages` / `codemanifest.annotations` both returned "Option not found" — no project-wide base practices exist to apply.
+- The `packages/excalidraw` root app cell (menu wiring, i18n locale files, `actions/index.ts` registration list, keyboard shortcuts panel) is **not** part of the documented Goga architecture forest (only `fractional-indexing/src`, `element/src`, `excalidraw/actions`, `math/src`, `common/src` are). Wiring the new action into `packages/excalidraw/actions/index.ts`, adding its i18n label, and any menu/shortcut surfacing are still necessary for the ticket to be user-reachable, but fall outside this manifest-governed scope — they will be handled as ordinary (non-manifest-governed) implementation work alongside the manifest-governed core.

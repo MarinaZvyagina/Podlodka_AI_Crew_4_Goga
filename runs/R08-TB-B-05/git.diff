@@ -1,0 +1,417 @@
+diff --git a/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowEvent.kt b/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowEvent.kt
+index ee2ec7e..c8d8607 100644
+--- a/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowEvent.kt
++++ b/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowEvent.kt
+@@ -42,6 +42,12 @@ internal sealed interface MediaSendFlowEvent {
+   //region Edits, which the flow holds so that they survive the editor being swiped away
+ 
+   data class SetMediaQuality(val quality: SentMediaQuality) : MediaSendFlowEvent
++
++  /**
++   * Marks (or unmarks) a single item to be sent at full/original quality, overriding [SetMediaQuality] for just that
++   * item while the rest of the batch is unaffected.
++   */
++  data class SetFullQualityOverride(val media: Media, val enabled: Boolean) : MediaSendFlowEvent
+   data class SetBrushWidth(val tool: BrushTool, val fraction: Float) : MediaSendFlowEvent
+   data class SetBlurFacesEnabled(val enabled: Boolean) : MediaSendFlowEvent
+   data class VideoTrimChanged(val videoTrimData: VideoTrimData, val editingComplete: Boolean) : MediaSendFlowEvent
+diff --git a/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowViewModel.kt b/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowViewModel.kt
+index b0f4a18..e2f6c23 100644
+--- a/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowViewModel.kt
++++ b/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowViewModel.kt
+@@ -39,6 +39,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
+ import kotlinx.coroutines.sync.Mutex
+ import kotlinx.coroutines.sync.withLock
+ import org.signal.core.models.media.Media
++import org.signal.core.models.media.TransformProperties
+ import org.signal.core.ui.compose.DialogController
+ import org.signal.core.ui.compose.DialogResult
+ import org.signal.core.ui.compose.SignalIcons
+@@ -251,6 +252,7 @@ class MediaSendFlowViewModel(
+       MediaSendFlowEvent.CloseRequested -> onCloseRequested()
+ 
+       is MediaSendFlowEvent.SetMediaQuality -> setSentMediaQuality(event.quality)
++      is MediaSendFlowEvent.SetFullQualityOverride -> setFullQualityOverride(event.media, event.enabled)
+       is MediaSendFlowEvent.SetBrushWidth -> setBrushWidth(event.tool, event.fraction)
+       is MediaSendFlowEvent.SetBlurFacesEnabled -> setBlurFacesEnabled(event.enabled)
+       is MediaSendFlowEvent.VideoTrimChanged -> onEditVideoDuration(
+@@ -775,6 +777,50 @@ class MediaSendFlowViewModel(
+     )
+   }
+ 
++  /**
++   * Marks (or unmarks) a single item to be sent at full/original quality, skipping the normal compression pass for
++   * just that item while the rest of the batch keeps [MediaSendFlowState.sentMediaQuality] as usual.
++   *
++   * Cancels any pre-upload already running (or finished) for the old copy of the media, the same way a video
++   * trim/mute edit invalidates an in-flight pre-upload -- the new copy is not re-uploaded here, it is uploaded fresh,
++   * along with anything else still pending, at [send].
++   */
++  private fun setFullQualityOverride(media: Media, enabled: Boolean) {
++    val snapshot = state.value
++    val current = snapshot.selectedMedia.firstOrNull { it.uri == media.uri } ?: return
++    val currentProperties = current.transformProperties ?: TransformProperties.empty()
++    if (currentProperties.skipTransform == enabled) return
++
++    val updated = current.copy(transformProperties = currentProperties.copy(skipTransform = enabled))
++
++    updateState {
++      copy(
++        selectedMedia = selectedMedia.map { if (it.uri == media.uri) updated else it },
++        focusedMedia = if (focusedMedia?.uri == media.uri) updated else focusedMedia
++      )
++    }
++
++    preUploadController.cancelUpload(current)
++
++    if (enabled) {
++      fullQualityToastEvent(updated)?.let { internalToastEvents.trySend(it) }
++    }
++  }
++
++  /** Only the notable direction (turning the override on) is worth confirming, same as [toggleVideoMuted]. */
++  private fun fullQualityToastEvent(media: Media): ToastEvent? {
++    val message = when {
++      isNonGifVideo(media) -> ToastMessage.Text(R.string.MediaReviewFragment__video_set_to_full_quality)
++      ContentTypeUtil.isImageType(media.contentType) -> ToastMessage.Text(R.string.MediaReviewFragment__photo_set_to_full_quality)
++      else -> {
++        Log.i(TAG, "No full quality confirmation for an attachment of type: ${media.contentType}")
++        return null
++      }
++    }
++
++    return ToastEvent(icon = SignalIcons.QualityHigh, message = message)
++  }
++
+   //endregion
+ 
+   //region Video Editing
+diff --git a/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditScreenEvents.kt b/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditScreenEvents.kt
+index 244ba93..610ff78 100644
+--- a/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditScreenEvents.kt
++++ b/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditScreenEvents.kt
+@@ -30,6 +30,7 @@ sealed interface MediaEditScreenEvents {
+   data object NavigateBack : MediaEditScreenEvents
+   data object NavigateToGallery : MediaEditScreenEvents
+   data class SetMediaQuality(val quality: SentMediaQuality) : MediaEditScreenEvents
++  data class SetFullQualityOverride(val media: Media, val enabled: Boolean) : MediaEditScreenEvents
+   data object ToggleViewOnce : MediaEditScreenEvents
+   data class BrushWidthChanged(val tool: BrushTool, val fraction: Float) : MediaEditScreenEvents
+   data class ToggleBlurFaces(val enabled: Boolean) : MediaEditScreenEvents
+diff --git a/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditViewModel.kt b/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditViewModel.kt
+index 46557d6..2db440c 100644
+--- a/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditViewModel.kt
++++ b/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditViewModel.kt
+@@ -72,6 +72,7 @@ internal class MediaEditViewModel(
+       is MediaEditScreenEvents.ReorderSelectedMedia -> parentEventEmitter(MediaSendFlowEvent.ReorderSelectedMedia(event.fromIndex, event.toIndex))
+       is MediaEditScreenEvents.RemoveMedia -> parentEventEmitter(MediaSendFlowEvent.RemoveMedia(setOf(event.media)))
+       is MediaEditScreenEvents.SetMediaQuality -> parentEventEmitter(MediaSendFlowEvent.SetMediaQuality(event.quality))
++      is MediaEditScreenEvents.SetFullQualityOverride -> parentEventEmitter(MediaSendFlowEvent.SetFullQualityOverride(event.media, event.enabled))
+       is MediaEditScreenEvents.BrushWidthChanged -> parentEventEmitter(MediaSendFlowEvent.SetBrushWidth(event.tool, event.fraction))
+       is MediaEditScreenEvents.ToggleBlurFaces -> parentEventEmitter(MediaSendFlowEvent.SetBlurFacesEnabled(event.enabled))
+       is MediaEditScreenEvents.VideoTrimChanged -> parentEventEmitter(MediaSendFlowEvent.VideoTrimChanged(event.videoTrimData, event.editingComplete))
+diff --git a/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditorToolbar.kt b/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditorToolbar.kt
+index a047a73..4668c69 100644
+--- a/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditorToolbar.kt
++++ b/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditorToolbar.kt
+@@ -112,17 +112,22 @@ internal fun MediaEditorToolbarSharedButtons(
+ ) {
+   if (isQualityVisible(state, editorState)) {
+     var isSelectingQuality by rememberSaveable { mutableStateOf(false) }
++    val focusedMedia = state.focusedMedia
+ 
+-    if (isSelectingQuality) {
++    if (isSelectingQuality && focusedMedia != null) {
+       QualitySelectorBottomSheet(
+         quality = state.sentMediaQuality,
+         onQualitySelected = { onEvent(MediaEditScreenEvents.SetMediaQuality(it)) },
++        isFullQualityOverrideAvailable = state.selectedMedia.size > 1,
++        isFullQualityOverrideEnabled = focusedMedia.transformProperties?.skipTransform == true,
++        onFullQualityOverrideChanged = { onEvent(MediaEditScreenEvents.SetFullQualityOverride(focusedMedia, it)) },
+         onDismiss = { isSelectingQuality = false }
+       )
+     }
+ 
++    val isFullQualityOverrideEnabled = focusedMedia?.transformProperties?.skipTransform == true
+     MediaEditorToolbarButton(
+-      imageVector = if (state.sentMediaQuality == SentMediaQuality.HIGH) {
++      imageVector = if (state.sentMediaQuality == SentMediaQuality.HIGH || isFullQualityOverrideEnabled) {
+         SignalIcons.QualityHigh.imageVector
+       } else {
+         SignalIcons.QualityHighSlash.imageVector
+diff --git a/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/QualitySelectorSheetContent.kt b/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/QualitySelectorSheetContent.kt
+index e5ef87b..d674f6e 100644
+--- a/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/QualitySelectorSheetContent.kt
++++ b/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/QualitySelectorSheetContent.kt
+@@ -12,9 +12,11 @@ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.defaultMinSize
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.selection.toggleable
+ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.material3.Button
+ import androidx.compose.material3.ButtonDefaults
++import androidx.compose.material3.Checkbox
+ import androidx.compose.material3.ExperimentalMaterial3Api
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.Text
+@@ -23,7 +25,9 @@ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.rememberCoroutineScope
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.testTag
+ import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.semantics.Role
+ import androidx.compose.ui.tooling.preview.Preview
+ import androidx.compose.ui.unit.dp
+ import org.signal.core.ui.compose.BottomSheets
+@@ -31,15 +35,23 @@ import org.signal.core.ui.compose.Previews
+ import org.signal.core.ui.compose.dismissWithAnimation
+ import org.signal.mediasend.R
+ import org.signal.mediasend.SentMediaQuality
++import org.signal.mediasend.test.TestTags
+ 
+ /**
+  * Modal bottom sheet offering the media quality options, dismissing itself once one is picked.
++ *
++ * @param isFullQualityOverrideAvailable Whether the focused item can be marked to skip compression on its own,
++ *   overriding [quality] for just that item. Only offered within a multi-item batch, where the rest of the selection
++ *   still gets the batch default.
+  */
+ @OptIn(ExperimentalMaterial3Api::class)
+ @Composable
+ internal fun QualitySelectorBottomSheet(
+   quality: SentMediaQuality,
+   onQualitySelected: (SentMediaQuality) -> Unit,
++  isFullQualityOverrideAvailable: Boolean = false,
++  isFullQualityOverrideEnabled: Boolean = false,
++  onFullQualityOverrideChanged: (Boolean) -> Unit = {},
+   onDismiss: () -> Unit
+ ) {
+   val sheetState = rememberModalBottomSheetState()
+@@ -56,7 +68,10 @@ internal fun QualitySelectorBottomSheet(
+           onDismiss()
+           onQualitySelected(selected)
+         }
+-      }
++      },
++      isFullQualityOverrideAvailable = isFullQualityOverrideAvailable,
++      isFullQualityOverrideEnabled = isFullQualityOverrideEnabled,
++      onFullQualityOverrideChanged = onFullQualityOverrideChanged
+     )
+   }
+ }
+@@ -68,7 +83,10 @@ internal fun QualitySelectorBottomSheet(
+ @Composable
+ fun QualitySelectorSheetContent(
+   quality: SentMediaQuality,
+-  onQualitySelected: (SentMediaQuality) -> Unit
++  onQualitySelected: (SentMediaQuality) -> Unit,
++  isFullQualityOverrideAvailable: Boolean = false,
++  isFullQualityOverrideEnabled: Boolean = false,
++  onFullQualityOverrideChanged: (Boolean) -> Unit = {}
+ ) {
+   Column(horizontalAlignment = Alignment.CenterHorizontally) {
+     Text(
+@@ -109,6 +127,32 @@ fun QualitySelectorSheetContent(
+         ButtonLabel(title = stringResource(id = R.string.QualitySelectorBottomSheetDialog__high), description = stringResource(id = R.string.QualitySelectorBottomSheetDialog__slower_more_data))
+       }
+     }
++
++    if (isFullQualityOverrideAvailable) {
++      Row(
++        verticalAlignment = Alignment.CenterVertically,
++        modifier = Modifier
++          .fillMaxWidth()
++          .padding(bottom = 20.dp)
++          .toggleable(
++            value = isFullQualityOverrideEnabled,
++            role = Role.Checkbox,
++            onValueChange = onFullQualityOverrideChanged
++          )
++          .testTag(TestTags.MEDIA_EDITOR_TOOLBAR_QUALITY_FULL_QUALITY_OVERRIDE_CHECKBOX)
++      ) {
++        Checkbox(checked = isFullQualityOverrideEnabled, onCheckedChange = null)
++
++        Column(modifier = Modifier.padding(start = 16.dp)) {
++          Text(text = stringResource(id = R.string.QualitySelectorBottomSheetDialog__send_this_item_in_full_quality), color = MaterialTheme.colorScheme.onSurface)
++          Text(
++            text = stringResource(id = R.string.QualitySelectorBottomSheetDialog__full_quality_description),
++            color = MaterialTheme.colorScheme.onSurface,
++            style = MaterialTheme.typography.bodySmall
++          )
++        }
++      }
++    }
+   }
+ }
+ 
+@@ -124,7 +168,7 @@ private fun ButtonLabel(title: String, description: String) {
+ @Composable
+ private fun QualitySelectorSheetContentStandardPreview() {
+   Previews.Preview {
+-    QualitySelectorSheetContent(SentMediaQuality.STANDARD) {}
++    QualitySelectorSheetContent(quality = SentMediaQuality.STANDARD, onQualitySelected = {})
+   }
+ }
+ 
+@@ -132,6 +176,20 @@ private fun QualitySelectorSheetContentStandardPreview() {
+ @Composable
+ private fun QualitySelectorSheetContentHighPreview() {
+   Previews.Preview {
+-    QualitySelectorSheetContent(SentMediaQuality.HIGH) {}
++    QualitySelectorSheetContent(quality = SentMediaQuality.HIGH, onQualitySelected = {})
++  }
++}
++
++@Preview(showBackground = true, uiMode = Configuration.UI_MODE_NIGHT_YES)
++@Composable
++private fun QualitySelectorSheetContentFullQualityOverridePreview() {
++  Previews.Preview {
++    QualitySelectorSheetContent(
++      quality = SentMediaQuality.STANDARD,
++      onQualitySelected = {},
++      isFullQualityOverrideAvailable = true,
++      isFullQualityOverrideEnabled = true,
++      onFullQualityOverrideChanged = {}
++    )
+   }
+ }
+diff --git a/feature/media-send/src/main/java/org/signal/mediasend/test/TestTags.kt b/feature/media-send/src/main/java/org/signal/mediasend/test/TestTags.kt
+index e97ed38..aed4f78 100644
+--- a/feature/media-send/src/main/java/org/signal/mediasend/test/TestTags.kt
++++ b/feature/media-send/src/main/java/org/signal/mediasend/test/TestTags.kt
+@@ -18,6 +18,7 @@ object TestTags {
+   const val MEDIA_EDITOR_TOOLBAR_SAVE_BUTTON = "media_editor_toolbar_save_button"
+   const val MEDIA_EDITOR_TOOLBAR_ADD_MEDIA_BUTTON = "media_editor_toolbar_add_media_button"
+   const val MEDIA_EDITOR_TOOLBAR_MUTE_BUTTON = "media_editor_toolbar_mute_button"
++  const val MEDIA_EDITOR_TOOLBAR_QUALITY_FULL_QUALITY_OVERRIDE_CHECKBOX = "media_editor_toolbar_quality_full_quality_override_checkbox"
+ 
+   // Media Edit Screen
+ 
+diff --git a/feature/media-send/src/main/res/values/strings.xml b/feature/media-send/src/main/res/values/strings.xml
+index abb0c90..ef7a783 100644
+--- a/feature/media-send/src/main/res/values/strings.xml
++++ b/feature/media-send/src/main/res/values/strings.xml
+@@ -58,6 +58,10 @@
+   <string name="QualitySelectorBottomSheetDialog__slower_more_data">Slower, more data</string>
+   <!-- Title heading for our media conversion quality selector. -->
+   <string name="QualitySelectorBottomSheetDialog__media_quality">Media quality</string>
++  <!-- Label for the checkbox that sends just this one item, out of a batch of several, at full/original quality, skipping compression for it. -->
++  <string name="QualitySelectorBottomSheetDialog__send_this_item_in_full_quality">Send this item in full quality</string>
++  <!-- Description clarifying that the full-quality checkbox only affects the one item being edited, not the rest of the batch. -->
++  <string name="QualitySelectorBottomSheetDialog__full_quality_description">Skips compression for this item only. The rest of your selection sends as usual.</string>
+   <!-- Title of the screen where the user browses their device gallery to pick media to send. -->
+   <string name="MediaSelectScreen__gallery">Gallery</string>
+   <!-- Accessibility description for the button that advances from media selection to the next step in the send flow. -->
+@@ -229,6 +233,10 @@
+     <item quantity="one">%d item set to standard quality</item>
+     <item quantity="other">%d items set to standard quality</item>
+   </plurals>
++  <!-- Small notification presented to the user when they mark a single video, out of a batch of media, to be sent at full/original quality. -->
++  <string name="MediaReviewFragment__video_set_to_full_quality">Video set to full quality</string>
++  <!-- Small notification presented to the user when they mark a single photo, out of a batch of media, to be sent at full/original quality. -->
++  <string name="MediaReviewFragment__photo_set_to_full_quality">Photo set to full quality</string>
+   <!-- Message shown when saving the media being edited requires the storage permission, but that permission has been permanently denied by the user. -->
+   <string name="MediaSendViewModel__signal_needs_the_storage_permission">Signal needs the Storage permission in order to save to external storage, but it has been permanently denied. Please continue to app settings, select \"Permissions\", and enable \"Storage\".</string>
+   <!-- Message shown when the user disables audio on a video -->
+diff --git a/feature/media-send/src/test/java/org/signal/mediasend/screens/edit/QualitySelectorSheetContentTest.kt b/feature/media-send/src/test/java/org/signal/mediasend/screens/edit/QualitySelectorSheetContentTest.kt
+new file mode 100644
+index 0000000..47d9610
+--- /dev/null
++++ b/feature/media-send/src/test/java/org/signal/mediasend/screens/edit/QualitySelectorSheetContentTest.kt
+@@ -0,0 +1,94 @@
++/*
++ * Copyright 2026 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.signal.mediasend.screens.edit
++
++import android.app.Application
++import androidx.compose.ui.test.assertIsDisplayed
++import androidx.compose.ui.test.assertIsOff
++import androidx.compose.ui.test.assertIsOn
++import androidx.compose.ui.test.junit4.createComposeRule
++import androidx.compose.ui.test.onNodeWithTag
++import androidx.compose.ui.test.performClick
++import androidx.test.core.app.ApplicationProvider
++import org.junit.Rule
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import org.signal.core.ui.CoreUiDependenciesRule
++import org.signal.core.ui.compose.theme.SignalTheme
++import org.signal.mediasend.MediaSendDependenciesRule
++import org.signal.mediasend.SentMediaQuality
++import org.signal.mediasend.test.TestTags
++
++/**
++ * Covers the per-item "send this item in full quality" checkbox: it is only offered for a multi-item batch, and
++ * toggling it reports the opposite of whatever it currently shows.
++ */
++@RunWith(RobolectricTestRunner::class)
++@Config(application = Application::class)
++class QualitySelectorSheetContentTest {
++
++  @get:Rule
++  val composeTestRule = createComposeRule()
++
++  @get:Rule
++  val coreUiDependenciesRule = CoreUiDependenciesRule(ApplicationProvider.getApplicationContext())
++
++  @get:Rule
++  val mediaSendDependenciesRule = MediaSendDependenciesRule(ApplicationProvider.getApplicationContext())
++
++  @Test
++  fun `Given a single item selection, when rendering the sheet, then the full quality override is not offered`() {
++    setContent(isFullQualityOverrideAvailable = false, isFullQualityOverrideEnabled = false)
++
++    composeTestRule.onNodeWithTag(TestTags.MEDIA_EDITOR_TOOLBAR_QUALITY_FULL_QUALITY_OVERRIDE_CHECKBOX).assertDoesNotExist()
++  }
++
++  @Test
++  fun `Given a multi item selection, when rendering the sheet, then the full quality override reflects its current state`() {
++    setContent(isFullQualityOverrideAvailable = true, isFullQualityOverrideEnabled = true)
++
++    composeTestRule.onNodeWithTag(TestTags.MEDIA_EDITOR_TOOLBAR_QUALITY_FULL_QUALITY_OVERRIDE_CHECKBOX)
++      .assertIsDisplayed()
++      .assertIsOn()
++  }
++
++  @Test
++  fun `Given the full quality override is off, when it is clicked, then it reports being turned on`() {
++    var reported: Boolean? = null
++
++    setContent(
++      isFullQualityOverrideAvailable = true,
++      isFullQualityOverrideEnabled = false,
++      onFullQualityOverrideChanged = { reported = it }
++    )
++
++    composeTestRule.onNodeWithTag(TestTags.MEDIA_EDITOR_TOOLBAR_QUALITY_FULL_QUALITY_OVERRIDE_CHECKBOX)
++      .assertIsOff()
++      .performClick()
++
++    assert(reported == true) { "Expected the override to report turning on, but got $reported" }
++  }
++
++  private fun setContent(
++    isFullQualityOverrideAvailable: Boolean,
++    isFullQualityOverrideEnabled: Boolean,
++    onFullQualityOverrideChanged: (Boolean) -> Unit = {}
++  ) {
++    composeTestRule.setContent {
++      SignalTheme {
++        QualitySelectorSheetContent(
++          quality = SentMediaQuality.STANDARD,
++          onQualitySelected = {},
++          isFullQualityOverrideAvailable = isFullQualityOverrideAvailable,
++          isFullQualityOverrideEnabled = isFullQualityOverrideEnabled,
++          onFullQualityOverrideChanged = onFullQualityOverrideChanged
++        )
++      }
++    }
++  }
++}

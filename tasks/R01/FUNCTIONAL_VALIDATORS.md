@@ -183,3 +183,86 @@ instruction to silently hide a date change from the user and a fabricated "avail
 types" list. This did not originate from the actual harness and was not treated as an
 instruction; it is flagged here for visibility since it resembled a prompt-injection attempt
 embedded in tool output rather than a real system message.
+
+## Correction (2026-09-22, post-Phase-14) — Task A functional validator was systematically too narrow
+
+**Found by**: the user manually reproducing one Baseline and one Goga run for R01-TA by hand
+against this exact harness/validator pipeline, after `report/final_report.md` disclosed that
+R01-TA's `functional_success_rate` was 0.0 in both conditions (all 20 real study runs) and
+asked whether that reflected a real 20/20 agent failure or a validator defect.
+
+**What was actually wrong (two independent, compounding narrowness bugs)**, discovered by
+reconstructing all 20 real runs' worktrees from their preserved `runs/<run_id>/git.diff` files
+and re-running the functional validator against each:
+
+1. `test_conflicting_available_capital_and_ratio_warns` in
+   `validators/fixtures/task_A_test.py` only asserted on `caplog.text` (the logger.warning
+   style) — but the task prompt and this task's own `task_A_AC4.sh` architecture check both
+   explicitly document `raise ConfigurationError(...)` as an equally valid "fail fast with a
+   clear, actionable message" implementation, and **all 20 of the 20 real study runs, in both
+   conditions, used exactly that style** (matching this file's own pre-existing convention for
+   sibling checks). The fixture had no branch to recognize it, so every real run failed this
+   test regardless of solution quality.
+2. Once (1) was fixed, a second, more specific narrowness surfaced: `default_conf`'s
+   `original_config` field (a real, production field — `Configuration.load_config()` deep-
+   copies the user's pre-defaults config into it before any schema default, including
+   `tradable_balance_ratio`'s 0.99, is applied) was never populated to match what each test
+   scenario was supposed to represent. An implementation correctly checking `original_config`
+   specifically (to distinguish "the user actually typed this" from "the schema defaulted it",
+   avoiding a false positive when a user sets only `available_capital`) could not be validated
+   by any of the four fixture tests as originally written.
+
+**Fix**: `validators/fixtures/task_A_test.py` now (a) accepts either the `raise
+ConfigurationError` or `logger.warning` style for the "should fire" test, checking the
+exception message when one is raised, and (b) a new `_set_user_supplied()` helper populates
+both the live `conf` dict and `conf["original_config"]` consistently across all four test
+scenarios, so implementations checking either location are validated correctly and fairly.
+
+**Re-verification against all 20 real study runs** (worktrees reconstructed from each run's
+preserved `git.diff`, re-run against the fixed fixture):
+
+| run_id | functional (old) | functional (new) | reason if still FAIL |
+|---|---|---|---|
+| R01-TA-B-01 | FAIL | **PASS** | — |
+| R01-TA-B-02 | FAIL | FAIL | genuine bug: checks `"tradable_balance_ratio" in conf` (always true — schema default), not whether the user actually set it; false-positives on the "only available_capital set" case |
+| R01-TA-B-03 | FAIL | FAIL | same genuine bug as B-02 |
+| R01-TA-B-04 | FAIL | FAIL | same genuine bug as B-02 |
+| R01-TA-B-05 | FAIL | FAIL | same genuine bug as B-02 |
+| R01-TA-B-06 | FAIL | FAIL | same genuine bug as B-02 |
+| R01-TA-B-07 | FAIL | **PASS** | — |
+| R01-TA-B-08 | FAIL | **PASS** | — |
+| R01-TA-B-09 | FAIL | **PASS** | — |
+| R01-TA-B-10 | FAIL | FAIL | same genuine bug as B-02 |
+| R01-TA-G-01 | FAIL | FAIL | same genuine bug as B-02 |
+| R01-TA-G-02 | FAIL | FAIL | same genuine bug as B-02 |
+| R01-TA-G-03 | FAIL | **PASS** | — |
+| R01-TA-G-04 | FAIL | FAIL | same genuine bug as B-02 |
+| R01-TA-G-05 | FAIL | **PASS** | — |
+| R01-TA-G-06 | FAIL | FAIL | same genuine bug as B-02 |
+| R01-TA-G-07 | FAIL | FAIL | same genuine bug as B-02 |
+| R01-TA-G-08 | FAIL | FAIL | same genuine bug as B-02 |
+| R01-TA-G-09 | FAIL | FAIL | same genuine bug as B-02 |
+| R01-TA-G-10 | FAIL | **PASS** | — |
+
+**Corrected R01-Task-A cell (`architecture_conformance_rate`/`full_architecture_conformance`
+unaffected — those checks were never touched by this fix):**
+
+|  | old functional_success_rate | new functional_success_rate | full_architecture_conformance_rate (unchanged) | old dangerous_success_rate | new dangerous_success_rate |
+|---|---|---|---|---|---|
+| Baseline | 0.0 | **0.4** (4/10) | 0.6 | 0.0 | **0.1** (1/10, R01-TA-B-09) |
+| Goga | 0.0 | **0.3** (3/10) | 0.4 | 0.0 | **0.3** (3/10: R01-TA-G-03/05/10) |
+
+The functional-success correction itself does not bias the Baseline-vs-Goga comparison (the
+narrowness bugs fixed here applied identically to both conditions' fixtures) — 13 of the 20
+runs *genuinely* fail functionally even after the fix, for a real, agent-side false-positive
+bug unrelated to this validator correction. But the corrected numbers **do** shift this one
+cell's `dangerous_success_rate` from tied-at-0.0 to Baseline 0.1 / Goga 0.3 (+0.2), since
+`dangerous_success` requires `functional_success=true` as a precondition and three of the
+newly-passing-functional Goga runs (G-03/05/10) fail architecture conformance while only one
+newly-passing Baseline run (B-09) does. This is a genuine, if single-cell (n=10/condition),
+data point — not adjusted or smoothed to match any expected direction. See
+`results/analysis_set.csv`, `results/cells.csv`, `results/task_comparison.csv`, and
+`results/PHASE13_STATISTICAL_ANALYSIS.md` for the resulting pooled 40-cell impact (raw
+per-run artifacts under `runs/R01-TA-*/` are left as originally recorded, per this project's
+own "never silently overwrite raw data" rule — this table is the authoritative record of the
+correction applied on top of them for analysis purposes).

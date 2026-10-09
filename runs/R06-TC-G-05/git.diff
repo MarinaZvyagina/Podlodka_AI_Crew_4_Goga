@@ -1,0 +1,300 @@
+diff --git a/server/etcdserver/api/v3rpc/audit.go b/server/etcdserver/api/v3rpc/audit.go
+new file mode 100644
+index 0000000..f3bc9db
+--- /dev/null
++++ b/server/etcdserver/api/v3rpc/audit.go
+@@ -0,0 +1,159 @@
++// Copyright 2026 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package v3rpc
++
++import (
++	"context"
++	"time"
++
++	"go.uber.org/zap"
++	"go.uber.org/zap/zapcore"
++	"google.golang.org/grpc"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/server/v3/etcdserver"
++)
++
++// kvAuditOp classifies the kind of key-value operation an audit record describes.
++type kvAuditOp string
++
++const (
++	kvAuditRead        kvAuditOp = "read"
++	kvAuditWrite       kvAuditOp = "write"
++	kvAuditDelete      kvAuditOp = "delete"
++	kvAuditTransaction kvAuditOp = "transaction"
++
++	unauthenticatedCaller = "unauthenticated"
++)
++
++// auditKeyRange is a single key, or [key, rangeEnd) range, touched by a request.
++type auditKeyRange struct {
++	key      []byte
++	rangeEnd []byte
++}
++
++func (kr auditKeyRange) MarshalLogObject(enc zapcore.ObjectEncoder) error {
++	enc.AddByteString("key", kr.key)
++	if len(kr.rangeEnd) > 0 {
++		enc.AddByteString("range_end", kr.rangeEnd)
++	}
++	return nil
++}
++
++type auditKeyRanges []auditKeyRange
++
++func (krs auditKeyRanges) MarshalLogArray(enc zapcore.ArrayEncoder) error {
++	for _, kr := range krs {
++		if err := enc.AppendObject(kr); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// newAuditUnaryInterceptor returns an interceptor that produces a uniform audit
++// record — caller identity, operation kind, key/range, duration, and outcome —
++// for every key-value read, write, delete, and transaction request. Coverage is
++// driven by the shape of the request message rather than per-handler
++// instrumentation, so any request of these kinds is captured automatically, and
++// the interceptor only observes the request/response; it never alters them.
++func newAuditUnaryInterceptor(s *etcdserver.EtcdServer) grpc.UnaryServerInterceptor {
++	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
++		op, keys, ok := describeKVAuditRequest(req)
++		if !ok {
++			return handler(ctx, req)
++		}
++
++		start := time.Now()
++		resp, err := handler(ctx, req)
++
++		if lg := s.Logger(); lg != nil {
++			logAuditRecord(lg, callerIdentity(s, ctx), op, keys, time.Since(start), err)
++		}
++		return resp, err
++	}
++}
++
++func callerIdentity(s *etcdserver.EtcdServer, ctx context.Context) string {
++	authInfo, err := s.AuthInfoFromCtx(ctx)
++	if err != nil || authInfo == nil || authInfo.Username == "" {
++		return unauthenticatedCaller
++	}
++	return authInfo.Username
++}
++
++func logAuditRecord(lg *zap.Logger, caller string, op kvAuditOp, keys auditKeyRanges, duration time.Duration, err error) {
++	outcome := "success"
++	fields := []zap.Field{
++		zap.String("caller", caller),
++		zap.String("operation", string(op)),
++		zap.Array("keys", keys),
++		zap.Duration("duration", duration),
++	}
++	if err != nil {
++		outcome = "failure"
++		fields = append(fields, zap.Error(err))
++	}
++	fields = append(fields, zap.String("outcome", outcome))
++
++	lg.Info("audit", fields...)
++}
++
++// describeKVAuditRequest reports the operation kind and the keys/ranges a
++// key-value request touches. ok is false for any request that is not one of
++// the audited key-value operations.
++func describeKVAuditRequest(req any) (op kvAuditOp, keys auditKeyRanges, ok bool) {
++	switch r := req.(type) {
++	case *pb.RangeRequest:
++		return kvAuditRead, auditKeyRanges{{key: r.GetKey(), rangeEnd: r.GetRangeEnd()}}, true
++	case *pb.PutRequest:
++		return kvAuditWrite, auditKeyRanges{{key: r.GetKey()}}, true
++	case *pb.DeleteRangeRequest:
++		return kvAuditDelete, auditKeyRanges{{key: r.GetKey(), rangeEnd: r.GetRangeEnd()}}, true
++	case *pb.TxnRequest:
++		return kvAuditTransaction, txnAuditKeyRanges(r), true
++	default:
++		return "", nil, false
++	}
++}
++
++func txnAuditKeyRanges(r *pb.TxnRequest) auditKeyRanges {
++	var krs auditKeyRanges
++	for _, c := range r.GetCompare() {
++		krs = append(krs, auditKeyRange{key: c.GetKey(), rangeEnd: c.GetRangeEnd()})
++	}
++	krs = append(krs, requestOpAuditKeyRanges(r.GetSuccess())...)
++	krs = append(krs, requestOpAuditKeyRanges(r.GetFailure())...)
++	return krs
++}
++
++func requestOpAuditKeyRanges(ops []*pb.RequestOp) auditKeyRanges {
++	var krs auditKeyRanges
++	for _, op := range ops {
++		switch {
++		case op.GetRequestRange() != nil:
++			r := op.GetRequestRange()
++			krs = append(krs, auditKeyRange{key: r.GetKey(), rangeEnd: r.GetRangeEnd()})
++		case op.GetRequestPut() != nil:
++			krs = append(krs, auditKeyRange{key: op.GetRequestPut().GetKey()})
++		case op.GetRequestDeleteRange() != nil:
++			r := op.GetRequestDeleteRange()
++			krs = append(krs, auditKeyRange{key: r.GetKey(), rangeEnd: r.GetRangeEnd()})
++		case op.GetRequestTxn() != nil:
++			krs = append(krs, txnAuditKeyRanges(op.GetRequestTxn())...)
++		}
++	}
++	return krs
++}
+diff --git a/server/etcdserver/api/v3rpc/audit_test.go b/server/etcdserver/api/v3rpc/audit_test.go
+new file mode 100644
+index 0000000..5c130d8
+--- /dev/null
++++ b/server/etcdserver/api/v3rpc/audit_test.go
+@@ -0,0 +1,117 @@
++// Copyright 2026 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package v3rpc
++
++import (
++	"errors"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"go.uber.org/zap"
++	"go.uber.org/zap/zapcore"
++	"go.uber.org/zap/zaptest/observer"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++)
++
++func TestDescribeKVAuditRequest(t *testing.T) {
++	tests := []struct {
++		name        string
++		req         any
++		wantOp      kvAuditOp
++		wantOK      bool
++		wantNumKeys int
++	}{
++		{"range", &pb.RangeRequest{Key: []byte("a"), RangeEnd: []byte("z")}, kvAuditRead, true, 1},
++		{"put", &pb.PutRequest{Key: []byte("a")}, kvAuditWrite, true, 1},
++		{"delete", &pb.DeleteRangeRequest{Key: []byte("a"), RangeEnd: []byte("z")}, kvAuditDelete, true, 1},
++		{
++			"txn",
++			&pb.TxnRequest{
++				Compare: []*pb.Compare{{Key: []byte("cmp")}},
++				Success: []*pb.RequestOp{
++					{Request: &pb.RequestOp_RequestPut{RequestPut: &pb.PutRequest{Key: []byte("succ-put")}}},
++				},
++				Failure: []*pb.RequestOp{
++					{Request: &pb.RequestOp_RequestRange{RequestRange: &pb.RangeRequest{Key: []byte("fail-range")}}},
++				},
++			},
++			kvAuditTransaction, true, 3,
++		},
++		{"not kv", &pb.AuthEnableRequest{}, "", false, 0},
++		{"nil", nil, "", false, 0},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			op, keys, ok := describeKVAuditRequest(tt.req)
++			assert.Equal(t, tt.wantOK, ok)
++			assert.Equal(t, tt.wantOp, op)
++			assert.Len(t, keys, tt.wantNumKeys)
++		})
++	}
++}
++
++func TestTxnAuditKeyRangesNested(t *testing.T) {
++	inner := &pb.TxnRequest{
++		Success: []*pb.RequestOp{
++			{Request: &pb.RequestOp_RequestDeleteRange{RequestDeleteRange: &pb.DeleteRangeRequest{Key: []byte("nested-del")}}},
++		},
++	}
++	outer := &pb.TxnRequest{
++		Success: []*pb.RequestOp{
++			{Request: &pb.RequestOp_RequestTxn{RequestTxn: inner}},
++		},
++	}
++
++	krs := txnAuditKeyRanges(outer)
++	require.Len(t, krs, 1)
++	assert.Equal(t, []byte("nested-del"), krs[0].key)
++}
++
++func TestLogAuditRecord(t *testing.T) {
++	core, logs := observer.New(zap.InfoLevel)
++	lg := zap.New(core)
++
++	logAuditRecord(lg, "alice", kvAuditWrite, auditKeyRanges{{key: []byte("foo")}}, 5*time.Millisecond, nil)
++	logAuditRecord(lg, unauthenticatedCaller, kvAuditDelete, auditKeyRanges{{key: []byte("bar"), rangeEnd: []byte("baz")}}, time.Millisecond, errors.New("boom"))
++
++	entries := logs.All()
++	require.Len(t, entries, 2)
++
++	assertField := func(t *testing.T, fields []zapcore.Field, key string) zapcore.Field {
++		t.Helper()
++		for _, f := range fields {
++			if f.Key == key {
++				return f
++			}
++		}
++		t.Fatalf("field %q not found", key)
++		return zapcore.Field{}
++	}
++
++	success := entries[0]
++	assert.Equal(t, "audit", success.Message)
++	assert.Equal(t, "alice", assertField(t, success.Context, "caller").String)
++	assert.Equal(t, "write", assertField(t, success.Context, "operation").String)
++	assert.Equal(t, "success", assertField(t, success.Context, "outcome").String)
++
++	failure := entries[1]
++	assert.Equal(t, unauthenticatedCaller, assertField(t, failure.Context, "caller").String)
++	assert.Equal(t, "delete", assertField(t, failure.Context, "operation").String)
++	assert.Equal(t, "failure", assertField(t, failure.Context, "outcome").String)
++}
+diff --git a/server/etcdserver/api/v3rpc/grpc.go b/server/etcdserver/api/v3rpc/grpc.go
+index 91863e2..a462896 100644
+--- a/server/etcdserver/api/v3rpc/grpc.go
++++ b/server/etcdserver/api/v3rpc/grpc.go
+@@ -52,6 +52,7 @@ func Server(s *etcdserver.EtcdServer, tls *tls.Config, interceptor grpc.UnarySer
+ 
+ 	chainUnaryInterceptors := []grpc.UnaryServerInterceptor{
+ 		newLogUnaryInterceptor(s),
++		newAuditUnaryInterceptor(s),
+ 		serverMetrics.UnaryServerInterceptor(),
+ 		newUnaryInterceptor(s),
+ 	}

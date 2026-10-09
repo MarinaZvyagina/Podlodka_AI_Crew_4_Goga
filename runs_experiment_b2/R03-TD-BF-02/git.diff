@@ -1,0 +1,621 @@
+diff --git a/docs/arch/request-id.md b/docs/arch/request-id.md
+new file mode 100644
+index 0000000..8636e4c
+--- /dev/null
++++ b/docs/arch/request-id.md
+@@ -0,0 +1,126 @@
++# [ARCHITECTURE_PLAN]
++
++## Topic
++
++Request/correlation id propagation — `docs/arch/request-id.md`
++
++A single HTTP header carrying a per-request correlation id, reused when a caller already supplies one and
++generated otherwise, always present on the response, and readable by application code while the request is
++being handled — identically whether the app runs on the Express or the Fastify platform integration.
++
++## Implementation Order
++
++1. **`packages/core/request-id`** (new) — has no `Imports` from any other documented cell, so it is designed
++   and implemented first. It depends only on Node's built-in `node:async_hooks` and `node:crypto`, and on the
++   `NestMiddleware` shape already established by `packages/common/interfaces/middleware` (not a documented
++   cell, referenced only in prose).
++
++No existing CODEMANIFEST needs modification: this feature does not change the contract of `core/adapters`,
++`core/router`, `platform-express/adapters`, or `platform-fastify/adapters` — it only relies on the existing,
++already-documented fact that `AbstractHttpAdapter` subclasses expose a uniform `use()` registration point, and
++that both concrete adapters ultimately hand registered middleware the platform's raw request/response objects.
++
++## Artifacts
++
++### Cell: `packages/core/request-id` (created)
++
++**CODEMANIFEST**
++
++```yaml
++Usages:
++  header_convention: |
++    The correlation id travels as a single HTTP header, read case-insensitively and always written back
++    using the canonical name `X-Request-Id`. Reuse an inbound value verbatim when present and non-empty;
++    only generate a new id when the header is absent or empty. Never emit more than one value for the
++    header on a given response.
++
++Annotations: |
++  Implements request/correlation id propagation for one incoming HTTP request, uniformly across every
++  platform HTTP adapter the framework bundles (Express, Fastify). Every request/response object this cell
++  touches is treated only as a plain Node.js `http.IncomingMessage`/`http.ServerResponse` surface (`headers`,
++  `setHeader`, `getHeader`) — never a platform-specific wrapper — because that is the shape both bundled
++  platform integrations hand to middleware registered through `HttpServer.use()` / `MiddlewareConsumer`.
++  Use `header_convention` for header handling.
++
++---
++
++"RequestIdStorage()":
++  location: request-id.storage.ts
++  annotations: |
++    Static holder that publishes the resolved id for the current request to any code running within it, via
++    Node's AsyncLocalStorage, so application code can read the same id `RequestIdMiddleware` writes to the
++    response header without receiving it as an explicit argument or parsing the response.
++
++    Algorithm:
++    1. Hold a single module-level `AsyncLocalStorage<string>` instance for the lifetime of the process.
++  methods:
++    "run(id: string, callback: Object<string, any>) -> result: any": |
++      Run `callback` with `id` bound as the active request id for the duration of its execution, including
++      further async continuations scheduled from within it.
++
++      `id`: the resolved request/correlation id to publish
++      `callback`: the function to execute with `id` active; its return value is passed through unchanged
++
++      Requirements:
++      - Code awaited or scheduled from within `callback` must still observe `id` via `getId()`.
++    "getId() -> id: string | null": |
++      Return the id active for the currently executing asynchronous context.
++
++      `id`: the active request id, or `null` when called outside of a `run` scope
++
++"RequestIdMiddleware()":
++  location: request-id.middleware.ts
++  annotations: |
++    Injectable, platform-agnostic middleware that resolves the request/correlation id for one incoming
++    request, exposes it to application code via `RequestIdStorage`, and guarantees it is present on the
++    outgoing response. Implements the framework's `NestMiddleware` shape (a `use(req, res, next)` method) so
++    it can be registered through `MiddlewareConsumer.apply(...).forRoutes(...)` the same way on every
++    platform integration.
++
++    Algorithm:
++    1. Read the inbound value of the `X-Request-Id` header from `req`, matched case-insensitively
++    2. When present and non-empty, reuse it verbatim as the request id; otherwise generate a new id
++    3. Write the resolved id back onto `res` under `X-Request-Id`, per `header_convention`
++    4. Invoke `next` via `RequestIdStorage.run`, so the resolved id is active for every downstream guard,
++       interceptor, pipe, handler, and exception filter for this request
++
++    Requirements:
++    - The id observed via `RequestIdStorage.getId()` anywhere during this request must equal the value sent
++      back in the `X-Request-Id` response header.
++  methods:
++    "use(req: any, res: any, next: Object<string, any>)": |
++      Resolve and publish the request id for one request-response cycle, per the type's Algorithm.
++
++---
++
++Author: Goga
++CreatedAt: 14/09/26
++Description: |
++  Documents request/correlation id propagation: resolving (or reusing) a per-request id, returning it on
++  every HTTP response, and publishing it to application code for the duration of the request, uniformly
++  across the Express and Fastify platform integrations.
++```
++
++**`.usages/` files** — none. `header_convention` is short (a few sentences, specific to this cell) and is kept
++inline per the cookbook's inline-form guidance rather than split into a file.
++
++## Dependency Map
++
++```
++packages/core/request-id   (no Imports — leaf cell)
++```
++
++No other cell imports from `packages/core/request-id` as part of this change; it is consumed at the
++application layer (via `MiddlewareConsumer` and direct calls to `RequestIdStorage.getId()`), not by other
++framework cells.
++
++## Verification Checklist
++
++- `RequestIdStorage.run`/`getId` round-trip an id correctly across at least one `await` boundary (proves
++  `AsyncLocalStorage` context survives async continuations).
++- `RequestIdMiddleware` reuses an inbound `X-Request-Id` header verbatim instead of generating a new one.
++- `RequestIdMiddleware` generates a new id (non-empty, unique per request) when no header is supplied.
++- The resolved id appears on the outgoing response's `X-Request-Id` header in both cases.
++- A value read via `RequestIdStorage.getId()` from inside a controller handler equals the response header
++  value, on both the default (Express) adapter and `FastifyAdapter`, using the same application code.
++- `goga lint` passes for the new cell.
+diff --git a/integration/hello-world/e2e/request-id-fastify.spec.ts b/integration/hello-world/e2e/request-id-fastify.spec.ts
+new file mode 100644
+index 0000000..56bd767
+--- /dev/null
++++ b/integration/hello-world/e2e/request-id-fastify.spec.ts
+@@ -0,0 +1,87 @@
++import {
++  Controller,
++  Get,
++  MiddlewareConsumer,
++  Module,
++  NestModule,
++} from '@nestjs/common';
++import { RequestIdMiddleware, RequestIdStorage } from '@nestjs/core';
++import {
++  FastifyAdapter,
++  NestFastifyApplication,
++} from '@nestjs/platform-fastify';
++import { Test } from '@nestjs/testing';
++import request from 'supertest';
++
++@Controller()
++class RequestIdTestController {
++  @Get('request-id')
++  getId() {
++    return { id: RequestIdStorage.getId() };
++  }
++}
++
++@Module({
++  controllers: [RequestIdTestController],
++})
++class RequestIdTestModule implements NestModule {
++  configure(consumer: MiddlewareConsumer) {
++    consumer.apply(RequestIdMiddleware).forRoutes('*');
++  }
++}
++
++describe('Request id (FastifyAdapter)', () => {
++  let app: NestFastifyApplication;
++
++  beforeEach(async () => {
++    app = (
++      await Test.createTestingModule({
++        imports: [RequestIdTestModule],
++      }).compile()
++    ).createNestApplication<NestFastifyApplication>(new FastifyAdapter());
++
++    await app.init();
++    await app.getHttpAdapter().getInstance().ready();
++  });
++
++  it('should generate a request id and return it on the response header', async () => {
++    const response = await request(app.getHttpServer())
++      .get('/request-id')
++      .expect(200);
++
++    expect(response.headers['x-request-id']).toBeTruthy();
++  });
++
++  it('should expose the same id to the route handler as the response header carries', async () => {
++    const response = await request(app.getHttpServer())
++      .get('/request-id')
++      .expect(200);
++
++    expect(response.body.id).toEqual(response.headers['x-request-id']);
++  });
++
++  it('should reuse an inbound x-request-id header instead of generating a new one', async () => {
++    const response = await request(app.getHttpServer())
++      .get('/request-id')
++      .set('x-request-id', 'caller-supplied-id')
++      .expect(200);
++
++    expect(response.headers['x-request-id']).toEqual('caller-supplied-id');
++    expect(response.body.id).toEqual('caller-supplied-id');
++  });
++
++  it('should generate a different id for each request with no inbound header', async () => {
++    const [first, second] = await Promise.all([
++      request(app.getHttpServer()).get('/request-id'),
++      request(app.getHttpServer()).get('/request-id'),
++    ]);
++
++    expect(first.headers['x-request-id']).not.toEqual(
++      second.headers['x-request-id'],
++    );
++  });
++
++  afterEach(async () => {
++    await app.close();
++  });
++});
+diff --git a/integration/hello-world/e2e/request-id.spec.ts b/integration/hello-world/e2e/request-id.spec.ts
+new file mode 100644
+index 0000000..5d45530
+--- /dev/null
++++ b/integration/hello-world/e2e/request-id.spec.ts
+@@ -0,0 +1,83 @@
++import {
++  Controller,
++  Get,
++  INestApplication,
++  MiddlewareConsumer,
++  Module,
++  NestModule,
++} from '@nestjs/common';
++import { RequestIdMiddleware, RequestIdStorage } from '@nestjs/core';
++import { Test } from '@nestjs/testing';
++import request from 'supertest';
++
++@Controller()
++class RequestIdTestController {
++  @Get('request-id')
++  getId() {
++    return { id: RequestIdStorage.getId() };
++  }
++}
++
++@Module({
++  controllers: [RequestIdTestController],
++})
++class RequestIdTestModule implements NestModule {
++  configure(consumer: MiddlewareConsumer) {
++    consumer.apply(RequestIdMiddleware).forRoutes('*');
++  }
++}
++
++describe('Request id (ExpressAdapter)', () => {
++  let app: INestApplication;
++
++  beforeEach(async () => {
++    app = (
++      await Test.createTestingModule({
++        imports: [RequestIdTestModule],
++      }).compile()
++    ).createNestApplication();
++
++    await app.init();
++  });
++
++  it('should generate a request id and return it on the response header', async () => {
++    const response = await request(app.getHttpServer())
++      .get('/request-id')
++      .expect(200);
++
++    expect(response.headers['x-request-id']).toBeTruthy();
++  });
++
++  it('should expose the same id to the route handler as the response header carries', async () => {
++    const response = await request(app.getHttpServer())
++      .get('/request-id')
++      .expect(200);
++
++    expect(response.body.id).toEqual(response.headers['x-request-id']);
++  });
++
++  it('should reuse an inbound x-request-id header instead of generating a new one', async () => {
++    const response = await request(app.getHttpServer())
++      .get('/request-id')
++      .set('x-request-id', 'caller-supplied-id')
++      .expect(200);
++
++    expect(response.headers['x-request-id']).toEqual('caller-supplied-id');
++    expect(response.body.id).toEqual('caller-supplied-id');
++  });
++
++  it('should generate a different id for each request with no inbound header', async () => {
++    const [first, second] = await Promise.all([
++      request(app.getHttpServer()).get('/request-id'),
++      request(app.getHttpServer()).get('/request-id'),
++    ]);
++
++    expect(first.headers['x-request-id']).not.toEqual(
++      second.headers['x-request-id'],
++    );
++  });
++
++  afterEach(async () => {
++    await app.close();
++  });
++});
+diff --git a/packages/core/index.ts b/packages/core/index.ts
+index 64791fa..b21ef33 100644
+--- a/packages/core/index.ts
++++ b/packages/core/index.ts
+@@ -25,5 +25,6 @@ export * from './nest-application.js';
+ export * from './nest-application-context.js';
+ export { IEntryNestModule, NestFactory } from './nest-factory.js';
+ export * from './repl/index.js';
++export * from './request-id/index.js';
+ export * from './router/index.js';
+ export * from './services/index.js';
+diff --git a/packages/core/request-id/CODEMANIFEST b/packages/core/request-id/CODEMANIFEST
+new file mode 100644
+index 0000000..75cdefc
+--- /dev/null
++++ b/packages/core/request-id/CODEMANIFEST
+@@ -0,0 +1,76 @@
++Usages:
++  header_convention: |
++    The correlation id travels as a single HTTP header, read case-insensitively and always written back
++    using the canonical header name. Reuse an inbound value verbatim when present and non-empty; only
++    generate a new id when the header is absent or empty. Never emit more than one value for the header on
++    a given response.
++
++Annotations: |
++  Implements request/correlation id propagation for one incoming HTTP request, uniformly across every
++  platform HTTP adapter the framework bundles (Express, Fastify). Every request/response object this cell
++  touches is treated only as a plain Node.js request/response surface — never a platform-specific wrapper —
++  because that is the shape both bundled platform integrations hand to middleware registered through the
++  framework's own platform-agnostic middleware pipeline.
++  Use `header_convention` for header handling.
++
++---
++
++"RequestIdStorage()":
++  location: request-id.storage.ts
++  annotations: |
++    Static holder that publishes the resolved id for the current request to any code running within it, via
++    Node's AsyncLocalStorage, so application code can read the same id published by `RequestIdMiddleware`
++    without receiving it as an explicit argument or parsing it back out of the response.
++
++    Algorithm:
++    1. Hold a single module-level AsyncLocalStorage instance for the lifetime of the process.
++  methods:
++    "run(id: string, callback: Object<string, any>) -> result: any": |
++      Run `callback` with `id` bound as the active request id for the duration of its execution, including
++      further async continuations scheduled from within it.
++
++      `id`: the resolved request/correlation id to publish
++      `callback`: the function to execute with `id` active
++      `result`: the return value of `callback`, passed through unchanged
++
++      Requirements:
++      - Code awaited or scheduled from within `callback` must still observe `id` via the companion getter.
++    "getId() -> id: string | null": |
++      Return the id active for the currently executing asynchronous context.
++
++      `id`: the active request id, or `null` when called outside of an active run scope
++
++"RequestIdMiddleware()":
++  location: request-id.middleware.ts
++  annotations: |
++    Injectable, platform-agnostic middleware that resolves the request/correlation id for one incoming
++    request, exposes it to application code via `RequestIdStorage`, and guarantees it is present on the
++    outgoing response. Shaped so it can be registered through the framework's own middleware-application
++    mechanism the same way on every platform integration.
++  methods:
++    "use(req: any, res: any, next: Object<string, any>)": |
++      Resolve and publish the request id for one request-response cycle.
++
++      `req`: the incoming request; only its headers are read, per `header_convention`
++      `res`: the outgoing response; the resolved id is written onto it, per `header_convention`
++      `next`: continuation to invoke to hand off to the rest of the request pipeline
++
++      Algorithm:
++      1. Read the inbound header value from `req`, matched case-insensitively, per `header_convention`
++      2. When present and non-empty, reuse it verbatim as the request id; otherwise generate a new id
++      3. Write the resolved id back onto `res`, per `header_convention`
++      4. Invoke `next` via `RequestIdStorage`, so the resolved id is active for every downstream guard,
++         interceptor, pipe, handler, and exception filter for this request
++
++      Requirements:
++      - The id observed via `RequestIdStorage` anywhere during this request must equal the value sent back
++        in the response header.
++
++---
++
++Author: Goga
++CreatedAt: 14/09/26
++Description: |
++  Documents request/correlation id propagation: resolving (or reusing) a per-request id, returning it on
++  every HTTP response, and publishing it to application code for the duration of the request, uniformly
++  across the Express and Fastify platform integrations.
+diff --git a/packages/core/request-id/index.ts b/packages/core/request-id/index.ts
+new file mode 100644
+index 0000000..6e319ad
+--- /dev/null
++++ b/packages/core/request-id/index.ts
+@@ -0,0 +1,3 @@
++export * from './request-id.constants.js';
++export * from './request-id.middleware.js';
++export * from './request-id.storage.js';
+diff --git a/packages/core/request-id/request-id.constants.ts b/packages/core/request-id/request-id.constants.ts
+new file mode 100644
+index 0000000..e280a2f
+--- /dev/null
++++ b/packages/core/request-id/request-id.constants.ts
+@@ -0,0 +1,4 @@
++/**
++ * @publicApi
++ */
++export const REQUEST_ID_HEADER = 'X-Request-Id';
+diff --git a/packages/core/request-id/request-id.middleware.ts b/packages/core/request-id/request-id.middleware.ts
+new file mode 100644
+index 0000000..46cd3ac
+--- /dev/null
++++ b/packages/core/request-id/request-id.middleware.ts
+@@ -0,0 +1,23 @@
++import { randomUUID } from 'node:crypto';
++import { Injectable, type NestMiddleware } from '@nestjs/common';
++import { REQUEST_ID_HEADER } from './request-id.constants.js';
++import { RequestIdStorage } from './request-id.storage.js';
++
++/**
++ * @publicApi
++ */
++@Injectable()
++export class RequestIdMiddleware implements NestMiddleware {
++  public use(req: any, res: any, next: (error?: any) => void): void {
++    const inboundHeader = req.headers?.[REQUEST_ID_HEADER.toLowerCase()];
++    const inboundId = Array.isArray(inboundHeader)
++      ? inboundHeader[0]
++      : inboundHeader;
++
++    const id = inboundId || randomUUID();
++
++    res.setHeader(REQUEST_ID_HEADER, id);
++
++    RequestIdStorage.run(id, () => next());
++  }
++}
+diff --git a/packages/core/request-id/request-id.storage.ts b/packages/core/request-id/request-id.storage.ts
+new file mode 100644
+index 0000000..6a62228
+--- /dev/null
++++ b/packages/core/request-id/request-id.storage.ts
+@@ -0,0 +1,16 @@
++import { AsyncLocalStorage } from 'node:async_hooks';
++
++/**
++ * @publicApi
++ */
++export class RequestIdStorage {
++  private static readonly storage = new AsyncLocalStorage<string>();
++
++  public static run<T>(id: string, callback: () => T): T {
++    return this.storage.run(id, callback);
++  }
++
++  public static getId(): string | null {
++    return this.storage.getStore() ?? null;
++  }
++}
+diff --git a/packages/core/test/request-id/request-id.middleware.spec.ts b/packages/core/test/request-id/request-id.middleware.spec.ts
+new file mode 100644
+index 0000000..939bb3a
+--- /dev/null
++++ b/packages/core/test/request-id/request-id.middleware.spec.ts
+@@ -0,0 +1,82 @@
++import { REQUEST_ID_HEADER } from '../../request-id/request-id.constants.js';
++import { RequestIdMiddleware } from '../../request-id/request-id.middleware.js';
++import { RequestIdStorage } from '../../request-id/request-id.storage.js';
++
++describe('RequestIdMiddleware', () => {
++  let middleware: RequestIdMiddleware;
++  let res: { setHeader: ReturnType<typeof vi.fn> };
++  let next: ReturnType<typeof vi.fn>;
++
++  beforeEach(() => {
++    middleware = new RequestIdMiddleware();
++    res = { setHeader: vi.fn() };
++    next = vi.fn();
++  });
++
++  it('should reuse an inbound request id header verbatim', () => {
++    const req = { headers: { 'x-request-id': 'incoming-id' } };
++
++    middleware.use(req, res, next);
++
++    expect(res.setHeader).toHaveBeenCalledWith(REQUEST_ID_HEADER, 'incoming-id');
++  });
++
++  it('should generate a new id when no header is supplied', () => {
++    const req = { headers: {} };
++
++    middleware.use(req, res, next);
++
++    const [, generatedId] = res.setHeader.mock.calls[0];
++    expect(generatedId).toEqual(expect.any(String));
++    expect(generatedId.length).toBeGreaterThan(0);
++  });
++
++  it('should generate a new id when the header is present but empty', () => {
++    const req = { headers: { 'x-request-id': '' } };
++
++    middleware.use(req, res, next);
++
++    const [, generatedId] = res.setHeader.mock.calls[0];
++    expect(generatedId).not.toEqual('');
++  });
++
++  it('should generate a different id on each call with no inbound header', () => {
++    middleware.use({ headers: {} }, res, next);
++    const [, firstId] = res.setHeader.mock.calls[0];
++
++    const res2 = { setHeader: vi.fn() };
++    middleware.use({ headers: {} }, res2, next);
++    const [, secondId] = res2.setHeader.mock.calls[0];
++
++    expect(firstId).not.toEqual(secondId);
++  });
++
++  it('should call next() exactly once', () => {
++    middleware.use({ headers: {} }, res, next);
++    expect(next).toHaveBeenCalledOnce();
++  });
++
++  it('should make the resolved id observable via RequestIdStorage while next() runs', () => {
++    const req = { headers: { 'x-request-id': 'incoming-id' } };
++    next.mockImplementation(() => {
++      expect(RequestIdStorage.getId()).toEqual('incoming-id');
++    });
++
++    middleware.use(req, res, next);
++
++    expect(next).toHaveBeenCalledOnce();
++  });
++
++  it('should not leave the id active once use() returns', () => {
++    middleware.use({ headers: { 'x-request-id': 'incoming-id' } }, res, next);
++    expect(RequestIdStorage.getId()).toBeNull();
++  });
++
++  it('should take the first value when the header arrives as an array', () => {
++    const req = { headers: { 'x-request-id': ['first-id', 'second-id'] } };
++
++    middleware.use(req, res, next);
++
++    expect(res.setHeader).toHaveBeenCalledWith(REQUEST_ID_HEADER, 'first-id');
++  });
++});
+diff --git a/packages/core/test/request-id/request-id.storage.spec.ts b/packages/core/test/request-id/request-id.storage.spec.ts
+new file mode 100644
+index 0000000..2ef9416
+--- /dev/null
++++ b/packages/core/test/request-id/request-id.storage.spec.ts
+@@ -0,0 +1,50 @@
++import { RequestIdStorage } from '../../request-id/request-id.storage.js';
++
++describe('RequestIdStorage', () => {
++  describe('getId', () => {
++    it('should return null outside of a run scope', () => {
++      expect(RequestIdStorage.getId()).toBeNull();
++    });
++  });
++
++  describe('run', () => {
++    it('should expose the bound id via getId() within the callback', () => {
++      RequestIdStorage.run('req-1', () => {
++        expect(RequestIdStorage.getId()).toEqual('req-1');
++      });
++    });
++
++    it('should return the callback result', () => {
++      const result = RequestIdStorage.run('req-1', () => 42);
++      expect(result).toEqual(42);
++    });
++
++    it('should not leak the id outside of the run scope', () => {
++      RequestIdStorage.run('req-1', () => undefined);
++      expect(RequestIdStorage.getId()).toBeNull();
++    });
++
++    it('should preserve the id across an async continuation', async () => {
++      const observed = await RequestIdStorage.run('req-async', async () => {
++        await new Promise(resolve => setTimeout(resolve, 0));
++        return RequestIdStorage.getId();
++      });
++      expect(observed).toEqual('req-async');
++    });
++
++    it('should isolate concurrent run scopes from each other', async () => {
++      const [first, second] = await Promise.all([
++        RequestIdStorage.run('req-a', async () => {
++          await new Promise(resolve => setTimeout(resolve, 10));
++          return RequestIdStorage.getId();
++        }),
++        RequestIdStorage.run('req-b', async () => {
++          await new Promise(resolve => setTimeout(resolve, 0));
++          return RequestIdStorage.getId();
++        }),
++      ]);
++      expect(first).toEqual('req-a');
++      expect(second).toEqual('req-b');
++    });
++  });
++});

@@ -1,0 +1,182 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModel.kt b/app/src/main/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModel.kt
+index bafbb3f..7dcd7bd 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModel.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModel.kt
+@@ -148,6 +148,7 @@ class ContactSearchViewModel(
+ 
+   override fun onCleared() {
+     disposables.clear()
++    searchRepository.dispose()
+   }
+ 
+   fun setFastScrollEnabled(enabled: Boolean) {
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationSearchViewModel.java b/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationSearchViewModel.java
+index 976237f..132a2d5 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationSearchViewModel.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationSearchViewModel.java
+@@ -35,6 +35,11 @@ public class ConversationSearchViewModel extends ViewModel {
+     return result;
+   }
+ 
++  @Override
++  protected void onCleared() {
++    searchRepository.dispose();
++  }
++
+   public void onQueryUpdated(@NonNull String query, long threadId, boolean forced) {
+     if (firstSearch && queryTooShort(query)) {
+       result.postValue(new SearchResult(Collections.emptyList(), 0));
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+index f47eddb..8e28cc7 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+@@ -18,6 +18,7 @@ import org.signal.core.util.logging.Log;
+ import org.thoughtcrime.securesms.conversation.MessageStyler;
+ import org.thoughtcrime.securesms.database.BodyAdjustment;
+ import org.thoughtcrime.securesms.database.BodyRangeUtil;
++import org.thoughtcrime.securesms.database.DatabaseObserver;
+ import org.thoughtcrime.securesms.database.GroupTable;
+ import org.thoughtcrime.securesms.database.MentionTable;
+ import org.thoughtcrime.securesms.database.MentionUtil;
+@@ -49,6 +50,7 @@ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.Executor;
+ 
+ import static org.thoughtcrime.securesms.database.SearchTable.SNIPPET_WRAP;
+@@ -72,6 +74,10 @@ public class SearchRepository {
+ 
+   private final Executor serialExecutor;
+ 
++  private final Map<ThreadCacheKey, ThreadSearchResult>   threadResultCache  = new ConcurrentHashMap<>();
++  private final Map<MessageCacheKey, MessageSearchResult> messageResultCache = new ConcurrentHashMap<>();
++  private final DatabaseObserver.Observer                 cacheInvalidationObserver;
++
+   public SearchRepository(@NonNull String noteToSelfTitle) {
+     this.context           = AppDependencies.getApplication().getApplicationContext();
+     this.noteToSelfTitle   = noteToSelfTitle;
+@@ -81,18 +87,44 @@ public class SearchRepository {
+     this.mentionTable      = SignalDatabase.mentions();
+     this.messageTable      = SignalDatabase.messages();
+     this.serialExecutor    = new SerialExecutor(SignalExecutors.BOUNDED);
++
++    this.cacheInvalidationObserver = this::invalidateCaches;
++    AppDependencies.getDatabaseObserver().registerConversationListObserver(cacheInvalidationObserver);
++  }
++
++  /**
++   * Stops listening for database changes. Must be called once this repository is no longer needed,
++   * or the cache-invalidation observer registered in the constructor leaks.
++   */
++  public void dispose() {
++    AppDependencies.getDatabaseObserver().unregisterObserver(cacheInvalidationObserver);
++  }
++
++  private void invalidateCaches() {
++    threadResultCache.clear();
++    messageResultCache.clear();
+   }
+ 
+   @WorkerThread
+   public @NonNull ThreadSearchResult queryThreadsSync(@NonNull String query, boolean unreadOnly) {
+     SignalTrace.beginSection("ConversationListSearch-Threads");
+     try {
++      ThreadCacheKey      cacheKey = new ThreadCacheKey(query, unreadOnly);
++      ThreadSearchResult  cached   = threadResultCache.get(cacheKey);
++
++      if (cached != null) {
++        return cached;
++      }
++
+       long                      start  = System.currentTimeMillis();
+       List<ThreadWithRecipient> result = queryConversations(query, unreadOnly);
+ 
+       Log.d(TAG, "[threads] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new ThreadSearchResult(result, query);
++      ThreadSearchResult searchResult = new ThreadSearchResult(result, query);
++      threadResultCache.put(cacheKey, searchResult);
++
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -102,6 +134,13 @@ public class SearchRepository {
+   public @NonNull MessageSearchResult queryMessagesSync(@NonNull String query, @NonNull SearchFilter filter) {
+     SignalTrace.beginSection("ConversationListSearch-Messages");
+     try {
++      MessageCacheKey     cacheKey = new MessageCacheKey(query, filter);
++      MessageSearchResult cached   = messageResultCache.get(cacheKey);
++
++      if (cached != null) {
++        return cached;
++      }
++
+       long start = System.currentTimeMillis();
+ 
+       List<MessageResult> messages         = queryMessages(query, filter);
+@@ -111,7 +150,10 @@ public class SearchRepository {
+ 
+       Log.d(TAG, "[messages] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new MessageSearchResult(combined, query);
++      MessageSearchResult searchResult = new MessageSearchResult(combined, query);
++      messageResultCache.put(cacheKey, searchResult);
++
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -485,4 +527,50 @@ public class SearchRepository {
+   public interface ModelBuilder<T> {
+     T build(@NonNull Cursor cursor);
+   }
++
++  private static final class ThreadCacheKey {
++    private final String  query;
++    private final boolean unreadOnly;
++
++    ThreadCacheKey(@NonNull String query, boolean unreadOnly) {
++      this.query      = query;
++      this.unreadOnly = unreadOnly;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++      if (this == o) return true;
++      if (!(o instanceof ThreadCacheKey)) return false;
++      ThreadCacheKey that = (ThreadCacheKey) o;
++      return unreadOnly == that.unreadOnly && query.equals(that.query);
++    }
++
++    @Override
++    public int hashCode() {
++      return Objects.hash(query, unreadOnly);
++    }
++  }
++
++  private static final class MessageCacheKey {
++    private final String       query;
++    private final SearchFilter filter;
++
++    MessageCacheKey(@NonNull String query, @NonNull SearchFilter filter) {
++      this.query  = query;
++      this.filter = filter;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++      if (this == o) return true;
++      if (!(o instanceof MessageCacheKey)) return false;
++      MessageCacheKey that = (MessageCacheKey) o;
++      return query.equals(that.query) && filter.equals(that.filter);
++    }
++
++    @Override
++    public int hashCode() {
++      return Objects.hash(query, filter);
++    }
++  }
+ }

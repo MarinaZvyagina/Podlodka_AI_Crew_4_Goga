@@ -1,0 +1,200 @@
+diff --git a/packages/platform-socket.io/adapters/io-adapter.ts b/packages/platform-socket.io/adapters/io-adapter.ts
+index 90c640c..72f0565 100644
+--- a/packages/platform-socket.io/adapters/io-adapter.ts
++++ b/packages/platform-socket.io/adapters/io-adapter.ts
+@@ -6,7 +6,7 @@ import { fromEvent, Observable } from 'rxjs';
+ import { filter, first, map, mergeMap, share, takeUntil } from 'rxjs/operators';
+ import { Namespace, Server, ServerOptions, Socket } from 'socket.io';
+ import { isFunction, isNil } from '@nestjs/common/internal';
+-import { DISCONNECT_EVENT } from '@nestjs/websockets/internal';
++import { DISCONNECT_EVENT, SHUTDOWN_EVENT } from '@nestjs/websockets/internal';
+ 
+ /**
+  * @publicApi
+@@ -93,6 +93,10 @@ export class IoAdapter extends AbstractWsAdapter {
+   }
+ 
+   public async close(server: Server): Promise<void> {
++    // Give connected clients a heads-up that the server is shutting down,
++    // so they can tell a graceful shutdown apart from a dropped connection.
++    server.emit(SHUTDOWN_EVENT);
++
+     if (this.forceCloseConnections && server.httpServer === this.httpServer) {
+       return;
+     }
+diff --git a/packages/platform-socket.io/test/io-adapter.spec.ts b/packages/platform-socket.io/test/io-adapter.spec.ts
+index 7c5520a..7f98fbf 100644
+--- a/packages/platform-socket.io/test/io-adapter.spec.ts
++++ b/packages/platform-socket.io/test/io-adapter.spec.ts
+@@ -45,4 +45,42 @@ describe('IoAdapter', () => {
+       expect(messageCalls).toHaveLength(2);
+     });
+   });
++
++  describe('close', () => {
++    it('should emit a shutdown notice to connected clients before closing the server', async () => {
++      const emitSpy = vi.fn();
++      const closeSpy = vi.fn((cb: Function) => cb());
++      const fakeServer = { emit: emitSpy, close: closeSpy } as any;
++
++      await adapter.close(fakeServer);
++
++      expect(emitSpy).toHaveBeenCalledWith('shutdown');
++      expect(closeSpy).toHaveBeenCalled();
++      expect(emitSpy.mock.invocationCallOrder[0]).toBeLessThan(
++        closeSpy.mock.invocationCallOrder[0],
++      );
++    });
++
++    it('should not call close() but still emit the shutdown notice when force-closing shared http server connections', async () => {
++      const httpServer = {} as any;
++      const forcedAdapter = new IoAdapter(httpServer);
++      forcedAdapter.forceCloseConnections = true;
++
++      const emitSpy = vi.fn();
++      const closeSpy = vi.fn();
++      const fakeServer = { emit: emitSpy, close: closeSpy, httpServer } as any;
++
++      await forcedAdapter.close(fakeServer);
++
++      expect(emitSpy).toHaveBeenCalledWith('shutdown');
++      expect(closeSpy).not.toHaveBeenCalled();
++    });
++
++    it('should resolve without throwing when there are no connected clients', async () => {
++      const closeSpy = vi.fn((cb: Function) => cb());
++      const fakeServer = { emit: vi.fn(), close: closeSpy } as any;
++
++      await expect(adapter.close(fakeServer)).resolves.toBeUndefined();
++    });
++  });
+ });
+diff --git a/packages/platform-ws/adapters/ws-adapter.ts b/packages/platform-ws/adapters/ws-adapter.ts
+index fd75cf7..50fcf8d 100644
+--- a/packages/platform-ws/adapters/ws-adapter.ts
++++ b/packages/platform-ws/adapters/ws-adapter.ts
+@@ -9,6 +9,7 @@ import {
+   CLOSE_EVENT,
+   CONNECTION_EVENT,
+   ERROR_EVENT,
++  SHUTDOWN_EVENT,
+ } from '@nestjs/websockets/internal';
+ import type { MessageMappingProperties } from '@nestjs/websockets';
+ 
+@@ -197,6 +198,10 @@ export class WsAdapter extends AbstractWsAdapter {
+       server.close((err: Error) => (err ? reject(err) : resolve(undefined))),
+     );
+     if (server.clients) {
++      // Give connected clients a heads-up that the server is shutting down
++      // before dropping their connection, and wait for the message to be
++      // flushed so it isn't cut off by the immediately following terminate.
++      await this.notifyClientsAboutShutdown(server.clients);
+       for (const ws of server.clients) {
+         ws.terminate();
+       }
+@@ -204,6 +209,18 @@ export class WsAdapter extends AbstractWsAdapter {
+     await closeEventSignal;
+   }
+ 
++  protected notifyClientsAboutShutdown(clients: Iterable<any>): Promise<void[]> {
++    const message = JSON.stringify({ event: SHUTDOWN_EVENT, data: undefined });
++    const openClients = Array.from(clients).filter(
++      ws => ws.readyState === READY_STATE.OPEN_STATE,
++    );
++    return Promise.all(
++      openClients.map(
++        ws => new Promise<void>(resolve => ws.send(message, () => resolve())),
++      ),
++    );
++  }
++
+   public async dispose() {
+     const closeEventSignals = Array.from(this.httpServersRegistry)
+       .filter(([port]) => port !== UNDERLYING_HTTP_SERVER_PORT)
+diff --git a/packages/platform-ws/test/ws-adapter.spec.ts b/packages/platform-ws/test/ws-adapter.spec.ts
+new file mode 100644
+index 0000000..862d2d6
+--- /dev/null
++++ b/packages/platform-ws/test/ws-adapter.spec.ts
+@@ -0,0 +1,66 @@
++import { WsAdapter } from '../adapters/ws-adapter.js';
++
++describe('WsAdapter', () => {
++  let adapter: WsAdapter;
++
++  beforeEach(() => {
++    adapter = new WsAdapter();
++  });
++
++  describe('close', () => {
++    const createClient = (readyState = 1) => ({
++      readyState,
++      send: vi.fn((_message: string, callback: Function) => callback()),
++      terminate: vi.fn(),
++    });
++
++    it('should send a shutdown notice to every open client before terminating it', async () => {
++      const clientA = createClient();
++      const clientB = createClient();
++      const closeSpy = vi.fn((cb: Function) => cb());
++      const fakeServer = {
++        clients: new Set([clientA, clientB]),
++        close: closeSpy,
++      } as any;
++
++      await adapter.close(fakeServer);
++
++      const expectedMessage = JSON.stringify({
++        event: 'shutdown',
++        data: undefined,
++      });
++      for (const client of [clientA, clientB]) {
++        expect(client.send).toHaveBeenCalledWith(
++          expectedMessage,
++          expect.any(Function),
++        );
++        // the shutdown notice must be flushed before the connection is terminated
++        expect(client.send.mock.invocationCallOrder[0]).toBeLessThan(
++          client.terminate.mock.invocationCallOrder[0],
++        );
++      }
++    });
++
++    it('should not send a shutdown notice to clients that are not open', async () => {
++      const connectingClient = createClient(0 /* CONNECTING */);
++      const closeSpy = vi.fn((cb: Function) => cb());
++      const fakeServer = {
++        clients: new Set([connectingClient]),
++        close: closeSpy,
++      } as any;
++
++      await adapter.close(fakeServer);
++
++      expect(connectingClient.send).not.toHaveBeenCalled();
++      expect(connectingClient.terminate).toHaveBeenCalled();
++    });
++
++    it('should resolve without throwing when there are no connected clients', async () => {
++      const closeSpy = vi.fn((cb: Function) => cb());
++      const fakeServer = { clients: new Set(), close: closeSpy } as any;
++
++      await expect(adapter.close(fakeServer)).resolves.toBeUndefined();
++      expect(closeSpy).toHaveBeenCalled();
++    });
++  });
++});
+diff --git a/packages/websockets/constants.ts b/packages/websockets/constants.ts
+index e8b7b8e..9ab5081 100644
+--- a/packages/websockets/constants.ts
++++ b/packages/websockets/constants.ts
+@@ -13,3 +13,10 @@ export const CONNECTION_EVENT = 'connection';
+ export const DISCONNECT_EVENT = 'disconnect';
+ export const CLOSE_EVENT = 'close';
+ export const ERROR_EVENT = 'error';
++
++/**
++ * Event emitted to connected clients right before the server closes their
++ * connection as part of the application shutdown sequence, so clients can
++ * distinguish a graceful shutdown from a dropped connection.
++ */
++export const SHUTDOWN_EVENT = 'shutdown';

@@ -1,0 +1,124 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+index f47eddb..28ec7ef 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+@@ -38,6 +38,7 @@ import org.thoughtcrime.securesms.util.SignalTrace;
+ import org.signal.core.util.Util;
+ import org.signal.core.util.concurrent.SerialExecutor;
+ 
++import java.util.AbstractMap;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
+@@ -49,7 +50,9 @@ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.Executor;
++import java.util.concurrent.atomic.AtomicLong;
+ 
+ import static org.thoughtcrime.securesms.database.SearchTable.SNIPPET_WRAP;
+ 
+@@ -62,6 +65,19 @@ public class SearchRepository {
+ 
+   private static final int MAX_SNIPPET_SIZE = 100;
+ 
++  /**
++   * Bumped whenever the underlying data a search could have matched against changes (message
++   * inserted/edited/deleted, thread or group updated, etc.), so that {@link #threadSearchCache}
++   * and {@link #messageSearchCache} entries stamped with an older generation are treated as
++   * misses. Registered once per process, not per {@link SearchRepository} instance, so creating
++   * many short-lived repositories (one per search screen) never leaks observer registrations.
++   */
++  private static final AtomicLong CACHE_GENERATION = new AtomicLong();
++
++  static {
++    AppDependencies.getDatabaseObserver().registerConversationListObserver(CACHE_GENERATION::incrementAndGet);
++  }
++
+   private final Context           context;
+   private final String            noteToSelfTitle;
+   private final SearchTable       searchDatabase;
+@@ -72,6 +88,9 @@ public class SearchRepository {
+ 
+   private final Executor serialExecutor;
+ 
++  private final Map<AbstractMap.SimpleImmutableEntry<String, Boolean>, CachedResult<ThreadSearchResult>>       threadSearchCache  = new ConcurrentHashMap<>();
++  private final Map<AbstractMap.SimpleImmutableEntry<String, SearchFilter>, CachedResult<MessageSearchResult>> messageSearchCache = new ConcurrentHashMap<>();
++
+   public SearchRepository(@NonNull String noteToSelfTitle) {
+     this.context           = AppDependencies.getApplication().getApplicationContext();
+     this.noteToSelfTitle   = noteToSelfTitle;
+@@ -87,12 +106,22 @@ public class SearchRepository {
+   public @NonNull ThreadSearchResult queryThreadsSync(@NonNull String query, boolean unreadOnly) {
+     SignalTrace.beginSection("ConversationListSearch-Threads");
+     try {
++      AbstractMap.SimpleImmutableEntry<String, Boolean> cacheKey   = new AbstractMap.SimpleImmutableEntry<>(query, unreadOnly);
++      long                                               generation = CACHE_GENERATION.get();
++      CachedResult<ThreadSearchResult>                   cached     = threadSearchCache.get(cacheKey);
++
++      if (cached != null && cached.generation == generation) {
++        return cached.result;
++      }
++
+       long                      start  = System.currentTimeMillis();
+       List<ThreadWithRecipient> result = queryConversations(query, unreadOnly);
+ 
+       Log.d(TAG, "[threads] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new ThreadSearchResult(result, query);
++      ThreadSearchResult searchResult = new ThreadSearchResult(result, query);
++      threadSearchCache.put(cacheKey, new CachedResult<>(generation, searchResult));
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -102,6 +131,14 @@ public class SearchRepository {
+   public @NonNull MessageSearchResult queryMessagesSync(@NonNull String query, @NonNull SearchFilter filter) {
+     SignalTrace.beginSection("ConversationListSearch-Messages");
+     try {
++      AbstractMap.SimpleImmutableEntry<String, SearchFilter> cacheKey   = new AbstractMap.SimpleImmutableEntry<>(query, filter);
++      long                                                    generation = CACHE_GENERATION.get();
++      CachedResult<MessageSearchResult>                       cached     = messageSearchCache.get(cacheKey);
++
++      if (cached != null && cached.generation == generation) {
++        return cached.result;
++      }
++
+       long start = System.currentTimeMillis();
+ 
+       List<MessageResult> messages         = queryMessages(query, filter);
+@@ -111,7 +148,9 @@ public class SearchRepository {
+ 
+       Log.d(TAG, "[messages] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new MessageSearchResult(combined, query);
++      MessageSearchResult searchResult = new MessageSearchResult(combined, query);
++      messageSearchCache.put(cacheKey, new CachedResult<>(generation, searchResult));
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -478,6 +517,21 @@ public class SearchRepository {
+     }
+   }
+ 
++  /**
++   * A cached search result stamped with the {@link #CACHE_GENERATION} it was computed under. A
++   * lookup only treats this as a hit if the generation still matches the current value, i.e.
++   * nothing search-relevant has changed since this result was computed.
++   */
++  private static final class CachedResult<T> {
++    final long generation;
++    final T    result;
++
++    CachedResult(long generation, @NonNull T result) {
++      this.generation = generation;
++      this.result     = result;
++    }
++  }
++
+   public interface Callback<E> {
+     void onResult(@NonNull E result);
+   }

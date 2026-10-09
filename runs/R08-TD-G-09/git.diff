@@ -1,0 +1,327 @@
+diff --git a/app/src/androidTest/java/org/thoughtcrime/securesms/database/DatabaseObserverTest.kt b/app/src/androidTest/java/org/thoughtcrime/securesms/database/DatabaseObserverTest.kt
+index f111813..3666f6d 100644
+--- a/app/src/androidTest/java/org/thoughtcrime/securesms/database/DatabaseObserverTest.kt
++++ b/app/src/androidTest/java/org/thoughtcrime/securesms/database/DatabaseObserverTest.kt
+@@ -129,6 +129,33 @@ class DatabaseObserverTest {
+     db.endTransaction()
+   }
+ 
++  @Test
++  fun notifyConversationListListeners_bumpsConversationListGeneration() {
++    val generationBefore = observer.conversationListGeneration
++
++    observer.notifyConversationListListeners()
++    observer.flush()
++
++    assertEquals(generationBefore + 1, observer.conversationListGeneration)
++  }
++
++  @Test
++  fun notifyConversationListListeners_doesNotBumpConversationListGenerationUntilTransactionSucceeds() {
++    val generationBefore = observer.conversationListGeneration
++
++    db.beginTransaction()
++
++    observer.notifyConversationListListeners()
++    observer.flush()
++    assertEquals(generationBefore, observer.conversationListGeneration)
++
++    db.setTransactionSuccessful()
++    db.endTransaction()
++    observer.flush()
++
++    assertEquals(generationBefore + 1, observer.conversationListGeneration)
++  }
++
+   @Test
+   fun notifyConversationListeners_runsAfterSuccessIfInTransaction_ignoreDuplicateNotifications() {
+     val thread1Count = AtomicInteger(0)
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/database/DatabaseObserver.java b/app/src/main/java/org/thoughtcrime/securesms/database/DatabaseObserver.java
+index d5ca55c..3dc5792 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/database/DatabaseObserver.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/database/DatabaseObserver.java
+@@ -19,6 +19,7 @@ import java.util.Set;
+ import java.util.UUID;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.Executor;
++import java.util.concurrent.atomic.AtomicLong;
+ 
+ /**
+  * Allows listening to database changes to varying degrees of specificity.
+@@ -52,6 +53,15 @@ public class DatabaseObserver {
+ 
+   private final Executor    executor;
+ 
++  /**
++   * Bumped every time {@link #notifyConversationListListeners()} fires, i.e. whenever a
++   * conversation-list-relevant mutation (message insert/update/delete, thread/group/recipient
++   * change, etc.) commits. Callers that cache data derived from that mutation set (e.g. search
++   * results) can stamp cache entries with this value and treat a mismatch as "stale" without
++   * needing to register/unregister their own {@link Observer}.
++   */
++  private final AtomicLong conversationListGeneration;
++
+   private final Set<Observer>                      conversationListObservers;
+   private final Map<Long, Set<Observer>>           conversationObservers;
+   private final Map<Long, Set<Observer>>           verboseConversationObservers;
+@@ -76,6 +86,7 @@ public class DatabaseObserver {
+ 
+   public DatabaseObserver() {
+     this.executor                     = new SerialExecutor(SignalExecutors.BOUNDED);
++    this.conversationListGeneration   = new AtomicLong(0);
+     this.conversationListObservers    = new HashSet<>();
+     this.conversationObservers        = new HashMap<>();
+     this.verboseConversationObservers = new HashMap<>();
+@@ -290,12 +301,20 @@ public class DatabaseObserver {
+ 
+   public void notifyConversationListListeners() {
+     runPostSuccessfulTransaction(KEY_CONVERSATION_LIST, () -> {
++      conversationListGeneration.incrementAndGet();
+       for (Observer listener : conversationListObservers) {
+         listener.onChanged();
+       }
+     });
+   }
+ 
++  /**
++   * @see #conversationListGeneration
++   */
++  public long getConversationListGeneration() {
++    return conversationListGeneration.get();
++  }
++
+   public void notifyPaymentListeners(@NonNull UUID paymentId) {
+     runPostSuccessfulTransaction(KEY_PAYMENT + paymentId.toString(), () -> {
+       notifyMapped(paymentObservers, paymentId);
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+index f47eddb..80fd804 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+@@ -13,6 +13,7 @@ import androidx.annotation.VisibleForTesting;
+ import androidx.annotation.WorkerThread;
+ 
+ import org.signal.core.util.CursorUtil;
++import org.signal.core.util.LRUCache;
+ import org.signal.core.util.concurrent.SignalExecutors;
+ import org.signal.core.util.logging.Log;
+ import org.thoughtcrime.securesms.conversation.MessageStyler;
+@@ -38,6 +39,7 @@ import org.thoughtcrime.securesms.util.SignalTrace;
+ import org.signal.core.util.Util;
+ import org.signal.core.util.concurrent.SerialExecutor;
+ 
++import java.util.AbstractMap;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
+@@ -62,6 +64,9 @@ public class SearchRepository {
+ 
+   private static final int MAX_SNIPPET_SIZE = 100;
+ 
++  /** Max number of distinct (query, filter) combinations kept per result type. */
++  private static final int SEARCH_CACHE_SIZE = 20;
++
+   private final Context           context;
+   private final String            noteToSelfTitle;
+   private final SearchTable       searchDatabase;
+@@ -72,6 +77,11 @@ public class SearchRepository {
+ 
+   private final Executor serialExecutor;
+ 
++  private final Object                                                             threadCacheLock  = new Object();
++  private final Object                                                             messageCacheLock = new Object();
++  private final LRUCache<Map.Entry<String, Boolean>, CacheEntry<ThreadSearchResult>>     threadSearchCache  = new LRUCache<>(SEARCH_CACHE_SIZE);
++  private final LRUCache<Map.Entry<String, SearchFilter>, CacheEntry<MessageSearchResult>> messageSearchCache = new LRUCache<>(SEARCH_CACHE_SIZE);
++
+   public SearchRepository(@NonNull String noteToSelfTitle) {
+     this.context           = AppDependencies.getApplication().getApplicationContext();
+     this.noteToSelfTitle   = noteToSelfTitle;
+@@ -87,12 +97,21 @@ public class SearchRepository {
+   public @NonNull ThreadSearchResult queryThreadsSync(@NonNull String query, boolean unreadOnly) {
+     SignalTrace.beginSection("ConversationListSearch-Threads");
+     try {
++      Map.Entry<String, Boolean> cacheKey = new AbstractMap.SimpleImmutableEntry<>(query, unreadOnly);
++      ThreadSearchResult          cached   = getCached(threadSearchCache, threadCacheLock, cacheKey);
++      if (cached != null) {
++        return cached;
++      }
++
+       long                      start  = System.currentTimeMillis();
+       List<ThreadWithRecipient> result = queryConversations(query, unreadOnly);
+ 
+       Log.d(TAG, "[threads] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new ThreadSearchResult(result, query);
++      ThreadSearchResult searchResult = new ThreadSearchResult(result, query);
++      putCached(threadSearchCache, threadCacheLock, cacheKey, searchResult);
++
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -102,6 +121,12 @@ public class SearchRepository {
+   public @NonNull MessageSearchResult queryMessagesSync(@NonNull String query, @NonNull SearchFilter filter) {
+     SignalTrace.beginSection("ConversationListSearch-Messages");
+     try {
++      Map.Entry<String, SearchFilter> cacheKey = new AbstractMap.SimpleImmutableEntry<>(query, filter);
++      MessageSearchResult              cached   = getCached(messageSearchCache, messageCacheLock, cacheKey);
++      if (cached != null) {
++        return cached;
++      }
++
+       long start = System.currentTimeMillis();
+ 
+       List<MessageResult> messages         = queryMessages(query, filter);
+@@ -111,12 +136,47 @@ public class SearchRepository {
+ 
+       Log.d(TAG, "[messages] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new MessageSearchResult(combined, query);
++      MessageSearchResult searchResult = new MessageSearchResult(combined, query);
++      putCached(messageSearchCache, messageCacheLock, cacheKey, searchResult);
++
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+   }
+ 
++  /**
++   * Looks up a cached value, treating it as a miss if it was computed before the last
++   * conversation-list-relevant database mutation (see {@link org.thoughtcrime.securesms.database.DatabaseObserver#getConversationListGeneration()}).
++   * This is how the cache stays correct without needing to register/unregister a listener for
++   * this repository's lifecycle: a search term is only ever served from cache while nothing that
++   * could affect its results has changed since it was computed.
++   */
++  private <K, V> @Nullable V getCached(@NonNull Map<K, CacheEntry<V>> cache, @NonNull Object lock, @NonNull K key) {
++    long generation = AppDependencies.getDatabaseObserver().getConversationListGeneration();
++    synchronized (lock) {
++      CacheEntry<V> entry = cache.get(key);
++      return (entry != null && entry.generation == generation) ? entry.value : null;
++    }
++  }
++
++  private <K, V> void putCached(@NonNull Map<K, CacheEntry<V>> cache, @NonNull Object lock, @NonNull K key, @NonNull V value) {
++    long generation = AppDependencies.getDatabaseObserver().getConversationListGeneration();
++    synchronized (lock) {
++      cache.put(key, new CacheEntry<>(generation, value));
++    }
++  }
++
++  private static class CacheEntry<V> {
++    private final long generation;
++    private final V    value;
++
++    private CacheEntry(long generation, @NonNull V value) {
++      this.generation = generation;
++      this.value      = value;
++    }
++  }
++
+   public void query(@NonNull String query, long threadId, @NonNull Callback<List<MessageResult>> callback) {
+     if (TextUtils.isEmpty(query)) {
+       callback.onResult(Collections.emptyList());
+diff --git a/app/src/test/java/org/thoughtcrime/securesms/search/SearchRepositoryCacheTest.kt b/app/src/test/java/org/thoughtcrime/securesms/search/SearchRepositoryCacheTest.kt
+new file mode 100644
+index 0000000..0f28b43
+--- /dev/null
++++ b/app/src/test/java/org/thoughtcrime/securesms/search/SearchRepositoryCacheTest.kt
+@@ -0,0 +1,99 @@
++/*
++ * Copyright 2026 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.search
++
++import android.app.Application
++import io.mockk.every
++import io.mockk.mockk
++import io.mockk.mockkObject
++import io.mockk.unmockkAll
++import io.mockk.verify
++import org.junit.After
++import org.junit.Before
++import org.junit.Rule
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import org.thoughtcrime.securesms.database.GroupTable
++import org.thoughtcrime.securesms.database.MentionTable
++import org.thoughtcrime.securesms.database.MessageTable
++import org.thoughtcrime.securesms.database.RecipientTable
++import org.thoughtcrime.securesms.database.SearchTable
++import org.thoughtcrime.securesms.database.SignalDatabase
++import org.thoughtcrime.securesms.database.ThreadTable
++import org.thoughtcrime.securesms.testutil.MockAppDependenciesRule
++
++/**
++ * Verifies that repeating an identical [SearchRepository.queryThreadsSync] call is served from
++ * an in-memory cache rather than hitting the database again, and that distinct queries don't
++ * collide with each other's cached results. Invalidation on database change is covered by
++ * [org.thoughtcrime.securesms.database.DatabaseObserverTest], since that's what the cache keys
++ * off of.
++ */
++@RunWith(RobolectricTestRunner::class)
++@Config(manifest = Config.NONE, application = Application::class)
++class SearchRepositoryCacheTest {
++
++  @get:Rule
++  val appDependencies = MockAppDependenciesRule()
++
++  private lateinit var threadTable: ThreadTable
++  private lateinit var repository: SearchRepository
++
++  @Before
++  fun setUp() {
++    threadTable = mockk(relaxed = true)
++
++    mockkObject(SignalDatabase)
++    every { SignalDatabase.threads } returns threadTable
++    every { SignalDatabase.recipients } returns mockk<RecipientTable>(relaxed = true)
++    every { SignalDatabase.groups } returns mockk<GroupTable> {
++      every { queryGroupsByTitle(any(), any(), any(), any()) } returns GroupTable.Reader(null)
++    }
++    every { SignalDatabase.mentions } returns mockk<MentionTable>(relaxed = true)
++    every { SignalDatabase.messages } returns mockk<MessageTable>(relaxed = true)
++    every { SignalDatabase.messageSearch } returns mockk<SearchTable>(relaxed = true)
++
++    every { threadTable.getFilteredConversationList(any(), any()) } returns null
++
++    repository = SearchRepository("Note to Self")
++  }
++
++  @After
++  fun tearDown() {
++    unmockkAll()
++  }
++
++  @Test
++  fun `repeated identical search is served from cache`() {
++    repository.queryThreadsSync("alice", false)
++    repository.queryThreadsSync("alice", false)
++    repository.queryThreadsSync("alice", false)
++
++    // queryConversations hits getFilteredConversationList twice per uncached call (once for
++    // contacts, once for groups-by-title), so three uncached calls would be six invocations.
++    verify(exactly = 2) { threadTable.getFilteredConversationList(any(), any()) }
++  }
++
++  @Test
++  fun `distinct queries are cached independently`() {
++    repository.queryThreadsSync("alice", false)
++    repository.queryThreadsSync("bob", false)
++    repository.queryThreadsSync("alice", false)
++    repository.queryThreadsSync("bob", false)
++
++    verify(exactly = 4) { threadTable.getFilteredConversationList(any(), any()) }
++  }
++
++  @Test
++  fun `same text with a different filter is cached independently`() {
++    repository.queryThreadsSync("alice", unreadOnly = false)
++    repository.queryThreadsSync("alice", unreadOnly = true)
++
++    verify(exactly = 4) { threadTable.getFilteredConversationList(any(), any()) }
++  }
++}

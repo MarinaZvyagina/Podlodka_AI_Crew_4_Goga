@@ -1,0 +1,99 @@
+diff --git a/freqtrade/data/dataprovider.py b/freqtrade/data/dataprovider.py
+index ed396ba..0bae001 100644
+--- a/freqtrade/data/dataprovider.py
++++ b/freqtrade/data/dataprovider.py
+@@ -572,7 +572,7 @@ class DataProvider:
+         if self._exchange is None:
+             raise OperationalException(NO_EXCHANGE_EXCEPTION)
+         try:
+-            return self._exchange.fetch_ticker(pair)
++            return self._exchange.fetch_ticker(pair, cached=True)
+         except ExchangeError:
+             return {}
+ 
+diff --git a/freqtrade/exchange/exchange.py b/freqtrade/exchange/exchange.py
+index 69c9993..d587070 100644
+--- a/freqtrade/exchange/exchange.py
++++ b/freqtrade/exchange/exchange.py
+@@ -235,6 +235,10 @@ class Exchange:
+         self._cache_lock = Lock()
+         # Cache for 10 minutes ...
+         self._fetch_tickers_cache: FtTTLCache = FtTTLCache(maxsize=4, ttl=60 * 10)
++        # Cache single-pair tickers for a couple of seconds, to avoid hammering the
++        # exchange when the current price for the same pair is requested repeatedly
++        # in quick succession (e.g. by different parts of the strategy logic).
++        self._fetch_ticker_cache: FtTTLCache = FtTTLCache(maxsize=1000, ttl=2)
+         # Cache values for 300 to avoid frequent polling of the exchange for prices
+         # Caching only applies to RPC methods, so prices for open trades are still
+         # refreshed once every iteration.
+@@ -2162,11 +2166,24 @@ class Exchange:
+         return None
+ 
+     @retrier
+-    def fetch_ticker(self, pair: str) -> Ticker:
++    def fetch_ticker(self, pair: str, *, cached: bool = False) -> Ticker:
++        """
++        :param pair: Pair to get ticker for
++        :param cached: Allow reusing a very recently fetched ticker for this pair
++            instead of hitting the exchange again. Only applies to callers that
++            explicitly opt in - regular price-lookup callers always get a fresh value.
++        """
++        if cached:
++            with self._cache_lock:
++                ticker = self._fetch_ticker_cache.get(pair)
++            if ticker is not None:
++                return ticker
+         try:
+             if pair not in self.markets or self.markets[pair].get("active", False) is False:
+                 raise ExchangeError(f"Pair {pair} not available")
+             data: Ticker = self._api.fetch_ticker(pair)
++            with self._cache_lock:
++                self._fetch_ticker_cache[pair] = data
+             return data
+         except ccxt.DDoSProtection as e:
+             raise DDosProtection(e) from e
+diff --git a/tests/exchange/test_exchange.py b/tests/exchange/test_exchange.py
+index 7594d95..ee2e610 100644
+--- a/tests/exchange/test_exchange.py
++++ b/tests/exchange/test_exchange.py
+@@ -2507,6 +2507,40 @@ def test_fetch_ticker(default_conf, mocker, exchange_name):
+         exchange.fetch_ticker(pair="XRP/ETH")
+ 
+ 
++@pytest.mark.parametrize("exchange_name", EXCHANGES)
++def test_fetch_ticker_cached(default_conf, mocker, exchange_name, time_machine):
++    api_mock = MagicMock()
++    tick1 = {"symbol": "ETH/BTC", "bid": 0.00001098, "ask": 0.00001099, "last": 0.0001}
++    tick2 = {"symbol": "ETH/BTC", "bid": 0.5, "ask": 1, "last": 42}
++    api_mock.fetch_ticker = MagicMock(side_effect=[tick1, tick2, tick2])
++    api_mock.markets = {"ETH/BTC": {"active": True}}
++    exchange = get_patched_exchange(mocker, default_conf, api_mock, exchange=exchange_name)
++    time_machine.move_to("2023-01-01 00:00:00 +00:00")
++
++    # default (uncached) behavior is unchanged - always hits the exchange
++    ticker = exchange.fetch_ticker(pair="ETH/BTC")
++    assert ticker == tick1
++    assert api_mock.fetch_ticker.call_count == 1
++
++    # A cached=True request shortly after reuses the last fetched value,
++    # without hitting the exchange again.
++    ticker = exchange.fetch_ticker(pair="ETH/BTC", cached=True)
++    assert ticker == tick1
++    assert api_mock.fetch_ticker.call_count == 1
++
++    # ... but an uncached request still always goes to the exchange,
++    # regardless of how recently a price was fetched.
++    ticker = exchange.fetch_ticker(pair="ETH/BTC")
++    assert ticker == tick2
++    assert api_mock.fetch_ticker.call_count == 2
++
++    # Once the short cache window has elapsed, a cached request refreshes again.
++    time_machine.shift(3)
++    ticker = exchange.fetch_ticker(pair="ETH/BTC", cached=True)
++    assert ticker == tick2
++    assert api_mock.fetch_ticker.call_count == 3
++
++
+ @pytest.mark.parametrize("exchange_name", EXCHANGES)
+ def test___now_is_time_to_refresh(default_conf, mocker, exchange_name, time_machine):
+     exchange = get_patched_exchange(mocker, default_conf, exchange=exchange_name)

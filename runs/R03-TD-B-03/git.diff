@@ -1,0 +1,356 @@
+diff --git a/integration/hello-world/e2e/request-id.spec.ts b/integration/hello-world/e2e/request-id.spec.ts
+new file mode 100644
+index 0000000..e86b47c
+--- /dev/null
++++ b/integration/hello-world/e2e/request-id.spec.ts
+@@ -0,0 +1,148 @@
++import {
++  Controller,
++  Get,
++  INestApplication,
++  RequestId,
++  RequestIdStorage,
++  X_REQUEST_ID_HEADER,
++} from '@nestjs/common';
++import {
++  FastifyAdapter,
++  NestFastifyApplication,
++} from '@nestjs/platform-fastify';
++import { Test } from '@nestjs/testing';
++import request from 'supertest';
++
++@Controller()
++class RequestIdController {
++  @Get('id')
++  getId(@RequestId() requestId: string) {
++    return {
++      fromDecorator: requestId,
++      fromStorage: RequestIdStorage.get(),
++    };
++  }
++}
++
++function declareRequestIdSuite(
++  name: string,
++  createApp: () => Promise<INestApplication>,
++  afterInit: (app: INestApplication) => Promise<void> = async () => {},
++) {
++  describe(name, () => {
++    let app: INestApplication;
++
++    afterEach(async () => {
++      await app.close();
++    });
++
++    describe('default options', () => {
++      beforeEach(async () => {
++        app = await createApp();
++        app.enableRequestId();
++        await app.init();
++        await afterInit(app);
++      });
++
++      it('generates an id and returns it on the response header when the caller sends none', async () => {
++        const response = await request(app.getHttpServer())
++          .get('/id')
++          .expect(200);
++
++        const headerValue = response.headers[X_REQUEST_ID_HEADER];
++        expect(headerValue).toBeDefined();
++        expect(response.body.fromDecorator).toBe(headerValue);
++        expect(response.body.fromStorage).toBe(headerValue);
++      });
++
++      it('reuses the inbound request id instead of generating a new one', async () => {
++        const inboundId = 'caller-supplied-id-123';
++
++        const response = await request(app.getHttpServer())
++          .get('/id')
++          .set(X_REQUEST_ID_HEADER, inboundId)
++          .expect(200);
++
++        expect(response.headers[X_REQUEST_ID_HEADER]).toBe(inboundId);
++        expect(response.body.fromDecorator).toBe(inboundId);
++        expect(response.body.fromStorage).toBe(inboundId);
++      });
++
++      it('generates a different id per request when none is supplied', async () => {
++        const first = await request(app.getHttpServer()).get('/id').expect(200);
++        const second = await request(app.getHttpServer())
++          .get('/id')
++          .expect(200);
++
++        expect(first.headers[X_REQUEST_ID_HEADER]).not.toBe(
++          second.headers[X_REQUEST_ID_HEADER],
++        );
++      });
++
++      it('is not visible outside of a request', () => {
++        expect(RequestIdStorage.get()).toBeUndefined();
++      });
++    });
++
++    describe('custom options', () => {
++      const CUSTOM_HEADER = 'x-correlation-id';
++
++      beforeEach(async () => {
++        app = await createApp();
++        app.enableRequestId({
++          header: CUSTOM_HEADER,
++          generator: () => 'generated-id',
++        });
++        await app.init();
++        await afterInit(app);
++      });
++
++      it('uses the configured header name and generator', async () => {
++        const response = await request(app.getHttpServer())
++          .get('/id')
++          .expect(200);
++
++        expect(response.headers[CUSTOM_HEADER]).toBe('generated-id');
++        expect(response.headers[X_REQUEST_ID_HEADER]).toBeUndefined();
++        expect(response.body.fromDecorator).toBe('generated-id');
++      });
++
++      it('still reuses an inbound id sent on the configured header', async () => {
++        const response = await request(app.getHttpServer())
++          .get('/id')
++          .set(CUSTOM_HEADER, 'inbound-correlation-id')
++          .expect(200);
++
++        expect(response.headers[CUSTOM_HEADER]).toBe('inbound-correlation-id');
++        expect(response.body.fromDecorator).toBe('inbound-correlation-id');
++      });
++    });
++  });
++}
++
++declareRequestIdSuite('RequestId (ExpressAdapter)', async () => {
++  const moduleRef = await Test.createTestingModule({
++    controllers: [RequestIdController],
++  }).compile();
++
++  return moduleRef.createNestApplication();
++});
++
++declareRequestIdSuite(
++  'RequestId (FastifyAdapter)',
++  async () => {
++    const moduleRef = await Test.createTestingModule({
++      controllers: [RequestIdController],
++    }).compile();
++
++    return moduleRef.createNestApplication<NestFastifyApplication>(
++      new FastifyAdapter(),
++    );
++  },
++  async app => {
++    await (app as NestFastifyApplication)
++      .getHttpAdapter()
++      .getInstance()
++      .ready();
++  },
++);
+diff --git a/packages/common/decorators/http/index.ts b/packages/common/decorators/http/index.ts
+index e89f076..1873635 100644
+--- a/packages/common/decorators/http/index.ts
++++ b/packages/common/decorators/http/index.ts
+@@ -7,3 +7,4 @@ export * from './header.decorator.js';
+ export * from './redirect.decorator.js';
+ export * from './sse.decorator.js';
+ export * from './sse-signal.decorator.js';
++export * from './request-id.decorator.js';
+diff --git a/packages/common/decorators/http/request-id.decorator.ts b/packages/common/decorators/http/request-id.decorator.ts
+new file mode 100644
+index 0000000..cee14d3
+--- /dev/null
++++ b/packages/common/decorators/http/request-id.decorator.ts
+@@ -0,0 +1,26 @@
++import { RequestIdStorage } from '../../utils/request-id-storage.util.js';
++import { createParamDecorator } from './create-route-param-metadata.decorator.js';
++
++/**
++ * Route handler parameter decorator that injects the id of the request
++ * currently being handled.
++ *
++ * The same value is used both for the `X-Request-Id` response header
++ * (see `app.enableRequestId()`) and here, so a log line written from inside
++ * a route handler - or any other application code invoked while the request
++ * is being handled - can be correlated with the response without reading
++ * the id back out of the outgoing response.
++ *
++ * @example
++ * ```typescript
++ * @Get()
++ * findAll(@RequestId() requestId: string) {
++ *   this.logger.log('handling request', { requestId });
++ * }
++ * ```
++ *
++ * @publicApi
++ */
++export const RequestId: () => ParameterDecorator = createParamDecorator(
++  (): string | undefined => RequestIdStorage.get(),
++);
+diff --git a/packages/common/interfaces/nest-application.interface.ts b/packages/common/interfaces/nest-application.interface.ts
+index 9c3e7ca..98a5b32 100644
+--- a/packages/common/interfaces/nest-application.interface.ts
++++ b/packages/common/interfaces/nest-application.interface.ts
+@@ -11,6 +11,7 @@ import {
+ import { INestApplicationContext } from './nest-application-context.interface.js';
+ import { VersioningOptions } from './version-options.interface.js';
+ import { WebSocketAdapter } from './websockets/web-socket-adapter.interface.js';
++import { RequestIdOptions } from '../utils/request-id-storage.util.js';
+ 
+ /**
+  * Interface defining the core NestApplication object.
+@@ -44,6 +45,20 @@ export interface INestApplication<
+    */
+   enableVersioning(options?: VersioningOptions): this;
+ 
++  /**
++   * Ensures every response carries a request/correlation id header (reusing
++   * the inbound one, if the caller already sent one), and makes that id
++   * available to application code handling the request via
++   * `RequestIdStorage.get()` or the `@RequestId()` param decorator.
++   *
++   * Works identically regardless of the underlying HTTP adapter (Express or
++   * Fastify).
++   *
++   * @param {RequestIdOptions} options
++   * @returns {this}
++   */
++  enableRequestId(options?: RequestIdOptions): this;
++
+   /**
+    * Starts the application.
+    *
+diff --git a/packages/common/utils/index.ts b/packages/common/utils/index.ts
+index 3d7c02b..97bfe74 100644
+--- a/packages/common/utils/index.ts
++++ b/packages/common/utils/index.ts
+@@ -1 +1,2 @@
+ export * from './forward-ref.util.js';
++export * from './request-id-storage.util.js';
+diff --git a/packages/common/utils/request-id-storage.util.ts b/packages/common/utils/request-id-storage.util.ts
+new file mode 100644
+index 0000000..b8344db
+--- /dev/null
++++ b/packages/common/utils/request-id-storage.util.ts
+@@ -0,0 +1,69 @@
++import { AsyncLocalStorage } from 'async_hooks';
++
++/**
++ * Default name of the HTTP header used to carry the request/correlation id,
++ * both when reading it off an inbound request and when writing it onto the
++ * outbound response.
++ *
++ * @publicApi
++ */
++export const X_REQUEST_ID_HEADER = 'x-request-id';
++
++/**
++ * Options accepted by `app.enableRequestId()`.
++ *
++ * @publicApi
++ */
++export interface RequestIdOptions {
++  /**
++   * Name of the HTTP header carrying the request id, read from the inbound
++   * request and written onto the outbound response.
++   *
++   * Defaults to `x-request-id`.
++   */
++  header?: string;
++  /**
++   * Factory used to generate a new request id when the inbound request does
++   * not already carry one (for example, when it isn't itself a downstream
++   * call from another one of our own services).
++   *
++   * Defaults to `crypto.randomUUID()`.
++   */
++  generator?: () => string;
++}
++
++/**
++ * Holds the id of the request currently being handled, so that it can be
++ * read from anywhere in application code (services, guards, interceptors,
++ * loggers, ...) without threading the request object through every call,
++ * and identically regardless of which underlying HTTP adapter (Express or
++ * Fastify) the application uses.
++ *
++ * Populated by the framework for the lifetime of a request once
++ * `app.enableRequestId()` has been called; read it with
++ * `RequestIdStorage.get()`, or inject it into a route handler argument with
++ * the `@RequestId()` decorator.
++ *
++ * @publicApi
++ */
++export class RequestIdStorage {
++  private static readonly storage = new AsyncLocalStorage<string>();
++
++  /**
++   * Runs `callback` with `requestId` bound to the current asynchronous
++   * execution context, so that any code invoked - synchronously or
++   * asynchronously - from within `callback` can read it back via `get()`.
++   */
++  public static run<T>(requestId: string, callback: () => T): T {
++    return this.storage.run(requestId, callback);
++  }
++
++  /**
++   * Returns the id of the request currently being handled, or `undefined`
++   * when called outside of a request handled by an application that has
++   * `enableRequestId()` enabled.
++   */
++  public static get(): string | undefined {
++    return this.storage.getStore();
++  }
++}
+diff --git a/packages/core/nest-application.ts b/packages/core/nest-application.ts
+index 35d2cbd..1d67a6e 100644
+--- a/packages/core/nest-application.ts
++++ b/packages/core/nest-application.ts
+@@ -7,10 +7,14 @@ import {
+   type NestHybridApplicationOptions,
+   type NestInterceptor,
+   type PipeTransform,
++  type RequestIdOptions,
++  RequestIdStorage,
+   type VersioningOptions,
+   VersioningType,
+   type WebSocketAdapter,
++  X_REQUEST_ID_HEADER,
+ } from '@nestjs/common';
++import { randomUUID } from 'crypto';
+ import { iterate } from 'iterare';
+ import { platform } from 'os';
+ import { AbstractHttpAdapter } from './adapters/index.js';
+@@ -383,6 +387,26 @@ export class NestApplication
+     return this;
+   }
+ 
++  public enableRequestId(options: RequestIdOptions = {}): this {
++    const headerName = options.header ?? X_REQUEST_ID_HEADER;
++    const lowerCasedHeaderName = headerName.toLowerCase();
++    const generateId = options.generator ?? (() => randomUUID());
++
++    this.getHttpAdapter().setOnRequestHook(
++      (req: any, res: any, done: (err?: Error) => void) => {
++        const inboundHeader = req.headers?.[lowerCasedHeaderName];
++        const requestId =
++          (Array.isArray(inboundHeader) ? inboundHeader[0] : inboundHeader) ||
++          generateId();
++
++        this.getHttpAdapter().setHeader(res, headerName, requestId);
++        RequestIdStorage.run(requestId, () => done());
++      },
++    );
++
++    return this;
++  }
++
+   public async listen(port: number | string): Promise<any>;
+   public async listen(port: number | string, hostname: string): Promise<any>;
+   public async listen(port: number | string, ...args: any[]): Promise<any> {

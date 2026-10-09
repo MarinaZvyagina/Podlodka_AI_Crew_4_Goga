@@ -1,0 +1,312 @@
+diff --git a/packages/core/middleware/index.ts b/packages/core/middleware/index.ts
+index 2d7a031..012c56c 100644
+--- a/packages/core/middleware/index.ts
++++ b/packages/core/middleware/index.ts
+@@ -1 +1,2 @@
+ export * from './builder.js';
++export * from './request-id/index.js';
+diff --git a/packages/core/middleware/request-id/index.ts b/packages/core/middleware/request-id/index.ts
+new file mode 100644
+index 0000000..d52aa8c
+--- /dev/null
++++ b/packages/core/middleware/request-id/index.ts
+@@ -0,0 +1,2 @@
++export * from './request-id-storage.js';
++export * from './request-id.middleware.js';
+diff --git a/packages/core/middleware/request-id/request-id-storage.ts b/packages/core/middleware/request-id/request-id-storage.ts
+new file mode 100644
+index 0000000..d5d7b9c
+--- /dev/null
++++ b/packages/core/middleware/request-id/request-id-storage.ts
+@@ -0,0 +1,32 @@
++import { AsyncLocalStorage } from 'async_hooks';
++
++/**
++ * Holds the correlation/request ID for the lifetime of a single HTTP request,
++ * independently of which underlying HTTP adapter (Express, Fastify, ...)
++ * handled it. Populated by the request ID middleware and read by application
++ * code via {@link RequestIdStorage.get}.
++ *
++ * @publicApi
++ */
++export class RequestIdStorage {
++  private static readonly storage = new AsyncLocalStorage<string>();
++
++  /**
++   * Runs `callback` with `id` bound as the current request ID. Any code
++   * executed synchronously or asynchronously from within `callback`
++   * (including across `await`/Promise boundaries) can retrieve it via
++   * {@link RequestIdStorage.get}.
++   */
++  public static run<T>(id: string, callback: () => T): T {
++    return this.storage.run(id, callback);
++  }
++
++  /**
++   * Returns the request ID bound by the innermost {@link RequestIdStorage.run}
++   * call in the current async execution context, or `undefined` if called
++   * outside of a request (or before the request ID middleware has run).
++   */
++  public static get(): string | undefined {
++    return this.storage.getStore();
++  }
++}
+diff --git a/packages/core/middleware/request-id/request-id.middleware.ts b/packages/core/middleware/request-id/request-id.middleware.ts
+new file mode 100644
+index 0000000..33f2496
+--- /dev/null
++++ b/packages/core/middleware/request-id/request-id.middleware.ts
+@@ -0,0 +1,68 @@
++import { randomStringGenerator } from '@nestjs/common/internal';
++import { RequestIdStorage } from './request-id-storage.js';
++
++/**
++ * Default name of the header used to read/propagate the correlation ID.
++ */
++export const DEFAULT_REQUEST_ID_HEADER = 'X-Request-Id';
++
++/**
++ * A caller-supplied ID is only trusted (echoed back and reused) if it matches
++ * this shape, so that untrusted input can't be used to smuggle control
++ * characters or oversized values into logs and downstream headers.
++ */
++const VALID_REQUEST_ID = /^[a-zA-Z0-9_-]{1,128}$/;
++
++export interface RequestIdMiddlewareOptions {
++  /**
++   * Name of the request/response header carrying the correlation ID.
++   * @default 'X-Request-Id'
++   */
++  header?: string;
++  /**
++   * Used to generate a new ID when the incoming request doesn't already
++   * carry a valid one.
++   * @default randomStringGenerator (from `@nestjs/common`)
++   */
++  generator?: () => string;
++}
++
++function getIncomingHeaderValue(req: any, header: string): string | undefined {
++  const value = req.headers?.[header];
++  return Array.isArray(value) ? value[0] : value;
++}
++
++/**
++ * Creates HTTP-adapter-agnostic middleware that ensures every response
++ * carries a correlation/request ID header: the incoming header value is
++ * reused when present and well-formed, otherwise a new ID is generated. The
++ * ID is also bound to {@link RequestIdStorage} for the duration of the
++ * request so application code can retrieve it (e.g. for logging) without
++ * reading it back off the response.
++ *
++ * Register it via `app.use(createRequestIdMiddleware())` as early as
++ * possible (before other middleware/handlers) so it applies uniformly
++ * regardless of the underlying HTTP adapter (Express, Fastify, ...).
++ *
++ * @publicApi
++ */
++export function createRequestIdMiddleware(
++  options: RequestIdMiddlewareOptions = {},
++) {
++  const header = options.header ?? DEFAULT_REQUEST_ID_HEADER;
++  const lookupHeader = header.toLowerCase();
++  const generator = options.generator ?? randomStringGenerator;
++
++  return function requestIdMiddleware(
++    req: any,
++    res: any,
++    next: (err?: any) => void,
++  ) {
++    const incoming = getIncomingHeaderValue(req, lookupHeader);
++    const id =
++      incoming && VALID_REQUEST_ID.test(incoming) ? incoming : generator();
++
++    res.setHeader(header, id);
++    RequestIdStorage.run(id, next);
++  };
++}
+diff --git a/packages/core/test/middleware/request-id/request-id-storage.spec.ts b/packages/core/test/middleware/request-id/request-id-storage.spec.ts
+new file mode 100644
+index 0000000..62dd5a8
+--- /dev/null
++++ b/packages/core/test/middleware/request-id/request-id-storage.spec.ts
+@@ -0,0 +1,54 @@
++import { RequestIdStorage } from '../../../middleware/request-id/request-id-storage.js';
++
++describe('RequestIdStorage', () => {
++  it('should return undefined when called outside of a run() context', () => {
++    expect(RequestIdStorage.get()).toBeUndefined();
++  });
++
++  it('should return the bound id from within the run() callback', () => {
++    RequestIdStorage.run('req-1', () => {
++      expect(RequestIdStorage.get()).toEqual('req-1');
++    });
++  });
++
++  it('should propagate the bound id across async/await boundaries', async () => {
++    await RequestIdStorage.run('req-2', async () => {
++      await Promise.resolve();
++      expect(RequestIdStorage.get()).toEqual('req-2');
++      await new Promise(resolve => setTimeout(resolve, 0));
++      expect(RequestIdStorage.get()).toEqual('req-2');
++    });
++  });
++
++  it('should return the value produced by the callback', () => {
++    const result = RequestIdStorage.run('req-3', () => 42);
++    expect(result).toEqual(42);
++  });
++
++  it('should isolate concurrent, interleaved run() contexts', async () => {
++    const observed: Array<[string, string | undefined]> = [];
++
++    const runA = RequestIdStorage.run('req-a', async () => {
++      await new Promise(resolve => setTimeout(resolve, 10));
++      observed.push(['a', RequestIdStorage.get()]);
++    });
++    const runB = RequestIdStorage.run('req-b', async () => {
++      await new Promise(resolve => setTimeout(resolve, 0));
++      observed.push(['b', RequestIdStorage.get()]);
++    });
++
++    await Promise.all([runA, runB]);
++
++    expect(observed).toContainEqual(['a', 'req-a']);
++    expect(observed).toContainEqual(['b', 'req-b']);
++  });
++
++  it('should restore the outer context after a nested run() returns', () => {
++    RequestIdStorage.run('outer', () => {
++      RequestIdStorage.run('inner', () => {
++        expect(RequestIdStorage.get()).toEqual('inner');
++      });
++      expect(RequestIdStorage.get()).toEqual('outer');
++    });
++  });
++});
+diff --git a/packages/core/test/middleware/request-id/request-id.middleware.spec.ts b/packages/core/test/middleware/request-id/request-id.middleware.spec.ts
+new file mode 100644
+index 0000000..fe1a439
+--- /dev/null
++++ b/packages/core/test/middleware/request-id/request-id.middleware.spec.ts
+@@ -0,0 +1,119 @@
++import {
++  DEFAULT_REQUEST_ID_HEADER,
++  createRequestIdMiddleware,
++} from '../../../middleware/request-id/request-id.middleware.js';
++import { RequestIdStorage } from '../../../middleware/request-id/request-id-storage.js';
++
++describe('createRequestIdMiddleware', () => {
++  const createReq = (headers: Record<string, any> = {}) => ({ headers });
++  const createRes = () => ({ setHeader: vi.fn() });
++
++  it('should generate a new id when no incoming header is present', () => {
++    const middleware = createRequestIdMiddleware();
++    const req = createReq();
++    const res = createRes();
++    const next = vi.fn();
++
++    middleware(req, res, next);
++
++    expect(res.setHeader).toHaveBeenCalledTimes(1);
++    const [headerName, id] = res.setHeader.mock.calls[0];
++    expect(headerName).toEqual(DEFAULT_REQUEST_ID_HEADER);
++    expect(typeof id).toEqual('string');
++    expect(id.length).toBeGreaterThan(0);
++    expect(next).toHaveBeenCalledTimes(1);
++  });
++
++  it('should reuse a well-formed incoming header value instead of generating one', () => {
++    const middleware = createRequestIdMiddleware();
++    const req = createReq({ 'x-request-id': 'caller-supplied-id-123' });
++    const res = createRes();
++
++    middleware(req, res, vi.fn());
++
++    expect(res.setHeader).toHaveBeenCalledWith(
++      DEFAULT_REQUEST_ID_HEADER,
++      'caller-supplied-id-123',
++    );
++  });
++
++  it('should fall back to a generated id when the incoming header is malformed', () => {
++    const middleware = createRequestIdMiddleware();
++    const req = createReq({ 'x-request-id': 'not valid\r\nheader value' });
++    const res = createRes();
++
++    middleware(req, res, vi.fn());
++
++    const [, id] = res.setHeader.mock.calls[0];
++    expect(id).not.toEqual('not valid\r\nheader value');
++  });
++
++  it('should fall back to a generated id when the incoming header is empty', () => {
++    const middleware = createRequestIdMiddleware();
++    const req = createReq({ 'x-request-id': '' });
++    const res = createRes();
++
++    middleware(req, res, vi.fn());
++
++    const [, id] = res.setHeader.mock.calls[0];
++    expect(id.length).toBeGreaterThan(0);
++  });
++
++  it('should use the first value when the incoming header was duplicated', () => {
++    const middleware = createRequestIdMiddleware();
++    const req = createReq({ 'x-request-id': ['first-id', 'second-id'] });
++    const res = createRes();
++
++    middleware(req, res, vi.fn());
++
++    expect(res.setHeader).toHaveBeenCalledWith(
++      DEFAULT_REQUEST_ID_HEADER,
++      'first-id',
++    );
++  });
++
++  it('should support a custom header name (matched case-insensitively on the way in)', () => {
++    const middleware = createRequestIdMiddleware({ header: 'X-Trace-Id' });
++    const req = createReq({ 'x-trace-id': 'trace-42' });
++    const res = createRes();
++
++    middleware(req, res, vi.fn());
++
++    expect(res.setHeader).toHaveBeenCalledWith('X-Trace-Id', 'trace-42');
++  });
++
++  it('should support a custom id generator', () => {
++    const middleware = createRequestIdMiddleware({
++      generator: () => 'fixed-id',
++    });
++    const req = createReq();
++    const res = createRes();
++
++    middleware(req, res, vi.fn());
++
++    expect(res.setHeader).toHaveBeenCalledWith(
++      DEFAULT_REQUEST_ID_HEADER,
++      'fixed-id',
++    );
++  });
++
++  it('should make the id available via RequestIdStorage while next() runs', () => {
++    const middleware = createRequestIdMiddleware();
++    const req = createReq({ 'x-request-id': 'req-in-storage' });
++    const res = createRes();
++    let observed: string | undefined;
++
++    middleware(req, res, () => {
++      observed = RequestIdStorage.get();
++    });
++
++    expect(observed).toEqual('req-in-storage');
++  });
++
++  it('should not leak the id into RequestIdStorage outside of the request', () => {
++    const middleware = createRequestIdMiddleware();
++    middleware(createReq(), createRes(), vi.fn());
++
++    expect(RequestIdStorage.get()).toBeUndefined();
++  });
++});

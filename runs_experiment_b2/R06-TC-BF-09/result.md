@@ -1,0 +1,82 @@
+# R06-TC-BF-09
+
+Condition: goga_forced_workflow
+Functional success: False
+Full architecture conformance: False
+ACR: 0.4
+Dangerous success: False
+Goga engagement signal: False
+Cost: $2.4217410000000004
+Duration: 422121ms, turns: 55
+
+## Agent's own summary
+
+# Change Plan
+
+## Task Classification
+**Feature (extension)** — net-new compliance capability added via the cell's existing, documented decorator-wrapping extension mechanism. No bug is being fixed and no existing contract is being altered.
+
+## Affected Cells
+
+| Cell | Files to Modify | What Changes |
+|---|---|---|
+| server/etcdserver/api/v3rpc | `audit.go` (new), `audit_test.go` (new), `grpc.go` (1-line registration change), `CODEMANIFEST` (usage text addition) | New `auditKVServer` decorator + `NewAuditKVServer` constructor; wired as the outermost KV decorator; CODEMANIFEST's `decorator_wrapping` usage extended to mention it |
+
+No other cell requires modification (server/etcdserver, server/auth are consumed read-only via already-exported `AuthInfoFromCtx`/`Logger`/`AuthInfo`).
+
+## Root Cause Analysis
+No audit mechanism exists today. The only code path common to all four KV operations — despite each branching differently internally (serializable read, linearizable read, read-only txn via `doSerialize`, write txn/Put/DeleteRange via `raftRequest`) — is the top-level `pb.KVServer` implementation registered in `grpc.go`. The cell's own CODEMANIFEST prescribes decorating that struct for new cross-cutting concerns, exactly as `quotaKVServer` already does for quota enforcement.
+
+## Trace Summary
+`client → auditKVServer (new, outermost) → quotaKVServer → kvServer → EtcdServer.{Range,Put,DeleteRange,Txn}`. The new decorator calls straight through to its wrapped `pb.KVServer`, so it sees the exact `(resp, err)` the client ultimately receives, for all four ops, including quota rejections and request-validation failures happening inside `kvServer`. Identity resolution reuses `EtcdServer.AuthInfoFromCtx`, which the investigation confirmed already returns `(nil, nil)` when auth is disabled or no token is present.
+
+## Change Strategy
+
+1. **Add `server/etcdserver/api/v3rpc/audit.go`**:
+   - Define `type kvAuditOperation string` with constants `"read"`, `"write"`, `"delete"`, `"transaction"`.
+   - Define `type auditKVServer struct { pb.KVServer; s *etcdserver.EtcdServer }`.
+   - Define `func NewAuditKVServer(s *etcdserver.EtcdServer, kv pb.KVServer) pb.KVServer` returning `&auditKVServer{kv, s}`.
+   - Override exactly `Range`, `Put`, `DeleteRange`, `Txn` (matching the 4 required categories precisely; `Compact` and other KVServer methods fall through via embedding, untouched, matching current requirements which don't mention compaction).
+   - Each override: capture `start := time.Now()`, call `a.KVServer.X(ctx, r)` unchanged, then emit one audit record via a shared `record` helper — never alters `resp`/`err`.
+   - Helper `auditIdentity(s, ctx) string`: calls `s.AuthInfoFromCtx(ctx)`; returns `"unauthenticated"` on error, nil `AuthInfo`, or empty `Username`; otherwise returns `Username`.
+   - Helper `formatAuditKeyRange(key, rangeEnd []byte) string`: `%q`-quoted single key, or `[%q, %q)` when `rangeEnd` is non-empty — reuses existing codebase convention of safely rendering arbitrary byte keys (cf. `zap.ByteString` usage in `server/auth/store.go`).
+   - Helper `formatAuditTxnTarget(r *pb.TxnRequest) string`: walks `Compare`, `Success`, `Failure` (recursing into nested `RequestOp_RequestTxn`) collecting `formatAuditKeyRange` for each `RequestRange`/`RequestPut`/`RequestDeleteRange`, joined with `", "`.
+   - `record(ctx, op, target, start, err)`: fetches `lg := a.s.Logger()`; if non-nil, logs at `Info` level with fields: identity, operation, key/key-range, duration (`time.Since(start)`), success (`err == nil`), and the error itself when present. Logging is unconditional (not gated by debug level or a latency threshold) since this is a compliance record, not a performance diagnostic — this is what keeps it distinct from and non-interfering with `newLogUnaryInterceptor`.
+
+2. **Modify `server/etcdserver/api/v3rpc/grpc.go`**: change
+   `pb.RegisterKVServer(grpcServer, NewQuotaKVServer(s))`
+   to
+   `pb.RegisterKVServer(grpcServer, NewAuditKVServer(s, NewQuotaKVServer(s)))`.
+   This is the only change to this file; `newLogUnaryInterceptor`/`newUnaryInterceptor`/metrics interceptor chain is untouched.
+
+3. **Update `server/etcdserver/api/v3rpc/CODEMANIFEST`**: extend the `decorator_wrapping` usage text to mention the new audit decorator (observes-after pattern) alongside the existing quota (pre-hook) and auth (pre-hook) decorators, keeping the existing convention of not individually manifesting every decorator constructor as a body entry (matches how `NewQuotaKVServer`/`NewQuotaLeaseServer` are undocumented as separate body entries today).
+
+4. **Add `server/etcdserver/api/v3rpc/audit_test.go`**: unit tests for the pure formatting/classification helpers and a decorator-level test using a fake `pb.KVServer` to verify pass-through behavior (response/error unchanged) and that exactly one audit log line is emitted per call with the expected fields, including the "unauthenticated" fallback when no auth context is present.
+
+## Specification Impact
+Only the `Usages.decorator_wrapping` text in `server/etcdserver/api/v3rpc/CODEMANIFEST` changes (additive sentence documenting the new decorator and that it's a post-hook, unlike the existing pre-hook examples). No `Imports`, `Annotations`, or body (type) entries require changes — consistent with the existing convention that not every decorator constructor is individually manifested (`NewQuotaKVServer` isn't). No other cell's CODEMANIFEST is touched.
+
+## Usage Impact
+No `.usages/*.md` files exist for this cell currently (confirmed: `server/etcdserver/api/v3rpc/.usages/` was not found in scope resolution), so none require updates. No consumer-facing usage recipe changes — `NewAuditKVServer` is an internal composition detail of `grpc.go`, not a new public entry point consumers need guidance on.
+
+## Compatibility Verification
+**Backward compatible.** No existing exported signature changes; no existing behavior changes for any KV RPC (response content, error semantics, and timing-relevant existing logs from `newLogUnaryInterceptor` are all preserved exactly). The only externally observable addition is new structured log lines. Proceeding.
+
+## Test Strategy
+- **Pure-function tests** (table-driven, per Go conventions): `formatAuditKeyRange` (single key, key+rangeEnd, empty rangeEnd), `formatAuditTxnTarget` (compare-only, success-only, failure-only, mixed, nested `RequestTxn`, empty txn).
+- **Identity resolution test**: `auditIdentity` returns `"unauthenticated"` when `AuthInfoFromCtx` returns `(nil, nil)` (auth disabled) and when it errors; returns the username otherwise. Given `AuthInfoFromCtx` requires a real `*etcdserver.EtcdServer`/`authStore`, this will be validated indirectly through the decorator-level test using a minimal server configured with auth disabled (the common case), and a direct unit test if an existing test seam allows constructing `*auth.AuthInfo` directly without a full server.
+- **Decorator pass-through test**: fake `pb.KVServer` returning canned `(resp, err)` for each of the 4 methods; assert `auditKVServer` returns them unchanged (proves requirement 3 — no functional/response change) and produces exactly one log entry per call with correct operation kind and target string (proves requirement 1/2).
+- **Regression check**: confirm existing `interceptor.go`-related tests (if any) and any existing `v3rpc` package tests still pass unmodified, and run `go build ./...` / `go vet ./server/...` for the package.
+
+## Risk Assessment
+
+| Risk | Likelihood | Impact | Mitigation |
+|---|---|---|---|
+| Extra `AuthInfoFromCtx` call per request adds measurable overhead (simple-token path touches a mutex + map) | Low | Low | Already called 1–2 times per request today in existing code paths; one more call is consistent with existing per-request cost profile, not a new order-of-magnitude cost |
+| Malicious/large `Txn` produces an oversized audit log line (many keys) | Low | Low | Bounded by existing server-side `MaxTxnOps` (default 128) and `MaxRequestBytesWithOverhead`, both enforced before/around this path already; no new unbounded amplification introduced |
+| Logging at `Info` unconditionally (vs. existing debug/latency-gated logging) increases log volume under high QPS | Medium | Medium (operational, not functional) | Acceptable and intended — compliance records must be unconditional per requirement 1; this is an explicit design choice, not an oversight, and is orthogonal to the existing debug/latency-gated request-stats logging which continues unchanged |
+| Future new `pb.KVServer` methods (hypothetical) not automatically audited | Low | Low | Inherent to any Go interface-decorator or type-switch approach; current KV service surface (Range/Put/DeleteRange/Txn/Compact) is stable; scope explicitly limited to the 4 categories the user specified |
+
+---
+
+Do you approve the plan? Proceed to implementation?

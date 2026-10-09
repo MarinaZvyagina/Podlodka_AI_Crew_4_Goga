@@ -1,0 +1,584 @@
+diff --git a/docs/victoriametrics/sd_configs.md b/docs/victoriametrics/sd_configs.md
+index 956f047..f50ec1f 100644
+--- a/docs/victoriametrics/sd_configs.md
++++ b/docs/victoriametrics/sd_configs.md
+@@ -2133,6 +2133,15 @@ scrape_configs:
+   #
+   # series_limit: <int>
+ 
++  # max_scrape_targets_per_job is an optional limit on the number of simultaneously active
++  # scrape targets this job (job_name) can have, regardless of which service discovery
++  # mechanism supplied them. By default, there is no limit.
++  # Extra targets beyond the limit are dropped instead of being scraped, and are shown
++  # with the `target_limit` drop reason at the /service-discovery page.
++  # See https://docs.victoriametrics.com/victoriametrics/vmagent/#limiting-the-number-of-targets-per-job .
++  #
++  # max_scrape_targets_per_job: <int>
++
+   # label_limit is an optional limit on the number of labels per each sample
+   # exposed by a target. It can be set globally for a whole scrape configuration and for each scrape job
+   #
+diff --git a/docs/victoriametrics/vmagent.md b/docs/victoriametrics/vmagent.md
+index 87a5b27..a7ccd89 100644
+--- a/docs/victoriametrics/vmagent.md
++++ b/docs/victoriametrics/vmagent.md
+@@ -1158,6 +1158,29 @@ These metrics allow building the following alerting rules:
+ 
+ See also `sample_limit` option at [scrape_config section](https://docs.victoriametrics.com/victoriametrics/sd_configs/#scrape_configs).
+ 
++## Limiting the number of targets per job
++
++By default, `vmagent` doesn't limit the number of scrape targets a single job (`job_name`) can have active at once.
++This means that if a service discovery source (Kubernetes, Consul, cloud APIs, a `file_sd_config` catalog, etc.)
++is misconfigured and suddenly returns an excessive number of targets for a job, `vmagent` tries to scrape all of
++them at once, which can spike memory and CPU usage and degrade scraping for every other job running on the same
++`vmagent` instance.
++
++The limit can be enforced in the following places:
++
++* Via `-promscrape.maxScrapeTargetsPerJob` command-line flag. This limit is applied individually to every job
++  defined in the file pointed to by `-promscrape.config`.
++* Via `max_scrape_targets_per_job` config option at [scrape_config](https://docs.victoriametrics.com/victoriametrics/sd_configs/#scrape_configs) section.
++  The `max_scrape_targets_per_job` option allows overriding the `-promscrape.maxScrapeTargetsPerJob` on a per-`scrape_config` basis.
++  If `max_scrape_targets_per_job` is set to `0` or left unset, then the `-promscrape.maxScrapeTargetsPerJob` command-line flag value is used instead.
++
++The limit is applied uniformly regardless of which service discovery mechanism (or combination of `static_configs`,
++`file_sd_configs` and `*_sd_configs`) supplied the targets for the job. When a job's discovered target count exceeds
++its resolved limit, `vmagent` keeps scraping only up to that number of targets for the job — it doesn't reject the
++whole job or crash. The excess targets are dropped with the `target_limit` drop reason and can be seen, together with
++the affected job's active/total target counts, at the `http://vmagent:8429/service-discovery` page (see
++[these docs](#scraping-big-number-of-targets)) and at the `/api/v1/targets?state=dropped` API endpoint.
++
+ By default, `vmagent` doesn't limit the number of time series written to remote storage systems specified at `-remoteWrite.url`.
+ The limit can be enforced by setting the following command-line flags:
+ 
+diff --git a/lib/promscrape/CODEMANIFEST b/lib/promscrape/CODEMANIFEST
+index 3982d8d..87ac471 100644
+--- a/lib/promscrape/CODEMANIFEST
++++ b/lib/promscrape/CODEMANIFEST
+@@ -18,6 +18,11 @@ Usages:
+     one-shot lookups. Each provider also contributes its own SDCheckInterval flag, used to give
+     its scraperGroup an independent polling cadence.
+ 
++    The per-job_name active-target cap (see `ScrapeConfig`) is enforced centrally, after this
++    dispatch, at the single point where every provider's discovered `ScrapeWork` set is turned
++    into running scrapers — it therefore applies uniformly to all ~22 providers plus
++    static_configs/file_sd_configs without any provider-specific code.
++
+ Annotations: |
+   This cell is the Prometheus-compatible service-discovery and scraping engine: it loads a YAML
+   scrape config, drives each configured discovery provider on its own interval, turns discovered
+@@ -50,7 +55,11 @@ Annotations: |
+     2. For each configured discovery-provider type, start a scraper group polling it on its own
+        interval (see `registry_dispatch`)
+     3. On each poll, diff the newly discovered `ScrapeWork` set against the previous one and
+-       start/stop individual target scrapers accordingly
++       start/stop individual target scrapers accordingly. Before starting a new target scraper,
++       check that target's job against its resolved active-target cap (see `ScrapeConfig`); once
++       a job_name is at its cap, further targets for that job_name are dropped instead of
++       started, regardless of which discovery provider produced them, and are surfaced through
++       the same dropped-target reporting used by `WriteServiceDiscovery` and `WriteAPIV1Targets`
+     4. Each running target scraper periodically calls its own HTTP client, applies relabeling,
+        and invokes `pushData`
+ 
+@@ -80,6 +89,11 @@ Annotations: |
+     Use `SDConfig` from Imports as the representative shape of each of the ~22 provider slice
+     fields this type carries (`registry_dispatch` lists the rest by name).
+ 
++    Optionally carries a per-job cap on the number of simultaneously active targets for this
++    job_name (falls back to a global default when unset; unset/zero means unlimited). This cap
++    is resolved onto every `ScrapeWork` produced for the job and enforced uniformly regardless
++    of which discovery provider supplied the target — see `Init`'s algorithm.
++
+ "ScrapeWork(scrapeURL: string, scrapeInterval: time.Duration, scrapeTimeout: time.Duration, labels: Labels, relabelConfigs: ParsedConfigs, metricRelabelConfigs: ParsedConfigs)":
+   location: scrapework.go
+   annotations: |
+@@ -110,6 +124,8 @@ Annotations: |
+   annotations: |
+     Serve the /service-discovery endpoint: for every target, show both its pre-relabeling
+     discovered labels and its post-relabeling final labels, for troubleshooting relabel rules.
++    Also shows, per job_name, how many discovered targets were dropped and why (including
++    targets dropped for exceeding the job's active-target cap, see `Init`'s algorithm).
+ 
+ "WriteAPIV1Targets(w: io.Writer, state: string, scrapePool: string)":
+   location: targetstatus.go
+diff --git a/lib/promscrape/config.go b/lib/promscrape/config.go
+index 87e5ecc..d4500bd 100644
+--- a/lib/promscrape/config.go
++++ b/lib/promscrape/config.go
+@@ -53,10 +53,16 @@ import (
+ )
+ 
+ var (
+-	noStaleMarkers       = flag.Bool("promscrape.noStaleMarkers", false, "Whether to disable sending Prometheus stale markers for metrics when scrape target disappears. This option may reduce memory usage if stale markers aren't needed for your setup. This option also disables populating the scrape_series_added metric. See https://prometheus.io/docs/concepts/jobs_instances/#automatically-generated-labels-and-time-series")
+-	seriesLimitPerTarget = flag.Int("promscrape.seriesLimitPerTarget", 0, "Optional limit on the number of unique time series a single scrape target can expose. See https://docs.victoriametrics.com/victoriametrics/vmagent/#cardinality-limiter for more info")
+-	strictParse          = flag.Bool("promscrape.config.strictParse", true, "Whether to deny unsupported fields in -promscrape.config . Set to false in order to silently skip unsupported fields")
+-	dryRun               = flag.Bool("promscrape.config.dryRun", false, "Checks -promscrape.config file for errors and unsupported fields and then exits. "+
++	noStaleMarkers         = flag.Bool("promscrape.noStaleMarkers", false, "Whether to disable sending Prometheus stale markers for metrics when scrape target disappears. This option may reduce memory usage if stale markers aren't needed for your setup. This option also disables populating the scrape_series_added metric. See https://prometheus.io/docs/concepts/jobs_instances/#automatically-generated-labels-and-time-series")
++	seriesLimitPerTarget   = flag.Int("promscrape.seriesLimitPerTarget", 0, "Optional limit on the number of unique time series a single scrape target can expose. See https://docs.victoriametrics.com/victoriametrics/vmagent/#cardinality-limiter for more info")
++	maxScrapeTargetsPerJob = flag.Int("promscrape.maxScrapeTargetsPerJob", 0, "Optional limit on the number of simultaneously scraped targets a single job (`job_name`) can have. "+
++		"Extra targets are dropped, and can be seen with the `target_limit` drop reason at /service-discovery and /api/v1/targets?state=dropped pages. "+
++		"This limit is applied uniformly regardless of the service discovery mechanism used by the job. "+
++		"It can be overridden individually per each `scrape_config` via `max_scrape_targets_per_job` config option. "+
++		"By default, this limit isn't set, i.e. it is unlimited. "+
++		"See https://docs.victoriametrics.com/victoriametrics/vmagent/#limiting-the-number-of-targets-per-job for more info")
++	strictParse = flag.Bool("promscrape.config.strictParse", true, "Whether to deny unsupported fields in -promscrape.config . Set to false in order to silently skip unsupported fields")
++	dryRun      = flag.Bool("promscrape.config.dryRun", false, "Checks -promscrape.config file for errors and unsupported fields and then exits. "+
+ 		"Returns non-zero exit code on parsing errors and emits these errors to stderr. "+
+ 		"See also -promscrape.config.strictParse command-line flag. "+
+ 		"Pass -loggerLevel=ERROR if you don't need to see info messages in the output.")
+@@ -343,14 +349,15 @@ type ScrapeConfig struct {
+ 	YandexCloudSDConfigs  []yandexcloud.SDConfig  `yaml:"yandexcloud_sd_configs,omitempty"`
+ 
+ 	// These options are supported only by lib/promscrape.
+-	DisableCompression  bool                       `yaml:"disable_compression,omitempty"`
+-	DisableKeepAlive    bool                       `yaml:"disable_keepalive,omitempty"`
+-	StreamParse         bool                       `yaml:"stream_parse,omitempty"`
+-	ScrapeAlignInterval *promutil.Duration         `yaml:"scrape_align_interval,omitempty"`
+-	ScrapeOffset        *promutil.Duration         `yaml:"scrape_offset,omitempty"`
+-	SeriesLimit         *int                       `yaml:"series_limit,omitempty"`
+-	NoStaleMarkers      *bool                      `yaml:"no_stale_markers,omitempty"`
+-	ProxyClientConfig   promauth.ProxyClientConfig `yaml:",inline"`
++	DisableCompression     bool                       `yaml:"disable_compression,omitempty"`
++	DisableKeepAlive       bool                       `yaml:"disable_keepalive,omitempty"`
++	StreamParse            bool                       `yaml:"stream_parse,omitempty"`
++	ScrapeAlignInterval    *promutil.Duration         `yaml:"scrape_align_interval,omitempty"`
++	ScrapeOffset           *promutil.Duration         `yaml:"scrape_offset,omitempty"`
++	SeriesLimit            *int                       `yaml:"series_limit,omitempty"`
++	MaxScrapeTargetsPerJob *int                       `yaml:"max_scrape_targets_per_job,omitempty"`
++	NoStaleMarkers         *bool                      `yaml:"no_stale_markers,omitempty"`
++	ProxyClientConfig      promauth.ProxyClientConfig `yaml:",inline"`
+ 
+ 	// This is set in loadConfig
+ 	swc *scrapeWorkConfig
+@@ -1002,70 +1009,76 @@ func getScrapeWorkConfig(sc *ScrapeConfig, baseDir string, globalCfg *GlobalConf
+ 	if sc.SeriesLimit != nil {
+ 		seriesLimit = *sc.SeriesLimit
+ 	}
++	targetsLimit := *maxScrapeTargetsPerJob
++	if sc.MaxScrapeTargetsPerJob != nil {
++		targetsLimit = *sc.MaxScrapeTargetsPerJob
++	}
+ 	disableCompression := sc.DisableCompression
+ 	if sc.EnableCompression != nil {
+ 		disableCompression = !*sc.EnableCompression
+ 	}
+ 	swc := &scrapeWorkConfig{
+-		scrapeInterval:       scrapeInterval,
+-		scrapeIntervalString: scrapeInterval.String(),
+-		scrapeTimeout:        scrapeTimeout,
+-		scrapeTimeoutString:  scrapeTimeout.String(),
+-		maxScrapeSize:        mss,
+-		jobName:              jobName,
+-		metricsPath:          metricsPath,
+-		scheme:               scheme,
+-		params:               params,
+-		proxyURL:             sc.ProxyURL,
+-		proxyAuthConfig:      proxyAC,
+-		authConfig:           ac,
+-		honorLabels:          honorLabels,
+-		honorTimestamps:      honorTimestamps,
+-		denyRedirects:        denyRedirects,
+-		externalLabels:       externalLabels,
+-		relabelConfigs:       relabelConfigs,
+-		metricRelabelConfigs: metricRelabelConfigs,
+-		sampleLimit:          sampleLimit,
+-		labelLimit:           labelLimit,
+-		disableCompression:   disableCompression,
+-		disableKeepAlive:     sc.DisableKeepAlive,
+-		streamParse:          sc.StreamParse,
+-		scrapeAlignInterval:  sc.ScrapeAlignInterval.Duration(),
+-		scrapeOffset:         sc.ScrapeOffset.Duration(),
+-		seriesLimit:          seriesLimit,
+-		noStaleMarkers:       noStaleTracking,
++		scrapeInterval:         scrapeInterval,
++		scrapeIntervalString:   scrapeInterval.String(),
++		scrapeTimeout:          scrapeTimeout,
++		scrapeTimeoutString:    scrapeTimeout.String(),
++		maxScrapeSize:          mss,
++		jobName:                jobName,
++		metricsPath:            metricsPath,
++		scheme:                 scheme,
++		params:                 params,
++		proxyURL:               sc.ProxyURL,
++		proxyAuthConfig:        proxyAC,
++		authConfig:             ac,
++		honorLabels:            honorLabels,
++		honorTimestamps:        honorTimestamps,
++		denyRedirects:          denyRedirects,
++		externalLabels:         externalLabels,
++		relabelConfigs:         relabelConfigs,
++		metricRelabelConfigs:   metricRelabelConfigs,
++		sampleLimit:            sampleLimit,
++		labelLimit:             labelLimit,
++		disableCompression:     disableCompression,
++		disableKeepAlive:       sc.DisableKeepAlive,
++		streamParse:            sc.StreamParse,
++		scrapeAlignInterval:    sc.ScrapeAlignInterval.Duration(),
++		scrapeOffset:           sc.ScrapeOffset.Duration(),
++		seriesLimit:            seriesLimit,
++		maxScrapeTargetsPerJob: targetsLimit,
++		noStaleMarkers:         noStaleTracking,
+ 	}
+ 	return swc, nil
+ }
+ 
+ type scrapeWorkConfig struct {
+-	scrapeInterval       time.Duration
+-	scrapeIntervalString string
+-	scrapeTimeout        time.Duration
+-	scrapeTimeoutString  string
+-	maxScrapeSize        int64
+-	jobName              string
+-	metricsPath          string
+-	scheme               string
+-	params               map[string][]string
+-	proxyURL             *proxy.URL
+-	proxyAuthConfig      *promauth.Config
+-	authConfig           *promauth.Config
+-	honorLabels          bool
+-	honorTimestamps      bool
+-	denyRedirects        bool
+-	externalLabels       *promutil.Labels
+-	relabelConfigs       *promrelabel.ParsedConfigs
+-	metricRelabelConfigs *promrelabel.ParsedConfigs
+-	sampleLimit          int
+-	labelLimit           int
+-	disableCompression   bool
+-	disableKeepAlive     bool
+-	streamParse          bool
+-	scrapeAlignInterval  time.Duration
+-	scrapeOffset         time.Duration
+-	seriesLimit          int
+-	noStaleMarkers       bool
++	scrapeInterval         time.Duration
++	scrapeIntervalString   string
++	scrapeTimeout          time.Duration
++	scrapeTimeoutString    string
++	maxScrapeSize          int64
++	jobName                string
++	metricsPath            string
++	scheme                 string
++	params                 map[string][]string
++	proxyURL               *proxy.URL
++	proxyAuthConfig        *promauth.Config
++	authConfig             *promauth.Config
++	honorLabels            bool
++	honorTimestamps        bool
++	denyRedirects          bool
++	externalLabels         *promutil.Labels
++	relabelConfigs         *promrelabel.ParsedConfigs
++	metricRelabelConfigs   *promrelabel.ParsedConfigs
++	sampleLimit            int
++	labelLimit             int
++	disableCompression     bool
++	disableKeepAlive       bool
++	streamParse            bool
++	scrapeAlignInterval    time.Duration
++	scrapeOffset           time.Duration
++	seriesLimit            int
++	maxScrapeTargetsPerJob int
++	noStaleMarkers         bool
+ }
+ 
+ func appendScrapeWorkForTargetLabels(dst []*ScrapeWork, swc *scrapeWorkConfig, targetLabels []*promutil.Labels, discoveryType string) []*ScrapeWork {
+@@ -1362,32 +1375,33 @@ func (swc *scrapeWorkConfig) getScrapeWork(target string, extraLabels, metaLabel
+ 	labelsCopy.InternStrings()
+ 
+ 	sw := &ScrapeWork{
+-		ScrapeURL:            scrapeURL,
+-		ScrapeInterval:       scrapeInterval,
+-		ScrapeTimeout:        scrapeTimeout,
+-		MaxScrapeSize:        targetMaxScrapeSize,
+-		HonorLabels:          swc.honorLabels,
+-		HonorTimestamps:      swc.honorTimestamps,
+-		DenyRedirects:        swc.denyRedirects,
+-		OriginalLabels:       originalLabels,
+-		Labels:               labelsCopy,
+-		ExternalLabels:       swc.externalLabels,
+-		ProxyURL:             swc.proxyURL,
+-		ProxyAuthConfig:      swc.proxyAuthConfig,
+-		AuthConfig:           swc.authConfig,
+-		RelabelConfigs:       swc.relabelConfigs,
+-		MetricRelabelConfigs: swc.metricRelabelConfigs,
+-		DisableCompression:   swc.disableCompression,
+-		DisableKeepAlive:     swc.disableKeepAlive,
+-		StreamParse:          streamParse,
+-		ScrapeAlignInterval:  swc.scrapeAlignInterval,
+-		ScrapeOffset:         swc.scrapeOffset,
+-		SampleLimit:          sampleLimit,
+-		SeriesLimit:          seriesLimit,
+-		LabelLimit:           labelLimit,
+-		NoStaleMarkers:       swc.noStaleMarkers,
+-		AuthToken:            at,
+-		UnixSocket:           unixSocket,
++		ScrapeURL:              scrapeURL,
++		ScrapeInterval:         scrapeInterval,
++		ScrapeTimeout:          scrapeTimeout,
++		MaxScrapeSize:          targetMaxScrapeSize,
++		HonorLabels:            swc.honorLabels,
++		HonorTimestamps:        swc.honorTimestamps,
++		DenyRedirects:          swc.denyRedirects,
++		OriginalLabels:         originalLabels,
++		Labels:                 labelsCopy,
++		ExternalLabels:         swc.externalLabels,
++		ProxyURL:               swc.proxyURL,
++		ProxyAuthConfig:        swc.proxyAuthConfig,
++		AuthConfig:             swc.authConfig,
++		RelabelConfigs:         swc.relabelConfigs,
++		MetricRelabelConfigs:   swc.metricRelabelConfigs,
++		DisableCompression:     swc.disableCompression,
++		DisableKeepAlive:       swc.disableKeepAlive,
++		StreamParse:            streamParse,
++		ScrapeAlignInterval:    swc.scrapeAlignInterval,
++		ScrapeOffset:           swc.scrapeOffset,
++		SampleLimit:            sampleLimit,
++		SeriesLimit:            seriesLimit,
++		MaxScrapeTargetsPerJob: swc.maxScrapeTargetsPerJob,
++		LabelLimit:             labelLimit,
++		NoStaleMarkers:         swc.noStaleMarkers,
++		AuthToken:              at,
++		UnixSocket:             unixSocket,
+ 
+ 		jobNameOriginal: swc.jobName,
+ 	}
+diff --git a/lib/promscrape/config_test.go b/lib/promscrape/config_test.go
+index 73ac545..53521d0 100644
+--- a/lib/promscrape/config_test.go
++++ b/lib/promscrape/config_test.go
+@@ -1468,6 +1468,69 @@ scrape_configs:
+ 		},
+ 	})
+ 	*seriesLimitPerTarget = defaultSeriesLimitPerTarget
++
++	defaultMaxScrapeTargetsPerJob := *maxScrapeTargetsPerJob
++	*maxScrapeTargetsPerJob = 1e3
++	f(`
++scrape_configs:
++- job_name: foo
++  static_configs:
++  - targets: ["foo.bar:1234"]
++`, []*ScrapeWork{
++		{
++			ScrapeURL:      "http://foo.bar:1234/metrics",
++			ScrapeInterval: defaultScrapeInterval,
++			ScrapeTimeout:  defaultScrapeTimeout,
++			MaxScrapeSize:  maxScrapeSize.N,
++			Labels: promutil.NewLabelsFromMap(map[string]string{
++				"instance": "foo.bar:1234",
++				"job":      "foo",
++			}),
++			jobNameOriginal:        "foo",
++			MaxScrapeTargetsPerJob: 1e3,
++		},
++	})
++	f(`
++scrape_configs:
++- job_name: foo
++  max_scrape_targets_per_job: 42
++  static_configs:
++  - targets: ["foo.bar:1234"]
++`, []*ScrapeWork{
++		{
++			ScrapeURL:      "http://foo.bar:1234/metrics",
++			ScrapeInterval: defaultScrapeInterval,
++			ScrapeTimeout:  defaultScrapeTimeout,
++			MaxScrapeSize:  maxScrapeSize.N,
++			Labels: promutil.NewLabelsFromMap(map[string]string{
++				"instance": "foo.bar:1234",
++				"job":      "foo",
++			}),
++			jobNameOriginal:        "foo",
++			MaxScrapeTargetsPerJob: 42,
++		},
++	})
++	f(`
++scrape_configs:
++- job_name: foo
++  max_scrape_targets_per_job: 0
++  static_configs:
++  - targets: ["foo.bar:1234"]
++`, []*ScrapeWork{
++		{
++			ScrapeURL:      "http://foo.bar:1234/metrics",
++			ScrapeInterval: defaultScrapeInterval,
++			ScrapeTimeout:  defaultScrapeTimeout,
++			MaxScrapeSize:  maxScrapeSize.N,
++			Labels: promutil.NewLabelsFromMap(map[string]string{
++				"instance": "foo.bar:1234",
++				"job":      "foo",
++			}),
++			jobNameOriginal:        "foo",
++			MaxScrapeTargetsPerJob: 0,
++		},
++	})
++	*maxScrapeTargetsPerJob = defaultMaxScrapeTargetsPerJob
+ }
+ 
+ func equalStaticConfigForScrapeWorks(a, b []*ScrapeWork) bool {
+diff --git a/lib/promscrape/scraper.go b/lib/promscrape/scraper.go
+index ecf37f9..452b785 100644
+--- a/lib/promscrape/scraper.go
++++ b/lib/promscrape/scraper.go
+@@ -417,6 +417,13 @@ func (sg *scraperGroup) update(sws []*ScrapeWork) {
+ 
+ 	// Start new scrapers only after the deleted scrapers are stopped.
+ 	for _, sw := range swsToStart {
++		if maxTargets := sw.MaxScrapeTargetsPerJob; maxTargets > 0 && tsmGlobal.countByJob(sw.jobNameOriginal) >= maxTargets {
++			// The job_name has already reached its -promscrape.maxScrapeTargetsPerJob (or max_scrape_targets_per_job) limit.
++			// Drop this target instead of starting a new scraper for it, in order to protect vmagent from
++			// scraping an excessive number of targets because of a misconfigured service discovery source.
++			droppedTargetsMap.Register(sw.OriginalLabels, sw.RelabelConfigs, targetDropReasonTargetsLimit, nil)
++			continue
++		}
+ 		sc, err := newScraper(sw, sg.name, sg.pushData)
+ 		if err != nil {
+ 			logger.Errorf("skipping scraper for url=%s, job=%s because of error: %s", sw.ScrapeURL, sg.name, err)
+diff --git a/lib/promscrape/scraper_test.go b/lib/promscrape/scraper_test.go
+index 8a03fc4..6ea2659 100644
+--- a/lib/promscrape/scraper_test.go
++++ b/lib/promscrape/scraper_test.go
+@@ -3,6 +3,7 @@ package promscrape
+ import (
+ 	"fmt"
+ 	"math/rand"
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
+@@ -79,3 +80,92 @@ scrape_configs:
+     - targets:
+         - localhost:8429`, true)
+ }
++
++// buildStaticScrapeConfigYAML builds a scrape config with jobName and targetsCount static targets.
++// If maxTargets > 0, it sets max_scrape_targets_per_job to maxTargets for the job.
++func buildStaticScrapeConfigYAML(jobName string, maxTargets, targetsCount int) string {
++	var sb strings.Builder
++	fmt.Fprintf(&sb, "scrape_configs:\n- job_name: %s\n", jobName)
++	if maxTargets > 0 {
++		fmt.Fprintf(&sb, "  max_scrape_targets_per_job: %d\n", maxTargets)
++	}
++	sb.WriteString("  static_configs:\n  - targets:\n")
++	for i := range targetsCount {
++		fmt.Fprintf(&sb, "    - \"127.0.0.1:%d\"\n", 12000+i)
++	}
++	return sb.String()
++}
++
++// countDroppedTargetsForJob returns the number of entries in droppedTargetsMap with the given
++// jobName and dropReason.
++func countDroppedTargetsForJob(jobName string, reason targetDropReason) int {
++	n := 0
++	for _, dt := range droppedTargetsMap.getTargetsList() {
++		if dt.dropReason == reason && dt.originalLabels.getJob() == jobName {
++			n++
++		}
++	}
++	return n
++}
++
++func TestScraperGroupUpdateMaxScrapeTargetsPerJob(t *testing.T) {
++	newSGForTest := func(t *testing.T) *scraperGroup {
++		t.Helper()
++		pushData := func(_ *auth.Token, _ *prompb.WriteRequest) {}
++		globalStopChan = make(chan struct{})
++		randName := rand.Int()
++		sg := newScraperGroup(fmt.Sprintf("static_configs_%d", randName), pushData, globalStopChan)
++		t.Cleanup(func() {
++			sg.stop()
++			close(globalStopChan)
++		})
++		return sg
++	}
++	parseAndGetStaticScrapeWork := func(t *testing.T, data string) []*ScrapeWork {
++		t.Helper()
++		var cfg Config
++		if err := cfg.parseData([]byte(data), "test-scrape.yaml"); err != nil {
++			t.Fatalf("cannot parse config: %s", err)
++		}
++		return cfg.getStaticScrapeWork()
++	}
++
++	t.Run("under_limit", func(t *testing.T) {
++		sg := newSGForTest(t)
++		jobName := fmt.Sprintf("under-limit-%d", rand.Int())
++		sws := parseAndGetStaticScrapeWork(t, buildStaticScrapeConfigYAML(jobName, 10, 3))
++		sg.update(sws)
++		if n := tsmGlobal.countByJob(jobName); n != 3 {
++			t.Fatalf("unexpected active target count for job %q; got %d; want 3", jobName, n)
++		}
++		if n := countDroppedTargetsForJob(jobName, targetDropReasonTargetsLimit); n != 0 {
++			t.Fatalf("unexpected number of targets dropped because of target_limit for job %q; got %d; want 0", jobName, n)
++		}
++	})
++
++	t.Run("over_limit", func(t *testing.T) {
++		sg := newSGForTest(t)
++		jobName := fmt.Sprintf("over-limit-%d", rand.Int())
++		sws := parseAndGetStaticScrapeWork(t, buildStaticScrapeConfigYAML(jobName, 2, 5))
++		sg.update(sws)
++		if n := tsmGlobal.countByJob(jobName); n != 2 {
++			t.Fatalf("unexpected active target count for job %q; got %d; want 2", jobName, n)
++		}
++		if n := countDroppedTargetsForJob(jobName, targetDropReasonTargetsLimit); n != 3 {
++			t.Fatalf("unexpected number of targets dropped because of target_limit for job %q; got %d; want 3", jobName, n)
++		}
++	})
++
++	t.Run("default_unlimited", func(t *testing.T) {
++		sg := newSGForTest(t)
++		jobName := fmt.Sprintf("unlimited-%d", rand.Int())
++		sws := parseAndGetStaticScrapeWork(t, buildStaticScrapeConfigYAML(jobName, 0, 50))
++		sg.update(sws)
++		if n := tsmGlobal.countByJob(jobName); n != 50 {
++			t.Fatalf("unexpected active target count for job %q; got %d; want 50", jobName, n)
++		}
++		if n := countDroppedTargetsForJob(jobName, targetDropReasonTargetsLimit); n != 0 {
++			t.Fatalf("unexpected number of targets dropped because of target_limit for job %q; got %d; want 0", jobName, n)
++		}
++	})
++}
+diff --git a/lib/promscrape/scrapework.go b/lib/promscrape/scrapework.go
+index 0660620..301ecf8 100644
+--- a/lib/promscrape/scrapework.go
++++ b/lib/promscrape/scrapework.go
+@@ -64,6 +64,11 @@ type ScrapeWork struct {
+ 	// MaxScrapeSize sets max amount of data, that can be scraped by a job
+ 	MaxScrapeSize int64
+ 
++	// MaxScrapeTargetsPerJob limits the number of simultaneously active targets for this target's job_name.
++	//
++	// Zero or negative value means no limit.
++	MaxScrapeTargetsPerJob int
++
+ 	// How to deal with conflicting labels.
+ 	// See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#scrape_config
+ 	HonorLabels bool
+diff --git a/lib/promscrape/targetstatus.go b/lib/promscrape/targetstatus.go
+index aa75dfc..537bf7c 100644
+--- a/lib/promscrape/targetstatus.go
++++ b/lib/promscrape/targetstatus.go
+@@ -237,6 +237,14 @@ func (tsm *targetStatusMap) StatusByGroup(group string, up bool) int {
+ 	return count
+ }
+ 
++// countByJob returns the current number of active (up+down) targets for the given jobName.
++func (tsm *targetStatusMap) countByJob(jobName string) int {
++	tsm.mu.Lock()
++	n := tsm.upByJob[jobName] + tsm.downByJob[jobName]
++	tsm.mu.Unlock()
++	return n
++}
++
+ func (tsm *targetStatusMap) getActiveTargetStatuses() []targetStatus {
+ 	tsm.mu.Lock()
+ 	tss := make([]targetStatus, 0, len(tsm.m))
+@@ -355,6 +363,7 @@ const (
+ 	targetDropReasonMissingScrapeURL = targetDropReason("missing scrape URL") // target dropped because of missing scrape URL
+ 	targetDropReasonDuplicate        = targetDropReason("duplicate")          // target with the given set of labels already exists
+ 	targetDropReasonSharding         = targetDropReason("sharding")           // target is dropped because of sharding https://docs.victoriametrics.com/victoriametrics/vmagent/#scraping-big-number-of-targets
++	targetDropReasonTargetsLimit     = targetDropReason("target_limit")       // target is dropped because job_name's -promscrape.maxScrapeTargetsPerJob (or max_scrape_targets_per_job) limit is exceeded
+ )
+ 
+ func (dt *droppedTargets) getTargetsList() []droppedTarget {

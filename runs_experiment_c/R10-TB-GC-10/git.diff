@@ -1,0 +1,212 @@
+diff --git a/Signal/ConversationView/ConversationSearch.swift b/Signal/ConversationView/ConversationSearch.swift
+index bb0e7b0..652ef5f 100644
+--- a/Signal/ConversationView/ConversationSearch.swift
++++ b/Signal/ConversationView/ConversationSearch.swift
+@@ -39,6 +39,8 @@ public class ConversationSearchController: NSObject {
+     private var lastSearchText: String?
+     private var currentSearchTask: Task<Void, Never>?
+ 
++    private var isAttachmentsOnlyFilterEnabled = false
++
+     // MARK: Initializer
+ 
+     public init(thread: TSThread) {
+@@ -51,6 +53,16 @@ public class ConversationSearchController: NSObject {
+ 
+         uiSearchController.hidesNavigationBarDuringPresentation = true
+         uiSearchController.obscuresBackgroundDuringPresentation = false
++
++        searchBar.delegate = self
++        searchBar.showsBookmarkButton = true
++        updateAttachmentsOnlyFilterIcon()
++    }
++
++    private func updateAttachmentsOnlyFilterIcon() {
++        let icon = Theme.iconImage(.photo16)
++        let image = isAttachmentsOnlyFilterEnabled ? icon.withTintColor(.Signal.accent, renderingMode: .alwaysOriginal) : icon
++        searchBar.setImage(image, for: .bookmark, state: .normal)
+     }
+ 
+     var searchBar: UISearchBar {
+@@ -76,7 +88,8 @@ extension ConversationSearchController: UISearchResultsUpdating {
+     public func updateSearchResults(for searchController: UISearchController) {
+         let searchText = FullTextSearchIndexer.normalizeText((searchController.searchBar.text ?? "").stripped)
+ 
+-        guard searchText.count >= ConversationSearchController.kMinimumSearchTextLength else {
++        let canBrowseAttachmentsWithoutText = isAttachmentsOnlyFilterEnabled && searchText.isEmpty
++        guard searchText.count >= ConversationSearchController.kMinimumSearchTextLength || canBrowseAttachmentsWithoutText else {
+             self.resultsBar.updateResults(resultSet: nil)
+             self.delegate?.conversationSearchController(self, didUpdateSearchResults: nil)
+             self.lastSearchText = nil
+@@ -98,6 +111,7 @@ extension ConversationSearchController: UISearchResultsUpdating {
+                     searchText: searchText,
+                     threadUniqueId: thread.uniqueId,
+                     isGroupThread: thread is TSGroupThread,
++                    onlyMessagesWithAttachments: isAttachmentsOnlyFilterEnabled,
+                 )
+                 if Task.isCancelled {
+                     throw CancellationError()
+@@ -116,6 +130,7 @@ extension ConversationSearchController: UISearchResultsUpdating {
+         searchText: String,
+         threadUniqueId: String,
+         isGroupThread: Bool,
++        onlyMessagesWithAttachments: Bool,
+     ) async throws(CancellationError) -> ConversationScreenSearchResultSet {
+         let databaseStorage = SSKEnvironment.shared.databaseStorageRef
+         return try databaseStorage.read { tx throws(CancellationError) in
+@@ -123,12 +138,30 @@ extension ConversationSearchController: UISearchResultsUpdating {
+                 threadUniqueId: threadUniqueId,
+                 isGroupThread: isGroupThread,
+                 searchText: searchText,
++                onlyMessagesWithAttachments: onlyMessagesWithAttachments,
+                 transaction: tx,
+             )
+         }
+     }
+ }
+ 
++extension ConversationSearchController: UISearchBarDelegate {
++    public func searchBarBookmarkButtonClicked(_ searchBar: UISearchBar) {
++        isAttachmentsOnlyFilterEnabled.toggle()
++        updateAttachmentsOnlyFilterIcon()
++
++        UIAccessibility.post(
++            notification: .announcement,
++            argument: isAttachmentsOnlyFilterEnabled
++                ? OWSLocalizedString("CONVERSATION_SEARCH_FILTER_ATTACHMENTS_ON", comment: "VoiceOver announcement when the conversation search 'shared media only' filter is turned on")
++                : OWSLocalizedString("CONVERSATION_SEARCH_FILTER_ATTACHMENTS_OFF", comment: "VoiceOver announcement when the conversation search 'shared media only' filter is turned off"),
++        )
++
++        lastSearchText = nil
++        updateSearchResults(for: uiSearchController)
++    }
++}
++
+ extension ConversationSearchController: SearchResultsBarDelegate {
+     func searchResultsBar(
+         _ searchResultsBar: SearchResultsBar,
+diff --git a/Signal/translations/en.lproj/Localizable.strings b/Signal/translations/en.lproj/Localizable.strings
+index c811732..2e590d7 100644
+--- a/Signal/translations/en.lproj/Localizable.strings
++++ b/Signal/translations/en.lproj/Localizable.strings
+@@ -2575,6 +2575,12 @@
+ /* navbar header */
+ "CONVERSATION_PICKER_TITLE" = "Choose Recipients";
+ 
++/* VoiceOver announcement when the conversation search 'shared media only' filter is turned off */
++"CONVERSATION_SEARCH_FILTER_ATTACHMENTS_OFF" = "Shared media filter off";
++
++/* VoiceOver announcement when the conversation search 'shared media only' filter is turned on */
++"CONVERSATION_SEARCH_FILTER_ATTACHMENTS_ON" = "Shared media filter on";
++
+ /* keyboard toolbar label when no messages match the search string */
+ "CONVERSATION_SEARCH_NO_RESULTS" = "No matches";
+ 
+diff --git a/SignalServiceKit/Storage/MediaGallery/MediaGalleryAttachmentFinder.swift b/SignalServiceKit/Storage/MediaGallery/MediaGalleryAttachmentFinder.swift
+index 3bc78c0..1bb664f 100644
+--- a/SignalServiceKit/Storage/MediaGallery/MediaGalleryAttachmentFinder.swift
++++ b/SignalServiceKit/Storage/MediaGallery/MediaGalleryAttachmentFinder.swift
+@@ -268,6 +268,46 @@ public struct MediaGalleryAttachmentFinder {
+         ).count)
+     }
+ 
++    /// Returns the sqlite row ids of messages in `threadId` that have at least one body attachment
++    /// (photo, video, voice message, or file), disregarding attachment category/type.
++    ///
++    /// Reuses the same `MessageAttachmentReferenceRecord` table the media gallery already queries, so
++    /// results always reflect the attachment's current association state without a separate index.
++    public static func messageRowIdsWithBodyAttachments(
++        inThreadId threadId: Int64,
++        restrictedToMessageRowIds messageRowIds: Set<Int64>?,
++        limit: Int? = nil,
++        tx: DBReadTransaction,
++    ) -> Set<Int64> {
++        let threadIdColumn = Column(RecordType.CodingKeys.threadRowId)
++        let ownerTypeColumn = Column(RecordType.CodingKeys.ownerType)
++        let isViewOnceColumn = Column(RecordType.CodingKeys.isViewOnce)
++        let isPastEditRevisionColumn = Column(RecordType.CodingKeys.ownerIsPastEditRevision)
++        let ownerIdColumn = Column(RecordType.CodingKeys.ownerRowId)
++
++        var rowIdQuery = RecordType
++            .filter(threadIdColumn == threadId)
++            .filter(ownerTypeColumn == RecordType.OwnerType.bodyAttachment.rawValue)
++            .filter(isViewOnceColumn == false)
++            .filter(isPastEditRevisionColumn == false)
++            .select(ownerIdColumn, as: Int64.self)
++            .distinct()
++
++        if let messageRowIds {
++            rowIdQuery = rowIdQuery.filter(messageRowIds.contains(ownerIdColumn))
++        }
++        if let limit {
++            rowIdQuery = rowIdQuery.order(ownerIdColumn.desc).limit(limit)
++        }
++
++        do {
++            return Set(try rowIdQuery.fetchAll(tx.database))
++        } catch {
++            owsFailDebug("Error fetching message row ids with body attachments: \(error)")
++            return []
++        }
++    }
++
+     // MARK: - Private
+ 
+     typealias RecordType = AttachmentReference.MessageAttachmentReferenceRecord
+diff --git a/SignalUI/Search/FullTextSearcher.swift b/SignalUI/Search/FullTextSearcher.swift
+index 1bf2114..f49cc30 100644
+--- a/SignalUI/Search/FullTextSearcher.swift
++++ b/SignalUI/Search/FullTextSearcher.swift
+@@ -643,6 +643,7 @@ public class FullTextSearcher {
+         threadUniqueId: String,
+         isGroupThread: Bool,
+         searchText: String,
++        onlyMessagesWithAttachments: Bool = false,
+         maxResults: Int = kDefaultMaxResults,
+         transaction: DBReadTransaction,
+     ) throws(CancellationError) -> ConversationScreenSearchResultSet {
+@@ -654,6 +655,28 @@ public class FullTextSearcher {
+             messages[message.sortId] = searchResult
+         }
+ 
++        let threadRowId = TSThread.fetchViaCache(uniqueId: threadUniqueId, transaction: transaction)?.sqliteRowId
++
++        guard !searchText.isEmpty else {
++            guard onlyMessagesWithAttachments, let threadRowId else {
++                return ConversationScreenSearchResultSet(searchText: searchText, messages: [])
++            }
++            let attachmentRowIds = MediaGalleryAttachmentFinder.messageRowIdsWithBodyAttachments(
++                inThreadId: threadRowId,
++                restrictedToMessageRowIds: nil,
++                limit: maxResults,
++                tx: transaction,
++            )
++            for rowId in attachmentRowIds {
++                guard let message = DependenciesBridge.shared.interactionStore.fetchInteraction(rowId: rowId, tx: transaction) as? TSMessage else {
++                    continue
++                }
++                appendMessage(message)
++            }
++            let sortedMessages = messages.values.sorted(by: >)
++            return ConversationScreenSearchResultSet(searchText: searchText, messages: sortedMessages)
++        }
++
+         FullTextSearchIndexer.search(
+             for: searchText,
+             maxResults: maxResults,
+@@ -696,6 +719,15 @@ public class FullTextSearcher {
+             }
+         }
+ 
++        if onlyMessagesWithAttachments, let threadRowId {
++            let attachmentRowIds = MediaGalleryAttachmentFinder.messageRowIdsWithBodyAttachments(
++                inThreadId: threadRowId,
++                restrictedToMessageRowIds: Set(messages.keys.map { Int64($0) }),
++                tx: transaction,
++            )
++            messages = messages.filter { sortId, _ in attachmentRowIds.contains(Int64(sortId)) }
++        }
++
+         // We want most recent first
+         let sortedMessages = messages.values.sorted(by: >)
+ 

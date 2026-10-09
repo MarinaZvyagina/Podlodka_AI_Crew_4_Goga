@@ -1,0 +1,340 @@
+diff --git a/server/etcdserver/api/v3rpc/audit.go b/server/etcdserver/api/v3rpc/audit.go
+new file mode 100644
+index 000000000..d601ae19c
+--- /dev/null
++++ b/server/etcdserver/api/v3rpc/audit.go
+@@ -0,0 +1,136 @@
++// Copyright 2025 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package v3rpc
++
++import (
++	"context"
++	"time"
++
++	"go.uber.org/zap"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/server/v3/auth"
++)
++
++// auditIdentitySource resolves the caller identity and logger an audit
++// record is written with. *etcdserver.EtcdServer satisfies this.
++type auditIdentitySource interface {
++	Logger() *zap.Logger
++	AuthInfoFromCtx(ctx context.Context) (*auth.AuthInfo, error)
++}
++
++// unauthenticatedIdentity is recorded as the audit caller identity when
++// authentication is disabled or no caller identity could be resolved from
++// the request context.
++const unauthenticatedIdentity = "unauthenticated"
++
++const (
++	auditOpRead        = "read"
++	auditOpWrite       = "write"
++	auditOpDelete      = "delete"
++	auditOpTransaction = "transaction"
++)
++
++// auditKVServer wraps a pb.KVServer to produce a uniform audit record for
++// every key-value read, write, delete, and transaction request, regardless
++// of which layers underneath (validation, quota, raft, auth) ultimately
++// handle it. It only observes the call and its outcome; it never alters the
++// request or response.
++type auditKVServer struct {
++	pb.UnsafeKVServer
++
++	kv pb.KVServer
++	s  auditIdentitySource
++}
++
++// NewAuditKVServer wraps kv so that every Range/RangeStream/Put/DeleteRange/
++// Txn call handled by the server produces an audit log record with caller
++// identity, operation kind, key/range, duration, and outcome. Wrap the
++// outermost KVServer decorator (e.g. the quota decorator) so the audit trail
++// also covers requests rejected by inner decorators.
++func NewAuditKVServer(kv pb.KVServer, s auditIdentitySource) pb.KVServer {
++	return &auditKVServer{kv: kv, s: s}
++}
++
++func (a *auditKVServer) Range(ctx context.Context, r *pb.RangeRequest) (*pb.RangeResponse, error) {
++	start := time.Now()
++	resp, err := a.kv.Range(ctx, r)
++	a.record(ctx, auditOpRead, r.GetKey(), r.GetRangeEnd(), start, err)
++	return resp, err
++}
++
++func (a *auditKVServer) RangeStream(r *pb.RangeRequest, rs pb.KV_RangeStreamServer) error {
++	start := time.Now()
++	err := a.kv.RangeStream(r, rs)
++	a.record(rs.Context(), auditOpRead, r.GetKey(), r.GetRangeEnd(), start, err)
++	return err
++}
++
++func (a *auditKVServer) Put(ctx context.Context, r *pb.PutRequest) (*pb.PutResponse, error) {
++	start := time.Now()
++	resp, err := a.kv.Put(ctx, r)
++	a.record(ctx, auditOpWrite, r.GetKey(), nil, start, err)
++	return resp, err
++}
++
++func (a *auditKVServer) DeleteRange(ctx context.Context, r *pb.DeleteRangeRequest) (*pb.DeleteRangeResponse, error) {
++	start := time.Now()
++	resp, err := a.kv.DeleteRange(ctx, r)
++	a.record(ctx, auditOpDelete, r.GetKey(), r.GetRangeEnd(), start, err)
++	return resp, err
++}
++
++func (a *auditKVServer) Txn(ctx context.Context, r *pb.TxnRequest) (*pb.TxnResponse, error) {
++	start := time.Now()
++	resp, err := a.kv.Txn(ctx, r)
++	// A transaction has no single key or range of its own: it bundles
++	// independently-keyed compare/success/failure operations.
++	a.record(ctx, auditOpTransaction, nil, nil, start, err)
++	return resp, err
++}
++
++func (a *auditKVServer) Compact(ctx context.Context, r *pb.CompactionRequest) (*pb.CompactionResponse, error) {
++	return a.kv.Compact(ctx, r)
++}
++
++func (a *auditKVServer) record(ctx context.Context, op string, key, rangeEnd []byte, start time.Time, err error) {
++	lg := a.s.Logger()
++	if lg == nil {
++		return
++	}
++
++	identity := unauthenticatedIdentity
++	if authInfo, aerr := a.s.AuthInfoFromCtx(ctx); aerr == nil && authInfo != nil && authInfo.Username != "" {
++		identity = authInfo.Username
++	}
++
++	fields := make([]zap.Field, 0, 6)
++	fields = append(fields,
++		zap.String("identity", identity),
++		zap.String("operation", op),
++		zap.Duration("duration", time.Since(start)),
++		zap.Bool("success", err == nil),
++	)
++	if len(key) > 0 {
++		fields = append(fields, zap.ByteString("key", key))
++	}
++	if len(rangeEnd) > 0 {
++		fields = append(fields, zap.ByteString("range-end", rangeEnd))
++	}
++	if err != nil {
++		fields = append(fields, zap.Error(err))
++	}
++	lg.Info("kv audit", fields...)
++}
+diff --git a/server/etcdserver/api/v3rpc/audit_test.go b/server/etcdserver/api/v3rpc/audit_test.go
+new file mode 100644
+index 000000000..affbf64db
+--- /dev/null
++++ b/server/etcdserver/api/v3rpc/audit_test.go
+@@ -0,0 +1,179 @@
++// Copyright 2025 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package v3rpc
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"go.uber.org/zap"
++	"go.uber.org/zap/zaptest/observer"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/server/v3/auth"
++)
++
++// stubKVServer returns canned responses/errors without doing any real work,
++// so tests can assert the audit decorator passes them through unchanged.
++type stubKVServer struct {
++	pb.UnsafeKVServer
++
++	rangeResp *pb.RangeResponse
++	putResp   *pb.PutResponse
++	delResp   *pb.DeleteRangeResponse
++	txnResp   *pb.TxnResponse
++	err       error
++}
++
++func (s *stubKVServer) Range(context.Context, *pb.RangeRequest) (*pb.RangeResponse, error) {
++	return s.rangeResp, s.err
++}
++
++func (s *stubKVServer) RangeStream(*pb.RangeRequest, pb.KV_RangeStreamServer) error {
++	return s.err
++}
++
++func (s *stubKVServer) Put(context.Context, *pb.PutRequest) (*pb.PutResponse, error) {
++	return s.putResp, s.err
++}
++
++func (s *stubKVServer) DeleteRange(context.Context, *pb.DeleteRangeRequest) (*pb.DeleteRangeResponse, error) {
++	return s.delResp, s.err
++}
++
++func (s *stubKVServer) Txn(context.Context, *pb.TxnRequest) (*pb.TxnResponse, error) {
++	return s.txnResp, s.err
++}
++
++func (s *stubKVServer) Compact(context.Context, *pb.CompactionRequest) (*pb.CompactionResponse, error) {
++	return nil, s.err
++}
++
++// stubIdentitySource lets tests control the resolved caller identity and
++// capture emitted log records.
++type stubIdentitySource struct {
++	lg       *zap.Logger
++	authInfo *auth.AuthInfo
++	authErr  error
++}
++
++func (s *stubIdentitySource) Logger() *zap.Logger { return s.lg }
++
++func (s *stubIdentitySource) AuthInfoFromCtx(context.Context) (*auth.AuthInfo, error) {
++	return s.authInfo, s.authErr
++}
++
++func TestAuditKVServerRecordsCallerIdentity(t *testing.T) {
++	tests := []struct {
++		name     string
++		authInfo *auth.AuthInfo
++		authErr  error
++		want     string
++	}{
++		{name: "auth disabled", authInfo: nil, authErr: nil, want: unauthenticatedIdentity},
++		{name: "auth error", authInfo: &auth.AuthInfo{Username: "alice"}, authErr: errors.New("boom"), want: unauthenticatedIdentity},
++		{name: "empty username", authInfo: &auth.AuthInfo{Username: ""}, want: unauthenticatedIdentity},
++		{name: "authenticated", authInfo: &auth.AuthInfo{Username: "alice"}, want: "alice"},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			core, logs := observer.New(zap.InfoLevel)
++			a := &auditKVServer{
++				kv: &stubKVServer{putResp: &pb.PutResponse{}},
++				s:  &stubIdentitySource{lg: zap.New(core), authInfo: tt.authInfo, authErr: tt.authErr},
++			}
++
++			resp, err := a.Put(context.Background(), &pb.PutRequest{Key: []byte("foo")})
++			require.NoError(t, err)
++			require.NotNil(t, resp)
++
++			entries := logs.All()
++			require.Len(t, entries, 1)
++			ctxMap := entries[0].ContextMap()
++			assert.Equal(t, tt.want, ctxMap["identity"])
++		})
++	}
++}
++
++func TestAuditKVServerRecordsOperationKindAndKey(t *testing.T) {
++	core, logs := observer.New(zap.InfoLevel)
++	id := &stubIdentitySource{lg: zap.New(core)}
++	inner := &stubKVServer{
++		rangeResp: &pb.RangeResponse{},
++		putResp:   &pb.PutResponse{},
++		delResp:   &pb.DeleteRangeResponse{},
++		txnResp:   &pb.TxnResponse{},
++	}
++	a := &auditKVServer{kv: inner, s: id}
++
++	_, err := a.Range(context.Background(), &pb.RangeRequest{Key: []byte("a"), RangeEnd: []byte("z")})
++	require.NoError(t, err)
++	_, err = a.Put(context.Background(), &pb.PutRequest{Key: []byte("k")})
++	require.NoError(t, err)
++	_, err = a.DeleteRange(context.Background(), &pb.DeleteRangeRequest{Key: []byte("k"), RangeEnd: []byte("kz")})
++	require.NoError(t, err)
++	_, err = a.Txn(context.Background(), &pb.TxnRequest{})
++	require.NoError(t, err)
++
++	entries := logs.All()
++	require.Len(t, entries, 4)
++
++	wantOps := []string{auditOpRead, auditOpWrite, auditOpDelete, auditOpTransaction}
++	for i, want := range wantOps {
++		ctxMap := entries[i].ContextMap()
++		assert.Equal(t, want, ctxMap["operation"])
++		assert.Equal(t, true, ctxMap["success"])
++	}
++
++	assert.Equal(t, "a", entries[0].ContextMap()["key"])
++	assert.Equal(t, "z", entries[0].ContextMap()["range-end"])
++	assert.Equal(t, "k", entries[1].ContextMap()["key"])
++	assert.NotContains(t, entries[1].ContextMap(), "range-end")
++	assert.NotContains(t, entries[3].ContextMap(), "key")
++}
++
++func TestAuditKVServerRecordsFailureOutcomeAndPassesErrorThrough(t *testing.T) {
++	core, logs := observer.New(zap.InfoLevel)
++	wantErr := errors.New("permission denied")
++	a := &auditKVServer{
++		kv: &stubKVServer{err: wantErr},
++		s:  &stubIdentitySource{lg: zap.New(core)},
++	}
++
++	resp, err := a.Put(context.Background(), &pb.PutRequest{Key: []byte("k")})
++	assert.Nil(t, resp)
++	assert.Equal(t, wantErr, err)
++
++	entries := logs.All()
++	require.Len(t, entries, 1)
++	assert.Equal(t, false, entries[0].ContextMap()["success"])
++}
++
++func TestAuditKVServerDoesNotAlterResponse(t *testing.T) {
++	core, _ := observer.New(zap.InfoLevel)
++	want := &pb.PutResponse{Header: &pb.ResponseHeader{Revision: 42}}
++	a := &auditKVServer{
++		kv: &stubKVServer{putResp: want},
++		s:  &stubIdentitySource{lg: zap.New(core)},
++	}
++
++	got, err := a.Put(context.Background(), &pb.PutRequest{Key: []byte("k")})
++	require.NoError(t, err)
++	assert.Same(t, want, got)
++}
+diff --git a/server/etcdserver/api/v3rpc/grpc.go b/server/etcdserver/api/v3rpc/grpc.go
+index 91863e294..fd00627ad 100644
+--- a/server/etcdserver/api/v3rpc/grpc.go
++++ b/server/etcdserver/api/v3rpc/grpc.go
+@@ -77,7 +77,7 @@ func Server(s *etcdserver.EtcdServer, tls *tls.Config, interceptor grpc.UnarySer
+ 
+ 	grpcServer := grpc.NewServer(append(opts, gopts...)...)
+ 
+-	pb.RegisterKVServer(grpcServer, NewQuotaKVServer(s))
++	pb.RegisterKVServer(grpcServer, NewAuditKVServer(NewQuotaKVServer(s), s))
+ 	pb.RegisterWatchServer(grpcServer, NewWatchServer(s))
+ 	pb.RegisterLeaseServer(grpcServer, NewQuotaLeaseServer(s))
+ 	pb.RegisterClusterServer(grpcServer, NewClusterServer(s))

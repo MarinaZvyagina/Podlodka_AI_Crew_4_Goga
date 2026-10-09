@@ -1,0 +1,150 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+index f47eddb..ca6380e 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+@@ -13,6 +13,7 @@ import androidx.annotation.VisibleForTesting;
+ import androidx.annotation.WorkerThread;
+ 
+ import org.signal.core.util.CursorUtil;
++import org.signal.core.util.LRUCache;
+ import org.signal.core.util.concurrent.SignalExecutors;
+ import org.signal.core.util.logging.Log;
+ import org.thoughtcrime.securesms.conversation.MessageStyler;
+@@ -50,6 +51,8 @@ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Set;
+ import java.util.concurrent.Executor;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicLong;
+ 
+ import static org.thoughtcrime.securesms.database.SearchTable.SNIPPET_WRAP;
+ 
+@@ -61,6 +64,20 @@ public class SearchRepository {
+   private static final String TAG = Log.tag(SearchRepository.class);
+ 
+   private static final int MAX_SNIPPET_SIZE = 100;
++  private static final int RESULT_CACHE_SIZE = 20;
++
++  /**
++   * Bumped by {@link #clearResultCaches()} whenever conversation-list-relevant data changes
++   * (message insert/update/delete, thread delete, group changes -- see
++   * {@link org.thoughtcrime.securesms.database.DatabaseObserver#registerConversationListObserver}).
++   * A result is only cached if this generation is unchanged between the start and end of the
++   * query that produced it, so a change that lands mid-query can never be cached over.
++   */
++  private static final AtomicLong    resultCacheGeneration            = new AtomicLong(0);
++  private static final AtomicBoolean resultCacheInvalidationRegistered = new AtomicBoolean(false);
++
++  private static final Map<ThreadCacheKey, CacheEntry<ThreadSearchResult>>   threadResultCache  = new LRUCache<>(RESULT_CACHE_SIZE);
++  private static final Map<MessageCacheKey, CacheEntry<MessageSearchResult>> messageResultCache = new LRUCache<>(RESULT_CACHE_SIZE);
+ 
+   private final Context           context;
+   private final String            noteToSelfTitle;
+@@ -81,10 +98,26 @@ public class SearchRepository {
+     this.mentionTable      = SignalDatabase.mentions();
+     this.messageTable      = SignalDatabase.messages();
+     this.serialExecutor    = new SerialExecutor(SignalExecutors.BOUNDED);
++
++    if (resultCacheInvalidationRegistered.compareAndSet(false, true)) {
++      AppDependencies.getDatabaseObserver().registerConversationListObserver(SearchRepository::clearResultCaches);
++    }
+   }
+ 
+   @WorkerThread
+   public @NonNull ThreadSearchResult queryThreadsSync(@NonNull String query, boolean unreadOnly) {
++    boolean        cacheable = !Util.isEmpty(query);
++    ThreadCacheKey cacheKey  = cacheable ? new ThreadCacheKey(query, unreadOnly) : null;
++
++    if (cacheable) {
++      ThreadSearchResult cached = getCached(threadResultCache, cacheKey);
++      if (cached != null) {
++        return cached;
++      }
++    }
++
++    long generation = resultCacheGeneration.get();
++
+     SignalTrace.beginSection("ConversationListSearch-Threads");
+     try {
+       long                      start  = System.currentTimeMillis();
+@@ -92,7 +125,11 @@ public class SearchRepository {
+ 
+       Log.d(TAG, "[threads] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new ThreadSearchResult(result, query);
++      ThreadSearchResult searchResult = new ThreadSearchResult(result, query);
++      if (cacheable) {
++        putCached(threadResultCache, cacheKey, generation, searchResult);
++      }
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -100,6 +137,18 @@ public class SearchRepository {
+ 
+   @WorkerThread
+   public @NonNull MessageSearchResult queryMessagesSync(@NonNull String query, @NonNull SearchFilter filter) {
++    boolean         cacheable = !Util.isEmpty(query);
++    MessageCacheKey cacheKey  = cacheable ? new MessageCacheKey(query, filter) : null;
++
++    if (cacheable) {
++      MessageSearchResult cached = getCached(messageResultCache, cacheKey);
++      if (cached != null) {
++        return cached;
++      }
++    }
++
++    long generation = resultCacheGeneration.get();
++
+     SignalTrace.beginSection("ConversationListSearch-Messages");
+     try {
+       long start = System.currentTimeMillis();
+@@ -111,12 +160,33 @@ public class SearchRepository {
+ 
+       Log.d(TAG, "[messages] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new MessageSearchResult(combined, query);
++      MessageSearchResult searchResult = new MessageSearchResult(combined, query);
++      if (cacheable) {
++        putCached(messageResultCache, cacheKey, generation, searchResult);
++      }
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+   }
+ 
++  private static synchronized <K, V> @Nullable V getCached(@NonNull Map<K, CacheEntry<V>> cache, @NonNull K key) {
++    CacheEntry<V> entry = cache.get(key);
++    return (entry != null && entry.generation == resultCacheGeneration.get()) ? entry.value : null;
++  }
++
++  private static synchronized <K, V> void putCached(@NonNull Map<K, CacheEntry<V>> cache, @NonNull K key, long generation, @NonNull V value) {
++    if (generation == resultCacheGeneration.get()) {
++      cache.put(key, new CacheEntry<>(generation, value));
++    }
++  }
++
++  private static synchronized void clearResultCaches() {
++    resultCacheGeneration.incrementAndGet();
++    threadResultCache.clear();
++    messageResultCache.clear();
++  }
++
+   public void query(@NonNull String query, long threadId, @NonNull Callback<List<MessageResult>> callback) {
+     if (TextUtils.isEmpty(query)) {
+       callback.onResult(Collections.emptyList());
+@@ -485,4 +555,13 @@ public class SearchRepository {
+   public interface ModelBuilder<T> {
+     T build(@NonNull Cursor cursor);
+   }
++
++  private record CacheEntry<V>(long generation, @NonNull V value) {
++  }
++
++  private record ThreadCacheKey(@NonNull String query, boolean unreadOnly) {
++  }
++
++  private record MessageCacheKey(@NonNull String query, @NonNull SearchFilter filter) {
++  }
+ }

@@ -1,0 +1,242 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+index f47eddb..82ce1a4 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+@@ -81,18 +81,27 @@ public class SearchRepository {
+     this.mentionTable      = SignalDatabase.mentions();
+     this.messageTable      = SignalDatabase.messages();
+     this.serialExecutor    = new SerialExecutor(SignalExecutors.BOUNDED);
++
++    SearchResultCache.INSTANCE.registerForInvalidation();
+   }
+ 
+   @WorkerThread
+   public @NonNull ThreadSearchResult queryThreadsSync(@NonNull String query, boolean unreadOnly) {
+     SignalTrace.beginSection("ConversationListSearch-Threads");
+     try {
++      ThreadSearchResult cached = SearchResultCache.INSTANCE.getThreads(query, unreadOnly);
++      if (cached != null) {
++        return cached;
++      }
++
+       long                      start  = System.currentTimeMillis();
+       List<ThreadWithRecipient> result = queryConversations(query, unreadOnly);
+ 
+       Log.d(TAG, "[threads] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new ThreadSearchResult(result, query);
++      ThreadSearchResult searchResult = new ThreadSearchResult(result, query);
++      SearchResultCache.INSTANCE.putThreads(query, unreadOnly, searchResult);
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -102,6 +111,11 @@ public class SearchRepository {
+   public @NonNull MessageSearchResult queryMessagesSync(@NonNull String query, @NonNull SearchFilter filter) {
+     SignalTrace.beginSection("ConversationListSearch-Messages");
+     try {
++      MessageSearchResult cached = SearchResultCache.INSTANCE.getMessages(query, filter);
++      if (cached != null) {
++        return cached;
++      }
++
+       long start = System.currentTimeMillis();
+ 
+       List<MessageResult> messages         = queryMessages(query, filter);
+@@ -111,7 +125,9 @@ public class SearchRepository {
+ 
+       Log.d(TAG, "[messages] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new MessageSearchResult(combined, query);
++      MessageSearchResult searchResult = new MessageSearchResult(combined, query);
++      SearchResultCache.INSTANCE.putMessages(query, filter, searchResult);
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/search/SearchResultCache.kt b/app/src/main/java/org/thoughtcrime/securesms/search/SearchResultCache.kt
+new file mode 100644
+index 0000000..6ae7dd9
+--- /dev/null
++++ b/app/src/main/java/org/thoughtcrime/securesms/search/SearchResultCache.kt
+@@ -0,0 +1,72 @@
++/*
++ * Copyright 2026 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++package org.thoughtcrime.securesms.search
++
++import org.thoughtcrime.securesms.dependencies.AppDependencies
++
++/**
++ * Caches chat list search results (conversations and messages), keyed by the exact query text
++ * and filters used to produce them, so that repeating an identical search can skip re-scanning
++ * the database.
++ *
++ * The cache never returns stale data because [clear] is wired up (via [registerForInvalidation])
++ * to fire on every conversation-list-affecting database change, which covers all of the tables
++ * search reads from (messages, threads, recipients, groups).
++ */
++object SearchResultCache {
++
++  private const val MAX_ENTRIES = 20
++
++  private data class ThreadCacheKey(val query: String, val unreadOnly: Boolean)
++  private data class MessageCacheKey(val query: String, val filter: SearchFilter)
++
++  private val threadResults: MutableMap<ThreadCacheKey, ThreadSearchResult> = boundedLruMap()
++  private val messageResults: MutableMap<MessageCacheKey, MessageSearchResult> = boundedLruMap()
++
++  private var invalidationRegistered = false
++
++  @Synchronized
++  fun getThreads(query: String, unreadOnly: Boolean): ThreadSearchResult? {
++    return threadResults[ThreadCacheKey(query, unreadOnly)]
++  }
++
++  @Synchronized
++  fun putThreads(query: String, unreadOnly: Boolean, result: ThreadSearchResult) {
++    threadResults[ThreadCacheKey(query, unreadOnly)] = result
++  }
++
++  @Synchronized
++  fun getMessages(query: String, filter: SearchFilter): MessageSearchResult? {
++    return messageResults[MessageCacheKey(query, filter)]
++  }
++
++  @Synchronized
++  fun putMessages(query: String, filter: SearchFilter, result: MessageSearchResult) {
++    messageResults[MessageCacheKey(query, filter)] = result
++  }
++
++  /** Discards all cached results. */
++  @Synchronized
++  fun clear() {
++    threadResults.clear()
++    messageResults.clear()
++  }
++
++  /** Idempotent: ensures [clear] runs on every conversation-list-affecting database change. */
++  @Synchronized
++  fun registerForInvalidation() {
++    if (invalidationRegistered) {
++      return
++    }
++    invalidationRegistered = true
++    AppDependencies.databaseObserver.registerConversationListObserver { clear() }
++  }
++
++  private fun <K, V> boundedLruMap(): MutableMap<K, V> {
++    return object : LinkedHashMap<K, V>(16, 0.75f, true) {
++      override fun removeEldestEntry(eldest: MutableMap.MutableEntry<K, V>): Boolean = size > MAX_ENTRIES
++    }
++  }
++}
+diff --git a/app/src/test/java/org/thoughtcrime/securesms/search/SearchResultCacheTest.kt b/app/src/test/java/org/thoughtcrime/securesms/search/SearchResultCacheTest.kt
+new file mode 100644
+index 0000000..8cb9605
+--- /dev/null
++++ b/app/src/test/java/org/thoughtcrime/securesms/search/SearchResultCacheTest.kt
+@@ -0,0 +1,102 @@
++/*
++ * Copyright 2026 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.search
++
++import assertk.assertThat
++import assertk.assertions.isEqualTo
++import assertk.assertions.isNotNull
++import assertk.assertions.isNull
++import assertk.assertions.isSameAs
++import org.junit.After
++import org.junit.Test
++
++class SearchResultCacheTest {
++
++  @After
++  fun tearDown() {
++    SearchResultCache.clear()
++  }
++
++  @Test
++  fun `returns null when nothing cached yet`() {
++    assertThat(SearchResultCache.getMessages("hello", SearchFilter.EMPTY)).isNull()
++    assertThat(SearchResultCache.getThreads("hello", unreadOnly = false)).isNull()
++  }
++
++  @Test
++  fun `returns the same instance that was cached for an identical query and filter`() {
++    val result = MessageSearchResult(emptyList(), "hello")
++
++    SearchResultCache.putMessages("hello", SearchFilter.EMPTY, result)
++
++    assertThat(SearchResultCache.getMessages("hello", SearchFilter.EMPTY)).isSameAs(result)
++  }
++
++  @Test
++  fun `different query text is cached independently`() {
++    val helloResult = MessageSearchResult(emptyList(), "hello")
++    val worldResult = MessageSearchResult(emptyList(), "world")
++
++    SearchResultCache.putMessages("hello", SearchFilter.EMPTY, helloResult)
++    SearchResultCache.putMessages("world", SearchFilter.EMPTY, worldResult)
++
++    assertThat(SearchResultCache.getMessages("hello", SearchFilter.EMPTY)).isSameAs(helloResult)
++    assertThat(SearchResultCache.getMessages("world", SearchFilter.EMPTY)).isSameAs(worldResult)
++  }
++
++  @Test
++  fun `different filters for the same query text are cached independently`() {
++    val unfiltered = MessageSearchResult(emptyList(), "hello")
++    val filtered = MessageSearchResult(emptyList(), "hello")
++    val dateFilter = SearchFilter(startDate = 100L)
++
++    SearchResultCache.putMessages("hello", SearchFilter.EMPTY, unfiltered)
++    SearchResultCache.putMessages("hello", dateFilter, filtered)
++
++    assertThat(SearchResultCache.getMessages("hello", SearchFilter.EMPTY)).isSameAs(unfiltered)
++    assertThat(SearchResultCache.getMessages("hello", dateFilter)).isSameAs(filtered)
++  }
++
++  @Test
++  fun `unread-only is a distinct cache key from thread search`() {
++    val allThreads = ThreadSearchResult(emptyList(), "hello")
++    val unreadThreads = ThreadSearchResult(emptyList(), "hello")
++
++    SearchResultCache.putThreads("hello", unreadOnly = false, result = allThreads)
++    SearchResultCache.putThreads("hello", unreadOnly = true, result = unreadThreads)
++
++    assertThat(SearchResultCache.getThreads("hello", unreadOnly = false)).isSameAs(allThreads)
++    assertThat(SearchResultCache.getThreads("hello", unreadOnly = true)).isSameAs(unreadThreads)
++  }
++
++  @Test
++  fun `clear discards all cached entries`() {
++    SearchResultCache.putMessages("hello", SearchFilter.EMPTY, MessageSearchResult(emptyList(), "hello"))
++    SearchResultCache.putThreads("hello", unreadOnly = false, result = ThreadSearchResult(emptyList(), "hello"))
++
++    SearchResultCache.clear()
++
++    assertThat(SearchResultCache.getMessages("hello", SearchFilter.EMPTY)).isNull()
++    assertThat(SearchResultCache.getThreads("hello", unreadOnly = false)).isNull()
++  }
++
++  @Test
++  fun `evicts the least recently used entry once past capacity`() {
++    repeat(20) { i ->
++      SearchResultCache.putMessages("query$i", SearchFilter.EMPTY, MessageSearchResult(emptyList(), "query$i"))
++    }
++
++    // Touch query0 so it's no longer the least-recently-used entry.
++    SearchResultCache.getMessages("query0", SearchFilter.EMPTY)
++
++    // Adding one more entry should evict query1 (now the least-recently-used), not query0.
++    SearchResultCache.putMessages("query20", SearchFilter.EMPTY, MessageSearchResult(emptyList(), "query20"))
++
++    assertThat(SearchResultCache.getMessages("query0", SearchFilter.EMPTY)).isNotNull()
++    assertThat(SearchResultCache.getMessages("query1", SearchFilter.EMPTY)).isNull()
++    assertThat(SearchResultCache.getMessages("query20", SearchFilter.EMPTY)?.query).isEqualTo("query20")
++  }
++}

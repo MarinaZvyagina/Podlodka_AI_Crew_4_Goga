@@ -1,0 +1,248 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModel.kt b/app/src/main/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModel.kt
+index bafbb3f..479a944 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModel.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModel.kt
+@@ -148,6 +148,7 @@ class ContactSearchViewModel(
+ 
+   override fun onCleared() {
+     disposables.clear()
++    searchRepository.close()
+   }
+ 
+   fun setFastScrollEnabled(enabled: Boolean) {
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+index f47eddb..8e12d11 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+@@ -18,6 +18,7 @@ import org.signal.core.util.logging.Log;
+ import org.thoughtcrime.securesms.conversation.MessageStyler;
+ import org.thoughtcrime.securesms.database.BodyAdjustment;
+ import org.thoughtcrime.securesms.database.BodyRangeUtil;
++import org.thoughtcrime.securesms.database.DatabaseObserver;
+ import org.thoughtcrime.securesms.database.GroupTable;
+ import org.thoughtcrime.securesms.database.MentionTable;
+ import org.thoughtcrime.securesms.database.MentionUtil;
+@@ -43,6 +44,7 @@ import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.HashSet;
++import java.util.LinkedHashMap;
+ import java.util.LinkedHashSet;
+ import java.util.LinkedList;
+ import java.util.List;
+@@ -62,6 +64,9 @@ public class SearchRepository {
+ 
+   private static final int MAX_SNIPPET_SIZE = 100;
+ 
++  /** Caps the number of distinct chat-list search queries we keep cached results for. */
++  private static final int MAX_CACHE_ENTRIES = 32;
++
+   private final Context           context;
+   private final String            noteToSelfTitle;
+   private final SearchTable       searchDatabase;
+@@ -72,6 +77,12 @@ public class SearchRepository {
+ 
+   private final Executor serialExecutor;
+ 
++  private final Map<Map.Entry<String, Boolean>, ThreadSearchResult>       threadResultCache  = createBoundedCache();
++  private final Map<Map.Entry<String, SearchFilter>, MessageSearchResult> messageResultCache = createBoundedCache();
++  private final DatabaseObserver.Observer                                cacheInvalidationObserver = this::clearResultCaches;
++
++  private volatile boolean cacheInvalidationRegistered;
++
+   public SearchRepository(@NonNull String noteToSelfTitle) {
+     this.context           = AppDependencies.getApplication().getApplicationContext();
+     this.noteToSelfTitle   = noteToSelfTitle;
+@@ -85,6 +96,14 @@ public class SearchRepository {
+ 
+   @WorkerThread
+   public @NonNull ThreadSearchResult queryThreadsSync(@NonNull String query, boolean unreadOnly) {
++    ensureCacheInvalidationRegistered();
++
++    Map.Entry<String, Boolean> cacheKey = Map.entry(query, unreadOnly);
++    ThreadSearchResult         cached   = threadResultCache.get(cacheKey);
++    if (cached != null) {
++      return cached;
++    }
++
+     SignalTrace.beginSection("ConversationListSearch-Threads");
+     try {
+       long                      start  = System.currentTimeMillis();
+@@ -92,7 +111,9 @@ public class SearchRepository {
+ 
+       Log.d(TAG, "[threads] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new ThreadSearchResult(result, query);
++      ThreadSearchResult searchResult = new ThreadSearchResult(result, query);
++      threadResultCache.put(cacheKey, searchResult);
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -100,6 +121,14 @@ public class SearchRepository {
+ 
+   @WorkerThread
+   public @NonNull MessageSearchResult queryMessagesSync(@NonNull String query, @NonNull SearchFilter filter) {
++    ensureCacheInvalidationRegistered();
++
++    Map.Entry<String, SearchFilter> cacheKey = Map.entry(query, filter);
++    MessageSearchResult             cached   = messageResultCache.get(cacheKey);
++    if (cached != null) {
++      return cached;
++    }
++
+     SignalTrace.beginSection("ConversationListSearch-Messages");
+     try {
+       long start = System.currentTimeMillis();
+@@ -111,12 +140,56 @@ public class SearchRepository {
+ 
+       Log.d(TAG, "[messages] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new MessageSearchResult(combined, query);
++      MessageSearchResult searchResult = new MessageSearchResult(combined, query);
++      messageResultCache.put(cacheKey, searchResult);
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+   }
+ 
++  /**
++   * Releases the cache-invalidation subscription. Should be called when this repository is no
++   * longer needed (e.g. from a ViewModel's {@code onCleared()}).
++   */
++  public void close() {
++    if (cacheInvalidationRegistered) {
++      AppDependencies.getDatabaseObserver().unregisterObserver(cacheInvalidationObserver);
++    }
++  }
++
++  /**
++   * Registers for conversation-list-affecting data changes (new/edited/deleted messages,
++   * thread/recipient/group updates) so cached search results are dropped as soon as they might be
++   * stale. Deferred until first real use so short-lived, never-queried instances of this
++   * repository (e.g. ones discarded by {@code ViewModelProvider} when a ViewModel already exists)
++   * never leak a permanent listener.
++   */
++  private void ensureCacheInvalidationRegistered() {
++    if (!cacheInvalidationRegistered) {
++      synchronized (this) {
++        if (!cacheInvalidationRegistered) {
++          AppDependencies.getDatabaseObserver().registerConversationListObserver(cacheInvalidationObserver);
++          cacheInvalidationRegistered = true;
++        }
++      }
++    }
++  }
++
++  private void clearResultCaches() {
++    threadResultCache.clear();
++    messageResultCache.clear();
++  }
++
++  private static <K, V> Map<K, V> createBoundedCache() {
++    return Collections.synchronizedMap(new LinkedHashMap<K, V>(16, 0.75f, true) {
++      @Override
++      protected boolean removeEldestEntry(Map.Entry<K, V> eldest) {
++        return size() > MAX_CACHE_ENTRIES;
++      }
++    });
++  }
++
+   public void query(@NonNull String query, long threadId, @NonNull Callback<List<MessageResult>> callback) {
+     if (TextUtils.isEmpty(query)) {
+       callback.onResult(Collections.emptyList());
+diff --git a/app/src/test/java/org/thoughtcrime/securesms/database/SearchRepositoryCacheTest.kt b/app/src/test/java/org/thoughtcrime/securesms/database/SearchRepositoryCacheTest.kt
+new file mode 100644
+index 0000000..6c09f10
+--- /dev/null
++++ b/app/src/test/java/org/thoughtcrime/securesms/database/SearchRepositoryCacheTest.kt
+@@ -0,0 +1,88 @@
++/*
++ * Copyright 2026 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.database
++
++import android.app.Application
++import assertk.assertThat
++import assertk.assertions.hasSize
++import io.mockk.every
++import io.mockk.mockkStatic
++import io.mockk.unmockkStatic
++import org.junit.After
++import org.junit.Before
++import org.junit.Rule
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import org.thoughtcrime.securesms.dependencies.AppDependencies
++import org.thoughtcrime.securesms.search.SearchRepository
++import org.thoughtcrime.securesms.testutil.RecipientTestRule
++
++/**
++ * Verifies the chat-list search result cache added to [SearchRepository]: repeated identical
++ * queries are served from cache, but that cache is dropped as soon as the conversation list
++ * changes so a later identical search never returns stale results.
++ */
++@RunWith(RobolectricTestRunner::class)
++@Config(manifest = Config.NONE, application = Application::class)
++class SearchRepositoryCacheTest {
++
++  @get:Rule
++  val recipients = RecipientTestRule()
++
++  private lateinit var observer: DatabaseObserver
++  private lateinit var repository: SearchRepository
++
++  @Before
++  fun setUp() {
++    observer = DatabaseObserver()
++    mockkStatic(AppDependencies::class)
++    every { AppDependencies.databaseObserver } returns observer
++
++    repository = SearchRepository("Note to Self")
++  }
++
++  @After
++  fun tearDown() {
++    unmockkStatic(AppDependencies::class)
++  }
++
++  @Test
++  fun `queryThreadsSync serves cached results until the conversation list changes`() {
++    val alice = recipients.createRecipient("Alice Wonderland")
++    recipients.insertIncomingMessage(alice)
++
++    assertThat(repository.queryThreadsSync("Alice", false).results).hasSize(1)
++
++    // A second matching thread appears, but the observer hasn't fired yet: the cached result
++    // for the exact same query should still be served, proving the second call was a cache hit
++    // rather than a fresh database query.
++    val aliceToo = recipients.createRecipient("Alice Two")
++    recipients.insertIncomingMessage(aliceToo)
++    assertThat(repository.queryThreadsSync("Alice", false).results).hasSize(1)
++
++    // Once the conversation list change is signalled, the same query must reflect current data.
++    observer.notifyConversationListListeners()
++    observer.flush()
++    assertThat(repository.queryThreadsSync("Alice", false).results).hasSize(2)
++  }
++
++  @Test
++  fun `different queries are cached independently`() {
++    val alice = recipients.createRecipient("Alice Wonderland")
++    recipients.insertIncomingMessage(alice)
++    val bob = recipients.createRecipient("Bob Builder")
++    recipients.insertIncomingMessage(bob)
++
++    assertThat(repository.queryThreadsSync("Alice", false).results).hasSize(1)
++    assertThat(repository.queryThreadsSync("Bob", false).results).hasSize(1)
++
++    // Re-querying "Alice" must still return only the Alice thread, i.e. the "Bob" cache entry
++    // didn't clobber it.
++    assertThat(repository.queryThreadsSync("Alice", false).results).hasSize(1)
++  }
++}

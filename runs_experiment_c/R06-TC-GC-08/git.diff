@@ -1,0 +1,328 @@
+diff --git a/server/etcdserver/api/v3rpc/audit.go b/server/etcdserver/api/v3rpc/audit.go
+new file mode 100644
+index 000000000..ac76ea23e
+--- /dev/null
++++ b/server/etcdserver/api/v3rpc/audit.go
+@@ -0,0 +1,192 @@
++// Copyright 2016 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package v3rpc
++
++import (
++	"context"
++	"strings"
++	"time"
++
++	"go.uber.org/zap"
++	"google.golang.org/grpc"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/server/v3/auth"
++	"go.etcd.io/etcd/server/v3/etcdserver"
++)
++
++// kvServiceMethodPrefix is the gRPC method prefix shared by every KV service
++// RPC. Matching on it, rather than on individual request/response types,
++// means the audit interceptor applies to every present and future KV RPC
++// without needing to be told about it individually.
++const kvServiceMethodPrefix = "/etcdserverpb.KV/"
++
++// auditOperationKinds maps a KV service method name to the audit operation
++// kind reported for it. A method absent from this map (e.g. a newly added
++// KV RPC that hasn't been categorized yet) still produces a full audit
++// record via newAuditUnaryInterceptor; only the operation kind falls back
++// to "unknown" instead of being silently dropped.
++var auditOperationKinds = map[string]string{
++	"Range":       "read",
++	"Put":         "write",
++	"DeleteRange": "delete",
++	"Txn":         "transaction",
++}
++
++// authInfoProvider is the subset of *etcdserver.EtcdServer the audit
++// interceptor needs to resolve caller identity. Narrowing it to an
++// interface keeps the identity logic independently testable.
++type authInfoProvider interface {
++	AuthInfoFromCtx(ctx context.Context) (*auth.AuthInfo, error)
++}
++
++// newAuditUnaryInterceptor produces a compliance audit record for every KV
++// service request handled by the server: caller identity, operation kind,
++// key or key range, duration, and outcome. Because it is keyed off the gRPC
++// method prefix rather than individual handlers, coverage stays uniform as
++// KV request types are added or changed, with no per-handler instrumentation
++// required. It only observes the request and response; it never alters
++// them, so functional behavior is unaffected.
++func newAuditUnaryInterceptor(s *etcdserver.EtcdServer) grpc.UnaryServerInterceptor {
++	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
++		if !strings.HasPrefix(info.FullMethod, kvServiceMethodPrefix) {
++			return handler(ctx, req)
++		}
++
++		startTime := time.Now()
++		resp, err := handler(ctx, req)
++
++		if lg := s.Logger(); lg != nil {
++			logKVAudit(ctx, lg, s, info.FullMethod, req, startTime, err)
++		}
++		return resp, err
++	}
++}
++
++func logKVAudit(ctx context.Context, lg *zap.Logger, ap authInfoProvider, fullMethod string, req any, startTime time.Time, err error) {
++	outcome := "success"
++	if err != nil {
++		outcome = "failure"
++	}
++
++	fields := []zap.Field{
++		zap.String("audit", "kv"),
++		zap.String("caller", auditCallerIdentity(ctx, ap)),
++		zap.String("operation", auditOperationKind(fullMethod)),
++		zap.Duration("duration", time.Since(startTime)),
++		zap.String("outcome", outcome),
++	}
++	fields = append(fields, auditKeyFields(req)...)
++
++	lg.Info("kv audit", fields...)
++}
++
++// auditCallerIdentity returns the authenticated username for the request,
++// or "unauthenticated" if authentication is disabled or no identity could
++// be resolved for the request.
++func auditCallerIdentity(ctx context.Context, ap authInfoProvider) string {
++	authInfo, err := ap.AuthInfoFromCtx(ctx)
++	if err != nil || authInfo == nil || authInfo.Username == "" {
++		return "unauthenticated"
++	}
++	return authInfo.Username
++}
++
++func auditOperationKind(fullMethod string) string {
++	method := strings.TrimPrefix(fullMethod, kvServiceMethodPrefix)
++	if kind, ok := auditOperationKinds[method]; ok {
++		return kind
++	}
++	return "unknown"
++}
++
++// singleKeyRequest is implemented by KV requests that act on one key.
++type singleKeyRequest interface {
++	GetKey() []byte
++}
++
++// keyRangeRequest is implemented by KV requests that can additionally span
++// a key range.
++type keyRangeRequest interface {
++	singleKeyRequest
++	GetRangeEnd() []byte
++}
++
++// auditKeyFields derives the key/key-range audit fields for a KV request.
++// Txn requests touch multiple keys across their compare/success/failure
++// operations and are summarized as a list; any other request exposing
++// GetKey/GetRangeEnd (Range, Put, DeleteRange, and any future single-key
++// or range RPC) is picked up automatically via the interfaces above, with
++// no switch-case update required when such a type is added.
++func auditKeyFields(req any) []zap.Field {
++	if txn, ok := req.(*pb.TxnRequest); ok {
++		return []zap.Field{zap.Strings("keys", auditTxnKeys(txn))}
++	}
++	if kr, ok := req.(keyRangeRequest); ok {
++		fields := []zap.Field{zap.ByteString("key", kr.GetKey())}
++		if rangeEnd := kr.GetRangeEnd(); len(rangeEnd) > 0 {
++			fields = append(fields, zap.ByteString("range_end", rangeEnd))
++		}
++		return fields
++	}
++	if kr, ok := req.(singleKeyRequest); ok {
++		return []zap.Field{zap.ByteString("key", kr.GetKey())}
++	}
++	return nil
++}
++
++// auditTxnKeys collects a deduplicated, human-readable summary of every key
++// or key range referenced by a (possibly nested) Txn request.
++func auditTxnKeys(t *pb.TxnRequest) []string {
++	seen := make(map[string]struct{})
++	var keys []string
++	add := func(key, rangeEnd []byte) {
++		desc := describeAuditKey(key, rangeEnd)
++		if _, ok := seen[desc]; ok {
++			return
++		}
++		seen[desc] = struct{}{}
++		keys = append(keys, desc)
++	}
++
++	var walk func(t *pb.TxnRequest)
++	walk = func(t *pb.TxnRequest) {
++		for _, c := range t.GetCompare() {
++			add(c.GetKey(), c.GetRangeEnd())
++		}
++		for _, op := range append(append([]*pb.RequestOp{}, t.GetSuccess()...), t.GetFailure()...) {
++			switch r := op.GetRequest().(type) {
++			case *pb.RequestOp_RequestRange:
++				add(r.RequestRange.GetKey(), r.RequestRange.GetRangeEnd())
++			case *pb.RequestOp_RequestPut:
++				add(r.RequestPut.GetKey(), nil)
++			case *pb.RequestOp_RequestDeleteRange:
++				add(r.RequestDeleteRange.GetKey(), r.RequestDeleteRange.GetRangeEnd())
++			case *pb.RequestOp_RequestTxn:
++				walk(r.RequestTxn)
++			}
++		}
++	}
++	walk(t)
++
++	return keys
++}
++
++func describeAuditKey(key, rangeEnd []byte) string {
++	if len(rangeEnd) == 0 {
++		return string(key)
++	}
++	return string(key) + ".." + string(rangeEnd)
++}
+diff --git a/server/etcdserver/api/v3rpc/audit_test.go b/server/etcdserver/api/v3rpc/audit_test.go
+new file mode 100644
+index 000000000..7883c1d89
+--- /dev/null
++++ b/server/etcdserver/api/v3rpc/audit_test.go
+@@ -0,0 +1,112 @@
++// Copyright 2016 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package v3rpc
++
++import (
++	"context"
++	"errors"
++	"sort"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/server/v3/auth"
++)
++
++type fakeAuthInfoProvider struct {
++	info *auth.AuthInfo
++	err  error
++}
++
++func (f fakeAuthInfoProvider) AuthInfoFromCtx(context.Context) (*auth.AuthInfo, error) {
++	return f.info, f.err
++}
++
++func TestAuditCallerIdentity(t *testing.T) {
++	tests := []struct {
++		name     string
++		provider fakeAuthInfoProvider
++		want     string
++	}{
++		{"auth disabled", fakeAuthInfoProvider{nil, nil}, "unauthenticated"},
++		{"lookup error", fakeAuthInfoProvider{nil, errors.New("boom")}, "unauthenticated"},
++		{"empty username", fakeAuthInfoProvider{&auth.AuthInfo{Username: ""}, nil}, "unauthenticated"},
++		{"authenticated", fakeAuthInfoProvider{&auth.AuthInfo{Username: "alice"}, nil}, "alice"},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			assert.Equal(t, tt.want, auditCallerIdentity(context.Background(), tt.provider))
++		})
++	}
++}
++
++func TestAuditOperationKind(t *testing.T) {
++	tests := []struct {
++		method string
++		want   string
++	}{
++		{"/etcdserverpb.KV/Range", "read"},
++		{"/etcdserverpb.KV/Put", "write"},
++		{"/etcdserverpb.KV/DeleteRange", "delete"},
++		{"/etcdserverpb.KV/Txn", "transaction"},
++		{"/etcdserverpb.KV/SomeFutureRPC", "unknown"},
++	}
++	for _, tt := range tests {
++		t.Run(tt.method, func(t *testing.T) {
++			assert.Equal(t, tt.want, auditOperationKind(tt.method))
++		})
++	}
++}
++
++func TestAuditKeyFields(t *testing.T) {
++	t.Run("range", func(t *testing.T) {
++		fields := auditKeyFields(&pb.RangeRequest{Key: []byte("a"), RangeEnd: []byte("z")})
++		assert.Len(t, fields, 2)
++	})
++	t.Run("put has no range end", func(t *testing.T) {
++		fields := auditKeyFields(&pb.PutRequest{Key: []byte("a")})
++		assert.Len(t, fields, 1)
++	})
++	t.Run("delete range without range end", func(t *testing.T) {
++		fields := auditKeyFields(&pb.DeleteRangeRequest{Key: []byte("a")})
++		assert.Len(t, fields, 1)
++	})
++	t.Run("unrecognized request has no key fields", func(t *testing.T) {
++		fields := auditKeyFields(&pb.CompactionRequest{})
++		assert.Nil(t, fields)
++	})
++}
++
++func TestAuditTxnKeys(t *testing.T) {
++	txn := &pb.TxnRequest{
++		Compare: []*pb.Compare{{Key: []byte("cmp")}},
++		Success: []*pb.RequestOp{
++			{Request: &pb.RequestOp_RequestPut{RequestPut: &pb.PutRequest{Key: []byte("put")}}},
++			{Request: &pb.RequestOp_RequestTxn{RequestTxn: &pb.TxnRequest{
++				Success: []*pb.RequestOp{
++					{Request: &pb.RequestOp_RequestDeleteRange{RequestDeleteRange: &pb.DeleteRangeRequest{Key: []byte("a"), RangeEnd: []byte("z")}}},
++				},
++			}}},
++		},
++		Failure: []*pb.RequestOp{
++			{Request: &pb.RequestOp_RequestRange{RequestRange: &pb.RangeRequest{Key: []byte("cmp")}}},
++		},
++	}
++
++	keys := auditTxnKeys(txn)
++	sort.Strings(keys)
++	assert.Equal(t, []string{"a..z", "cmp", "put"}, keys)
++}
+diff --git a/server/etcdserver/api/v3rpc/grpc.go b/server/etcdserver/api/v3rpc/grpc.go
+index 91863e294..a462896c5 100644
+--- a/server/etcdserver/api/v3rpc/grpc.go
++++ b/server/etcdserver/api/v3rpc/grpc.go
+@@ -52,6 +52,7 @@ func Server(s *etcdserver.EtcdServer, tls *tls.Config, interceptor grpc.UnarySer
+ 
+ 	chainUnaryInterceptors := []grpc.UnaryServerInterceptor{
+ 		newLogUnaryInterceptor(s),
++		newAuditUnaryInterceptor(s),
+ 		serverMetrics.UnaryServerInterceptor(),
+ 		newUnaryInterceptor(s),
+ 	}

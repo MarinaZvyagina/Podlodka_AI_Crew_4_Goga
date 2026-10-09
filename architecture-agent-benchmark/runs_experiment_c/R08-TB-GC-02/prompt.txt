@@ -1,0 +1,24 @@
+## Ticket: Let people send one photo at full quality in a mixed batch
+
+**Reported by:** Product
+**Component:** Media send / attachment review flow
+
+### Description
+
+When someone selects several photos or videos to send at once, the whole batch gets compressed the same way for faster sending. We're hearing from users (photographers, people sharing screenshots of documents, etc.) that they sometimes want one specific item in the batch — say, a screenshot with small text, or a photo they care about — to go out at full/original quality, while the rest of the batch still gets compressed normally so the overall send stays fast.
+
+### Request
+
+On the review screen where people see the batch of photos/videos before sending, add a way to mark an individual item as "send in full quality," overriding the batch default just for that one item. Everything else in the batch should behave exactly as it does today.
+
+### Important behavior to get right
+
+- The upload for items in a batch can start in the background before the user finishes reviewing everything (this already happens today for speed). Marking an item as full quality needs to actually take effect even if that item started uploading already.
+- If the app gets closed (or killed by the OS) while the send is still in progress and the user reopens it, the full-quality choice for that item must not be lost or silently reverted to the compressed default.
+- This is a per-item choice within one batch, not a global setting — other items sent in the same batch keep getting compressed as usual.
+
+### Acceptance criteria
+
+- User can mark one attachment out of a multi-item batch as full quality before sending.
+- That attachment is delivered without the normal compression pass being applied to it; the rest of the batch is compressed as usual.
+- The choice survives the app being killed and relaunched mid-send.

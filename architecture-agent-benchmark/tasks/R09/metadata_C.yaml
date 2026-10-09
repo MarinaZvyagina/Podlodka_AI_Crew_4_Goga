@@ -1,0 +1,83 @@
+task_id: R09-TC
+repository: mozilla-mobile/firefox-ios
+commit: de940072da700c2af7d74348b5775674d106d503
+category: existing_extension_point
+
+functional_requirements:
+  - "A second, alternative speech transcription implementation is added alongside the two that already exist (SFSpeechRecognizerEngine and, for iOS 26+, SpeechAnalyzerEngine, both in BrowserKit/Sources/QuickAnswersKit/Backend/SpeechService/)."
+  - "Which implementation is used is selectable via a flag/toggle (a simple boolean or enum-backed switch is sufficient — no real Nimbus/experiment wiring is required for this ticket), independent of OS version."
+  - "QuickAnswersService's public surface (record(), stopRecording(), search(text:)) is unchanged; DefaultQuickAnswersService's callers (QuickAnswersViewModel/ViewController) require no modification."
+  - "Existing behaviour for permission handling, streaming partial results, error propagation (SpeechError cases), and stop/cancel semantics is preserved for both pipelines."
+  - "New unit tests cover: (a) selecting each pipeline yields the expected concrete engine, (b) record()/stopRecording() behave identically (same call sequence into whichever engine is active) regardless of which pipeline is selected."
+
+architectural_constraints:
+  - "The alternative pipeline must be introduced as a new type conforming to the existing TranscriptionEngine protocol (BrowserKit/Sources/QuickAnswersKit/Backend/SpeechService/TranscriptionEngine.swift: prepare() async throws, start(continuation:) async throws, stop() async throws) — not as a parallel recording/transcription pathway with its own method names bolted onto DefaultQuickAnswersService or the ViewModel."
+  - "Engine selection must be centralized in one place (the existing DefaultQuickAnswersService.makeDefaultEngine()-style selection point, or an equivalent single factory/init-time decision), not scattered as if/else branches across the ViewModel, ViewController, or call sites of record()/search()."
+  - "The new engine must reuse the existing AudioManagerProtocol / AudioEngineProvider / AudioSessionProvider / AuthorizeProvider abstractions (BrowserKit/Sources/QuickAnswersKit/Backend/SpeechService/Abstractions.swift, AudioManager.swift, AuthorizationHandler.swift) for microphone/audio-session/permission handling rather than talking to AVAudioSession/AVAudioEngine/SFSpeechRecognizer or requesting permissions directly — duplicating that plumbing is exactly the kind of parallel mechanism this check is designed to catch."
+  - "No new dependency from QuickAnswersKit to the Client app, or to any BrowserKit target that doesn't already appear in QuickAnswersKit's dependency list in BrowserKit/Package.swift, should be introduced solely to support engine selection."
+
+required_existing_abstractions:
+  - "TranscriptionEngine protocol, BrowserKit/Sources/QuickAnswersKit/Backend/SpeechService/TranscriptionEngine.swift"
+  - "AudioManagerProtocol / AudioManager, BrowserKit/Sources/QuickAnswersKit/Backend/SpeechService/AudioManager.swift"
+  - "AuthorizeProvider / AuthorizationHandler, BrowserKit/Sources/QuickAnswersKit/Backend/SpeechService/AuthorizationHandler.swift"
+  - "DefaultQuickAnswersService.makeDefaultEngine() selection point, BrowserKit/Sources/QuickAnswersKit/Backend/DefaultQuickAnswersService.swift"
+  - "MockTranscriptionEngine test double, BrowserKit/Tests/QuickAnswersKitTests/Mocks/MockTranscriptionEngine.swift (pattern to follow for testing the new engine and the selection logic)"
+
+allowed_dependencies:
+  - "QuickAnswersKit -> its existing BrowserKit/Package.swift dependencies (LLMKit, Shared, Common, etc. — unchanged)"
+
+forbidden_dependencies:
+  - "QuickAnswersKit -> Client app (firefox-ios/Client) — BrowserKit targets must not depend on the main app."
+  - "New engine type -> AVAudioSession/AVAudioEngine/SFSpeechRecognizer directly (bypassing AudioManagerProtocol/AudioEngineProvider/AudioSessionProvider/SpeechRecognizerProvider/AuthorizeProvider) — this is the specific 'reinvent a parallel plumbing path' trap this task is designed to detect."
+
+expected_extension_points:
+  - "TranscriptionEngine protocol (Strategy-style extension point), BrowserKit/Sources/QuickAnswersKit/Backend/SpeechService/TranscriptionEngine.swift — verified via actual code reading: two real conformers already exist (SFSpeechRecognizerEngine.swift, SpeechAnalyzerEngine.swift), selected in DefaultQuickAnswersService.makeDefaultEngine() by OS-version today; a MockTranscriptionEngine test double already exists in BrowserKit/Tests/QuickAnswersKitTests/Mocks/, confirming the protocol is the intended seam for swapping implementations."
+
+public_api_constraints:
+  - "QuickAnswersService protocol (record/stopRecording/search) must not change shape."
+  - "DefaultQuickAnswersService's public initializer may grow an optional parameter (e.g. an experiment flag or an injected engine), but must keep working with existing call sites' default arguments."
+
+functional_check_command: "cd BrowserKit && swift test --filter QuickAnswersKitTests (BrowserKit is independently buildable/testable via plain `swift test`; does not require the private Bitrise CI used for the full Client app)."
+architecture_check_command: "Manual code review plus grep: (1) `grep -rn 'TranscriptionEngine' BrowserKit/Sources/QuickAnswersKit/` to confirm the new type conforms to the protocol; (2) `grep -rn 'AVAudioSession\\|AVAudioEngine\\|SFSpeechRecognizer(' BrowserKit/Sources/QuickAnswersKit/Backend/SpeechService/` to confirm no new direct OS-API usage outside the existing Abstractions.swift/AudioManager.swift/AuthorizationHandler.swift/SFSpeechRecognizerEngine.swift/SpeechAnalyzerEngine.swift files; (3) confirm DefaultQuickAnswersService.swift's public method signatures are byte-identical to the pre-change version."
+
+architecture_checks:
+  - id: AC1
+    description: "New pipeline is implemented as a TranscriptionEngine conformer, not a parallel bespoke class."
+    method: "grep -n ': TranscriptionEngine' BrowserKit/Sources/QuickAnswersKit/Backend/SpeechService/*.swift"
+    expected_result_if_correct: "A new file/type declares `final class <Name>: TranscriptionEngine` implementing prepare()/start(continuation:)/stop()."
+    expected_result_if_trap: "A new class or set of free functions with different method names (e.g. beginAlternateRecording(), fetchAlternateTranscript()) is added and wired directly into DefaultQuickAnswersService or the ViewModel via new bespoke methods, without conforming to TranscriptionEngine."
+  - id: AC2
+    description: "Engine selection is centralized, not scattered as branching logic at call sites."
+    method: "grep -n 'if #available\\|engine ==\\|selectedEngine\\|experimentFlag' BrowserKit/Sources/QuickAnswersKit/UI/*.swift BrowserKit/Sources/QuickAnswersKit/Backend/QuickAnswersService.swift"
+    expected_result_if_correct: "No branching on which pipeline to use appears in the ViewModel/ViewController layer; selection happens once, at construction time, in DefaultQuickAnswersService (or an equivalent single factory)."
+    expected_result_if_trap: "QuickAnswersViewModel or QuickAnswersViewController contains an if/else or feature-flag check that calls different methods depending on which pipeline is active."
+  - id: AC3
+    description: "New engine reuses AudioManagerProtocol/AuthorizeProvider rather than talking to AVFoundation/Speech APIs directly."
+    method: "Read the new engine's initializer and prepare()/start()/stop() implementations; grep for `AVAudio` / `SFSpeechRecognizer(` / `SFSpeechAudioBufferRecognitionRequest` inside the new file."
+    expected_result_if_correct: "The new engine takes an AudioManagerProtocol and an AuthorizeProvider (or reuses AudioManager/AuthorizationHandler) via its initializer, exactly like SFSpeechRecognizerEngine and SpeechAnalyzerEngine already do."
+    expected_result_if_trap: "The new engine directly instantiates AVAudioEngine/AVAudioSession/SFSpeechRecognizer or calls AVAudioSession.sharedInstance().requestRecordPermission itself, duplicating logic already centralized in AudioManager/AuthorizationHandler."
+  - id: AC4
+    description: "QuickAnswersService public surface and existing call sites are unmodified."
+    method: "diff BrowserKit/Sources/QuickAnswersKit/Backend/QuickAnswersService.swift against the pinned-commit version; diff the call sites in QuickAnswersViewModel.swift."
+    expected_result_if_correct: "No changes to QuickAnswersService.swift; QuickAnswersViewModel's use of service.record()/stopRecording()/search(text:) is unchanged."
+    expected_result_if_trap: "New public methods are added to QuickAnswersService (e.g. recordWithAlternateEngine()) forcing call-site changes."
+  - id: AC5
+    description: "Tests exist exercising both pipelines through the same public entry points."
+    method: "grep -n 'func test' BrowserKit/Tests/QuickAnswersKitTests/DefaultQuickAnswersServiceTests.swift and any new test file; confirm both engines are exercised via record()/stopRecording(), not via new bespoke test-only entry points."
+    expected_result_if_correct: "Tests construct DefaultQuickAnswersService with each engine (or each flag value) and assert identical behavior through record()/stopRecording()."
+    expected_result_if_trap: "Tests only exist for the new engine class in isolation, with no coverage proving DefaultQuickAnswersService actually routes to it correctly under the flag."
+
+notes_for_positive_negative_control: >
+  Positive control: add e.g. `final class AlternateTranscriptionEngine: TranscriptionEngine` in
+  BrowserKit/Sources/QuickAnswersKit/Backend/SpeechService/, constructed with an injected
+  AudioManagerProtocol/AuthorizeProvider like the two existing engines, and extend
+  DefaultQuickAnswersService.makeDefaultEngine() (or its init) with a single flag check that picks between
+  the default engine-selection logic and the new engine — everything else (record/stopRecording/search,
+  ViewModel, ViewController) untouched. Negative control (functionally indistinguishable to a manual
+  tester, architecturally wrong): implement the "alternative pipeline" as a second, mostly-duplicated
+  recording path directly inside DefaultQuickAnswersService (or worse, inside QuickAnswersViewModel) with
+  its own AVAudioEngine/AVAudioSession/SFSpeechRecognizer setup and its own permission-request calls,
+  switched on with an if-flag inside record() — this passes a shallow manual smoke test (voice search still
+  works either way) while duplicating audio/permission plumbing and never touching the TranscriptionEngine
+  protocol at all, i.e. it builds a parallel mechanism instead of using the extension point that was
+  already there for exactly this purpose.

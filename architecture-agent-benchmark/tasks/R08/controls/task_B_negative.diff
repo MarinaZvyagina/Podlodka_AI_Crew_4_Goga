@@ -1,0 +1,191 @@
+diff --git a/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowState.kt b/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowState.kt
+index 3f0b2a4..09be098 100644
+--- a/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowState.kt
++++ b/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowState.kt
+@@ -137,7 +137,12 @@ data class MediaSendFlowState(
+   /**
+    * Whether the control for stripping a video's audio track is available.
+    */
+-  val isMuteVideoAudioEnabled: Boolean = MediaConstraints.isMuteVideoAudioAvailable()
++  val isMuteVideoAudioEnabled: Boolean = MediaConstraints.isMuteVideoAudioAvailable(),
++
++  /**
++   * URIs of media items the user has marked to be sent at full/original quality. Tracked only as transient UI state.
++   */
++  val fullQualityUris: Set<Uri> = emptySet()
+ ) : Parcelable {
+ 
+   /**
+diff --git a/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowViewModel.kt b/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowViewModel.kt
+index b0f4a18..861bbc2 100644
+--- a/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowViewModel.kt
++++ b/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowViewModel.kt
+@@ -49,6 +49,7 @@ import org.signal.imageeditor.core.Renderer
+ import org.signal.imageeditor.core.model.EditorElement
+ import org.signal.imageeditor.core.model.EditorModel
+ import org.signal.imageeditor.core.renderers.UriGlideRenderer
++import org.signal.mediasend.preupload.FullQualityCompressionOverride
+ import org.signal.mediasend.preupload.PreUploadController
+ import org.signal.mediasend.preupload.PreUploadResult
+ import org.signal.mediasend.screens.edit.ImageController
+@@ -737,6 +738,23 @@ class MediaSendFlowViewModel(
+     }
+   }
+ 
++  /**
++   * Marks (or unmarks) a single item in the batch to be sent at full/original quality.
++   *
++   * The choice is tracked as transient in-memory UI state and applied by the feature-module-local
++   * [org.signal.mediasend.preupload.FullQualityCompressionOverride].
++   *
++   * @param uri The media item to toggle.
++   * @param fullQuality `true` to send at full quality, `false` to compress as usual.
++   */
++  fun setFullQuality(uri: Uri, fullQuality: Boolean) {
++    updateState {
++      copy(fullQualityUris = if (fullQuality) fullQualityUris + uri else fullQualityUris - uri)
++    }
++
++    FullQualityCompressionOverride.setFullQuality(uri, fullQuality)
++  }
++
+   /**
+    * Copy confirming a move to [quality], which names the media itself when there is only one item and counts them
+    * otherwise. Null for a lone attachment that is neither a video nor an image, which there is nothing to say about.
+diff --git a/feature/media-send/src/main/java/org/signal/mediasend/preupload/FullQualityCompressionOverride.kt b/feature/media-send/src/main/java/org/signal/mediasend/preupload/FullQualityCompressionOverride.kt
+new file mode 100644
+index 0000000..ba9e0c4
+--- /dev/null
++++ b/feature/media-send/src/main/java/org/signal/mediasend/preupload/FullQualityCompressionOverride.kt
+@@ -0,0 +1,59 @@
++/*
++ * Copyright 2026 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.signal.mediasend.preupload
++
++import android.net.Uri
++import java.io.File
++import java.io.FileInputStream
++import java.io.FileOutputStream
++
++/**
++ * Feature-module-local mechanism for the per-item "send at full quality" override.
++ *
++ * Tracks which items the user marked as full quality purely in memory, and re-implements the
++ * "skip compression" behavior directly inside the feature module by copying the original file bytes
++ * over the compressed output instead of routing the choice through the app's attachment/pre-upload
++ * layer.
++ */
++object FullQualityCompressionOverride {
++
++  private val fullQualityUris: MutableSet<Uri> = mutableSetOf()
++
++  fun setFullQuality(uri: Uri, fullQuality: Boolean) {
++    if (fullQuality) {
++      fullQualityUris.add(uri)
++    } else {
++      fullQualityUris.remove(uri)
++    }
++  }
++
++  fun isFullQuality(uri: Uri): Boolean {
++    return uri in fullQualityUris
++  }
++
++  /**
++   * Local re-implementation of the compression decision for this item.
++   */
++  fun shouldCompress(uri: Uri): Boolean {
++    return uri !in fullQualityUris
++  }
++
++  /**
++   * If the item was marked full quality, overwrite the compressed output with the original file bytes so the
++   * uncompressed version is what gets sent.
++   */
++  fun applyFullQuality(uri: Uri, originalFile: File, compressedOutput: File) {
++    if (shouldCompress(uri)) {
++      return
++    }
++
++    FileInputStream(originalFile).use { input ->
++      FileOutputStream(compressedOutput).use { output ->
++        input.copyTo(output)
++      }
++    }
++  }
++}
+diff --git a/feature/media-send/src/test/java/org/signal/mediasend/preupload/FullQualityCompressionOverrideTest.kt b/feature/media-send/src/test/java/org/signal/mediasend/preupload/FullQualityCompressionOverrideTest.kt
+new file mode 100644
+index 0000000..afe7480
+--- /dev/null
++++ b/feature/media-send/src/test/java/org/signal/mediasend/preupload/FullQualityCompressionOverrideTest.kt
+@@ -0,0 +1,66 @@
++/*
++ * Copyright 2026 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.signal.mediasend.preupload
++
++import android.net.Uri
++import assertk.assertThat
++import assertk.assertions.isFalse
++import assertk.assertions.isTrue
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++
++/**
++ * Negative-control demonstration.
++ *
++ * Shows that the feature-module-local override lets a user mark one item full quality "right now" (in-memory
++ * mechanism works), but the choice lives only in transient in-memory state and therefore does NOT survive process
++ * death — it never reaches the persisted per-attachment data layer. This is the intended architectural defect of
++ * the negative control.
++ */
++@RunWith(RobolectricTestRunner::class)
++class FullQualityCompressionOverrideTest {
++
++  @Test
++  fun givenItemMarkedFullQuality_whenCheckedInSameProcess_thenCompressionIsSkipped() {
++    val uri = Uri.parse("content://media/marked")
++    val sibling = Uri.parse("content://media/sibling")
++
++    FullQualityCompressionOverride.setFullQuality(uri, true)
++
++    // The in-memory mechanism works within the same process: the marked item skips compression, the sibling does not.
++    assertThat(FullQualityCompressionOverride.shouldCompress(uri)).isFalse()
++    assertThat(FullQualityCompressionOverride.shouldCompress(sibling)).isTrue()
++
++    // cleanup
++    FullQualityCompressionOverride.setFullQuality(uri, false)
++  }
++
++  @Test
++  fun givenItemMarkedFullQuality_whenProcessRecreated_thenChoiceIsLost() {
++    val uri = Uri.parse("content://media/marked")
++
++    FullQualityCompressionOverride.setFullQuality(uri, true)
++    assertThat(FullQualityCompressionOverride.isFullQuality(uri)).isTrue()
++
++    // Simulate process death: the choice lives only in transient in-memory state, so a fresh process starts with
++    // an empty set and the full-quality choice is silently reverted to the compressed default.
++    simulateProcessDeath()
++
++    assertThat(FullQualityCompressionOverride.isFullQuality(uri)).isFalse()
++    assertThat(FullQualityCompressionOverride.shouldCompress(uri)).isTrue()
++  }
++
++  /**
++   * Resets the singleton's in-memory state to model what a real relaunch would produce: nothing persisted.
++   */
++  private fun simulateProcessDeath() {
++    listOf(
++      Uri.parse("content://media/marked"),
++      Uri.parse("content://media/sibling")
++    ).forEach { FullQualityCompressionOverride.setFullQuality(it, false) }
++  }
++}

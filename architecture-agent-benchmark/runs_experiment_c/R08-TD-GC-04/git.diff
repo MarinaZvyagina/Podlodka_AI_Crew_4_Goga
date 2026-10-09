@@ -1,0 +1,169 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+index f47eddb..ae207fd 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+@@ -13,6 +13,7 @@ import androidx.annotation.VisibleForTesting;
+ import androidx.annotation.WorkerThread;
+ 
+ import org.signal.core.util.CursorUtil;
++import org.signal.core.util.LRUCache;
+ import org.signal.core.util.concurrent.SignalExecutors;
+ import org.signal.core.util.logging.Log;
+ import org.thoughtcrime.securesms.conversation.MessageStyler;
+@@ -50,6 +51,7 @@ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Set;
+ import java.util.concurrent.Executor;
++import java.util.concurrent.atomic.AtomicLong;
+ 
+ import static org.thoughtcrime.securesms.database.SearchTable.SNIPPET_WRAP;
+ 
+@@ -62,6 +64,35 @@ public class SearchRepository {
+ 
+   private static final int MAX_SNIPPET_SIZE = 100;
+ 
++  /**
++   * Chat-list search results for {@link #queryThreadsSync} and {@link #queryMessagesSync}, keyed by
++   * query text (and filter). Shared across all {@link SearchRepository} instances -- callers construct
++   * a new instance per screen, so an instance-level cache would be dropped every time the user leaves
++   * and returns to search, which is exactly the repeat-search case this cache exists to speed up.
++   * <p>
++   * Invalidated wholesale on {@link #cacheGeneration} bump (see below) rather than per search term,
++   * since a single message/thread write can affect results for many different queries at once.
++   */
++  private static final int RESULT_CACHE_SIZE = 32;
++
++  private static final Map<ThreadQueryKey, ThreadSearchResult>   threadResultCache  = Collections.synchronizedMap(new LRUCache<>(RESULT_CACHE_SIZE));
++  private static final Map<MessageQueryKey, MessageSearchResult> messageResultCache = Collections.synchronizedMap(new LRUCache<>(RESULT_CACHE_SIZE));
++
++  /**
++   * Bumped every time a message or conversation write could invalidate cached search results. A query
++   * result is only cached if this hasn't changed since the query started, so a write that lands while a
++   * query is in flight can't have its cache entry re-populated with data computed before the write.
++   */
++  private static final AtomicLong cacheGeneration = new AtomicLong(0);
++
++  static {
++    AppDependencies.getDatabaseObserver().registerConversationListObserver(() -> {
++      cacheGeneration.incrementAndGet();
++      threadResultCache.clear();
++      messageResultCache.clear();
++    });
++  }
++
+   private final Context           context;
+   private final String            noteToSelfTitle;
+   private final SearchTable       searchDatabase;
+@@ -85,14 +116,27 @@ public class SearchRepository {
+ 
+   @WorkerThread
+   public @NonNull ThreadSearchResult queryThreadsSync(@NonNull String query, boolean unreadOnly) {
++    ThreadQueryKey    key    = new ThreadQueryKey(query, unreadOnly);
++    ThreadSearchResult cached = threadResultCache.get(key);
++    if (cached != null) {
++      return cached;
++    }
++
+     SignalTrace.beginSection("ConversationListSearch-Threads");
+     try {
++      long generationAtStart = cacheGeneration.get();
+       long                      start  = System.currentTimeMillis();
+       List<ThreadWithRecipient> result = queryConversations(query, unreadOnly);
+ 
+       Log.d(TAG, "[threads] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new ThreadSearchResult(result, query);
++      ThreadSearchResult searchResult = new ThreadSearchResult(result, query);
++
++      if (cacheGeneration.get() == generationAtStart) {
++        threadResultCache.put(key, searchResult);
++      }
++
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -100,8 +144,15 @@ public class SearchRepository {
+ 
+   @WorkerThread
+   public @NonNull MessageSearchResult queryMessagesSync(@NonNull String query, @NonNull SearchFilter filter) {
++    MessageQueryKey     key    = new MessageQueryKey(query, filter);
++    MessageSearchResult cached = messageResultCache.get(key);
++    if (cached != null) {
++      return cached;
++    }
++
+     SignalTrace.beginSection("ConversationListSearch-Messages");
+     try {
++      long generationAtStart = cacheGeneration.get();
+       long start = System.currentTimeMillis();
+ 
+       List<MessageResult> messages         = queryMessages(query, filter);
+@@ -111,7 +162,13 @@ public class SearchRepository {
+ 
+       Log.d(TAG, "[messages] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new MessageSearchResult(combined, query);
++      MessageSearchResult searchResult = new MessageSearchResult(combined, query);
++
++      if (cacheGeneration.get() == generationAtStart) {
++        messageResultCache.put(key, searchResult);
++      }
++
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -478,6 +535,52 @@ public class SearchRepository {
+     }
+   }
+ 
++  private static final class ThreadQueryKey {
++    private final String  query;
++    private final boolean unreadOnly;
++
++    ThreadQueryKey(@NonNull String query, boolean unreadOnly) {
++      this.query      = query;
++      this.unreadOnly = unreadOnly;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++      if (this == o) return true;
++      if (!(o instanceof ThreadQueryKey)) return false;
++      ThreadQueryKey that = (ThreadQueryKey) o;
++      return unreadOnly == that.unreadOnly && query.equals(that.query);
++    }
++
++    @Override
++    public int hashCode() {
++      return Objects.hash(query, unreadOnly);
++    }
++  }
++
++  private static final class MessageQueryKey {
++    private final String       query;
++    private final SearchFilter filter;
++
++    MessageQueryKey(@NonNull String query, @NonNull SearchFilter filter) {
++      this.query  = query;
++      this.filter = filter;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++      if (this == o) return true;
++      if (!(o instanceof MessageQueryKey)) return false;
++      MessageQueryKey that = (MessageQueryKey) o;
++      return query.equals(that.query) && filter.equals(that.filter);
++    }
++
++    @Override
++    public int hashCode() {
++      return Objects.hash(query, filter);
++    }
++  }
++
+   public interface Callback<E> {
+     void onResult(@NonNull E result);
+   }

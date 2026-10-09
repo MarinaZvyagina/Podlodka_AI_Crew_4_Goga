@@ -1,0 +1,502 @@
+diff --git a/integration/maintenance-mode/e2e/maintenance-mode.spec.ts b/integration/maintenance-mode/e2e/maintenance-mode.spec.ts
+new file mode 100644
+index 0000000..7a08e8f
+--- /dev/null
++++ b/integration/maintenance-mode/e2e/maintenance-mode.spec.ts
+@@ -0,0 +1,50 @@
++import type { INestApplication } from '@nestjs/common';
++import { Test } from '@nestjs/testing';
++import request from 'supertest';
++import { AppModule } from '../src/app.module.js';
++import { MaintenanceModeService } from '../src/maintenance-mode.service.js';
++
++describe('Maintenance mode (e2e)', () => {
++  let app: INestApplication;
++  let maintenanceModeService: MaintenanceModeService;
++
++  beforeEach(async () => {
++    const moduleRef = await Test.createTestingModule({
++      imports: [AppModule],
++    }).compile();
++
++    app = moduleRef.createNestApplication();
++    maintenanceModeService = moduleRef.get(MaintenanceModeService);
++    await app.init();
++  });
++
++  afterEach(async () => {
++    await app.close();
++  });
++
++  it('serves both marked and unmarked routes normally while maintenance mode is off', async () => {
++    await request(app.getHttpServer()).get('/reports').expect(200);
++    await request(app.getHttpServer()).get('/health').expect(200);
++    await request(app.getHttpServer()).get('/migration/status').expect(200);
++  });
++
++  it('rejects a method-marked route and a class-marked controller once maintenance mode is on, while leaving unmarked routes untouched', async () => {
++    maintenanceModeService.enable();
++
++    await request(app.getHttpServer()).get('/reports').expect(503);
++    await request(app.getHttpServer()).get('/migration/status').expect(503);
++    await request(app.getHttpServer()).get('/health').expect(200);
++  });
++
++  it('can be toggled at runtime through the admin endpoint, without restarting the app', async () => {
++    await request(app.getHttpServer())
++      .post('/admin/maintenance-mode/enable')
++      .expect(201);
++    await request(app.getHttpServer()).get('/reports').expect(503);
++
++    await request(app.getHttpServer())
++      .post('/admin/maintenance-mode/disable')
++      .expect(201);
++    await request(app.getHttpServer()).get('/reports').expect(200);
++  });
++});
+diff --git a/integration/maintenance-mode/src/app.controller.ts b/integration/maintenance-mode/src/app.controller.ts
+new file mode 100644
+index 0000000..fce2549
+--- /dev/null
++++ b/integration/maintenance-mode/src/app.controller.ts
+@@ -0,0 +1,19 @@
++import { Controller, Get } from '@nestjs/common';
++import { MaintenanceMode } from './maintenance-mode.decorator.js';
++
++@Controller()
++export class AppController {
++  // Depends on data touched by the migration, so it must stop serving
++  // requests while maintenance mode is on.
++  @Get('reports')
++  @MaintenanceMode()
++  getReports() {
++    return { data: 'reports' };
++  }
++
++  // Unaffected by the migration; keeps working during maintenance.
++  @Get('health')
++  getHealth() {
++    return { status: 'ok' };
++  }
++}
+diff --git a/integration/maintenance-mode/src/app.module.ts b/integration/maintenance-mode/src/app.module.ts
+new file mode 100644
+index 0000000..c14447f
+--- /dev/null
++++ b/integration/maintenance-mode/src/app.module.ts
+@@ -0,0 +1,17 @@
++import { Module } from '@nestjs/common';
++import { AppController } from './app.controller.js';
++import { EventsGateway } from './events.gateway.js';
++import { MaintenanceModeAdminController } from './maintenance-mode-admin.controller.js';
++import { MaintenanceModeModule } from './maintenance-mode.module.js';
++import { MigrationController } from './migration.controller.js';
++
++@Module({
++  imports: [MaintenanceModeModule],
++  controllers: [
++    AppController,
++    MigrationController,
++    MaintenanceModeAdminController,
++  ],
++  providers: [EventsGateway],
++})
++export class AppModule {}
+diff --git a/integration/maintenance-mode/src/events.gateway.ts b/integration/maintenance-mode/src/events.gateway.ts
+new file mode 100644
+index 0000000..ce050d8
+--- /dev/null
++++ b/integration/maintenance-mode/src/events.gateway.ts
+@@ -0,0 +1,22 @@
++import {
++  MessageBody,
++  SubscribeMessage,
++  WebSocketGateway,
++} from '@nestjs/websockets';
++import { MaintenanceMode } from './maintenance-mode.decorator.js';
++
++@WebSocketGateway()
++export class EventsGateway {
++  // Reads from the same store the migration is rewriting; blocked during
++  // maintenance using the exact same decorator as the HTTP routes above.
++  @MaintenanceMode()
++  @SubscribeMessage('getReport')
++  getReport(@MessageBody() data: unknown) {
++    return { event: 'report', data };
++  }
++
++  @SubscribeMessage('ping')
++  ping() {
++    return { event: 'pong', data: {} };
++  }
++}
+diff --git a/integration/maintenance-mode/src/maintenance-mode-admin.controller.ts b/integration/maintenance-mode/src/maintenance-mode-admin.controller.ts
+new file mode 100644
+index 0000000..0d5abb2
+--- /dev/null
++++ b/integration/maintenance-mode/src/maintenance-mode-admin.controller.ts
+@@ -0,0 +1,28 @@
++import { Controller, Get, Post } from '@nestjs/common';
++import { MaintenanceModeService } from './maintenance-mode.service.js';
++
++// Lets an operator flip maintenance mode on/off from inside the running
++// application (e.g. during a migration), with no redeploy involved.
++@Controller('admin/maintenance-mode')
++export class MaintenanceModeAdminController {
++  constructor(
++    private readonly maintenanceModeService: MaintenanceModeService,
++  ) {}
++
++  @Get()
++  status() {
++    return { enabled: this.maintenanceModeService.isEnabled() };
++  }
++
++  @Post('enable')
++  enable() {
++    this.maintenanceModeService.enable();
++    return { enabled: true };
++  }
++
++  @Post('disable')
++  disable() {
++    this.maintenanceModeService.disable();
++    return { enabled: false };
++  }
++}
+diff --git a/integration/maintenance-mode/src/maintenance-mode.constants.ts b/integration/maintenance-mode/src/maintenance-mode.constants.ts
+new file mode 100644
+index 0000000..3c8aecb
+--- /dev/null
++++ b/integration/maintenance-mode/src/maintenance-mode.constants.ts
+@@ -0,0 +1 @@
++export const MAINTENANCE_MODE_KEY = 'MAINTENANCE_MODE_AFFECTED';
+diff --git a/integration/maintenance-mode/src/maintenance-mode.decorator.ts b/integration/maintenance-mode/src/maintenance-mode.decorator.ts
+new file mode 100644
+index 0000000..6af14f8
+--- /dev/null
++++ b/integration/maintenance-mode/src/maintenance-mode.decorator.ts
+@@ -0,0 +1,12 @@
++import { SetMetadata } from '@nestjs/common';
++import { MAINTENANCE_MODE_KEY } from './maintenance-mode.constants.js';
++
++/**
++ * Marks a controller/gateway, an individual HTTP route handler, or an
++ * individual WebSocket `@SubscribeMessage` handler as affected by
++ * maintenance mode. `MaintenanceModeGuard` rejects calls to anything carrying
++ * this metadata while maintenance mode is switched on, before the handler
++ * body runs; undecorated handlers are never affected.
++ */
++export const MaintenanceMode = (): ClassDecorator & MethodDecorator =>
++  SetMetadata(MAINTENANCE_MODE_KEY, true);
+diff --git a/integration/maintenance-mode/src/maintenance-mode.guard.ts b/integration/maintenance-mode/src/maintenance-mode.guard.ts
+new file mode 100644
+index 0000000..bea6dcc
+--- /dev/null
++++ b/integration/maintenance-mode/src/maintenance-mode.guard.ts
+@@ -0,0 +1,46 @@
++import {
++  CanActivate,
++  ExecutionContext,
++  Injectable,
++  ServiceUnavailableException,
++} from '@nestjs/common';
++import { Reflector } from '@nestjs/core';
++import { WsException } from '@nestjs/websockets';
++import { MAINTENANCE_MODE_KEY } from './maintenance-mode.constants.js';
++import { MaintenanceModeService } from './maintenance-mode.service.js';
++
++export const MAINTENANCE_MODE_MESSAGE =
++  'This part of the API is temporarily unavailable for maintenance.';
++
++/**
++ * Rejects calls to handlers marked with `@MaintenanceMode()` while
++ * `MaintenanceModeService` reports maintenance mode as enabled. Handlers
++ * without the metadata are always allowed through, regardless of the flag.
++ *
++ * Works unchanged for HTTP routes and WebSocket message handlers: both go
++ * through the same `CanActivate`/`ExecutionContext` pipeline, so a single
++ * guard instance covers both transports.
++ */
++@Injectable()
++export class MaintenanceModeGuard implements CanActivate {
++  constructor(
++    private readonly reflector: Reflector,
++    private readonly maintenanceModeService: MaintenanceModeService,
++  ) {}
++
++  canActivate(context: ExecutionContext): boolean {
++    const isAffected = this.reflector.getAllAndOverride<boolean>(
++      MAINTENANCE_MODE_KEY,
++      [context.getHandler(), context.getClass()],
++    );
++
++    if (!isAffected || !this.maintenanceModeService.isEnabled()) {
++      return true;
++    }
++
++    if (context.getType() === 'http') {
++      throw new ServiceUnavailableException(MAINTENANCE_MODE_MESSAGE);
++    }
++    throw new WsException(MAINTENANCE_MODE_MESSAGE);
++  }
++}
+diff --git a/integration/maintenance-mode/src/maintenance-mode.module.ts b/integration/maintenance-mode/src/maintenance-mode.module.ts
+new file mode 100644
+index 0000000..e182ea1
+--- /dev/null
++++ b/integration/maintenance-mode/src/maintenance-mode.module.ts
+@@ -0,0 +1,20 @@
++import { Global, Module } from '@nestjs/common';
++import { APP_GUARD } from '@nestjs/core';
++import { MaintenanceModeGuard } from './maintenance-mode.guard.js';
++import { MaintenanceModeService } from './maintenance-mode.service.js';
++
++/**
++ * Registers `MaintenanceModeGuard` as a global guard (via `APP_GUARD`), so it
++ * runs for every HTTP route and every WebSocket message handler in the
++ * application without each controller/gateway needing its own `@UseGuards`.
++ * The guard only ever blocks handlers carrying `@MaintenanceMode()`.
++ */
++@Global()
++@Module({
++  providers: [
++    MaintenanceModeService,
++    { provide: APP_GUARD, useClass: MaintenanceModeGuard },
++  ],
++  exports: [MaintenanceModeService],
++})
++export class MaintenanceModeModule {}
+diff --git a/integration/maintenance-mode/src/maintenance-mode.service.ts b/integration/maintenance-mode/src/maintenance-mode.service.ts
+new file mode 100644
+index 0000000..e6d600f
+--- /dev/null
++++ b/integration/maintenance-mode/src/maintenance-mode.service.ts
+@@ -0,0 +1,23 @@
++import { Injectable } from '@nestjs/common';
++
++/**
++ * Holds the application's maintenance-mode flag in memory so it can be
++ * toggled at runtime (e.g. from an admin endpoint or internal trigger)
++ * without redeploying.
++ */
++@Injectable()
++export class MaintenanceModeService {
++  private enabled = false;
++
++  enable(): void {
++    this.enabled = true;
++  }
++
++  disable(): void {
++    this.enabled = false;
++  }
++
++  isEnabled(): boolean {
++    return this.enabled;
++  }
++}
+diff --git a/integration/maintenance-mode/src/migration.controller.ts b/integration/maintenance-mode/src/migration.controller.ts
+new file mode 100644
+index 0000000..2b81ea9
+--- /dev/null
++++ b/integration/maintenance-mode/src/migration.controller.ts
+@@ -0,0 +1,18 @@
++import { Controller, Get, Post } from '@nestjs/common';
++import { MaintenanceMode } from './maintenance-mode.decorator.js';
++
++// Every handler in this controller depends on the in-flight migration, so
++// the class itself is marked instead of decorating each method.
++@Controller('migration')
++@MaintenanceMode()
++export class MigrationController {
++  @Get('status')
++  status() {
++    return { status: 'running' };
++  }
++
++  @Post('retry')
++  retry() {
++    return { retried: true };
++  }
++}
+diff --git a/integration/maintenance-mode/test/maintenance-mode.guard.spec.ts b/integration/maintenance-mode/test/maintenance-mode.guard.spec.ts
+new file mode 100644
+index 0000000..50a4ac9
+--- /dev/null
++++ b/integration/maintenance-mode/test/maintenance-mode.guard.spec.ts
+@@ -0,0 +1,101 @@
++import type { ExecutionContext } from '@nestjs/common';
++import { ServiceUnavailableException } from '@nestjs/common';
++import { Reflector } from '@nestjs/core';
++import { WsException } from '@nestjs/websockets';
++import { MAINTENANCE_MODE_KEY } from '../src/maintenance-mode.constants.js';
++import {
++  MAINTENANCE_MODE_MESSAGE,
++  MaintenanceModeGuard,
++} from '../src/maintenance-mode.guard.js';
++import { MaintenanceModeService } from '../src/maintenance-mode.service.js';
++
++/**
++ * Builds a bare `ExecutionContext`-shaped object, with no HTTP server or
++ * socket behind it, so the guard can be exercised in isolation.
++ */
++function createContext(options: {
++  type?: 'http' | 'ws';
++  handlerMarked?: boolean;
++  classMarked?: boolean;
++}): ExecutionContext {
++  const handler = function affectedHandler() {};
++  class Controller {}
++
++  if (options.handlerMarked) {
++    Reflect.defineMetadata(MAINTENANCE_MODE_KEY, true, handler);
++  }
++  if (options.classMarked) {
++    Reflect.defineMetadata(MAINTENANCE_MODE_KEY, true, Controller);
++  }
++
++  return {
++    getHandler: () => handler,
++    getClass: () => Controller as any,
++    getType: () => options.type ?? 'http',
++    getArgs: () => [],
++    getArgByIndex: () => undefined,
++    switchToHttp: () => ({}) as any,
++    switchToRpc: () => ({}) as any,
++    switchToWs: () => ({}) as any,
++  } as ExecutionContext;
++}
++
++describe('MaintenanceModeGuard', () => {
++  let maintenanceModeService: MaintenanceModeService;
++  let guard: MaintenanceModeGuard;
++
++  beforeEach(() => {
++    maintenanceModeService = new MaintenanceModeService();
++    guard = new MaintenanceModeGuard(new Reflector(), maintenanceModeService);
++  });
++
++  it('allows an unmarked handler through even while maintenance mode is on', () => {
++    maintenanceModeService.enable();
++    expect(guard.canActivate(createContext({}))).toBe(true);
++  });
++
++  it('allows a marked handler through while maintenance mode is off', () => {
++    expect(guard.canActivate(createContext({ handlerMarked: true }))).toBe(
++      true,
++    );
++  });
++
++  it('blocks a method-marked HTTP handler while maintenance mode is on', () => {
++    maintenanceModeService.enable();
++    const context = createContext({ handlerMarked: true, type: 'http' });
++    expect(() => guard.canActivate(context)).toThrow(
++      ServiceUnavailableException,
++    );
++  });
++
++  it('blocks every handler of a class-marked controller while maintenance mode is on', () => {
++    maintenanceModeService.enable();
++    const context = createContext({ classMarked: true, type: 'http' });
++    expect(() => guard.canActivate(context)).toThrow(
++      ServiceUnavailableException,
++    );
++  });
++
++  it('blocks a marked WebSocket message handler using the same metadata, but raises a WsException', () => {
++    maintenanceModeService.enable();
++    const context = createContext({ handlerMarked: true, type: 'ws' });
++    expect(() => guard.canActivate(context)).toThrow(WsException);
++  });
++
++  it('re-allows a marked handler once maintenance mode is switched back off', () => {
++    maintenanceModeService.enable();
++    const context = createContext({ handlerMarked: true });
++    expect(() => guard.canActivate(context)).toThrow();
++
++    maintenanceModeService.disable();
++    expect(guard.canActivate(context)).toBe(true);
++  });
++
++  it('reports a clear maintenance-specific message', () => {
++    maintenanceModeService.enable();
++    const context = createContext({ handlerMarked: true });
++    expect(() => guard.canActivate(context)).toThrow(
++      MAINTENANCE_MODE_MESSAGE,
++    );
++  });
++});
+diff --git a/integration/maintenance-mode/test/maintenance-mode.service.spec.ts b/integration/maintenance-mode/test/maintenance-mode.service.spec.ts
+new file mode 100644
+index 0000000..da7a9be
+--- /dev/null
++++ b/integration/maintenance-mode/test/maintenance-mode.service.spec.ts
+@@ -0,0 +1,17 @@
++import { MaintenanceModeService } from '../src/maintenance-mode.service.js';
++
++describe('MaintenanceModeService', () => {
++  it('starts disabled by default', () => {
++    expect(new MaintenanceModeService().isEnabled()).toBe(false);
++  });
++
++  it('toggles on and off', () => {
++    const service = new MaintenanceModeService();
++
++    service.enable();
++    expect(service.isEnabled()).toBe(true);
++
++    service.disable();
++    expect(service.isEnabled()).toBe(false);
++  });
++});
+diff --git a/integration/maintenance-mode/tsconfig.json b/integration/maintenance-mode/tsconfig.json
+new file mode 100644
+index 0000000..6d87cbe
+--- /dev/null
++++ b/integration/maintenance-mode/tsconfig.json
+@@ -0,0 +1,44 @@
++{
++  "compilerOptions": {
++    "types": ["vitest/globals"],
++    "module": "commonjs",
++    "declaration": false,
++    "noImplicitAny": false,
++    "removeComments": true,
++    "noLib": false,
++    "esModuleInterop": true,
++    "emitDecoratorMetadata": true,
++    "experimentalDecorators": true,
++    "target": "ES2023",
++    "sourceMap": true,
++    "allowJs": true,
++    "strictNullChecks": true,
++    "outDir": "./dist",
++    "paths": {
++      "@nestjs/common": ["../../packages/common"],
++      "@nestjs/common/*": ["../../packages/common/*"],
++      "@nestjs/core": ["../../packages/core"],
++      "@nestjs/core/*": ["../../packages/core/*"],
++      "@nestjs/microservices": ["../../packages/microservices"],
++      "@nestjs/microservices/*": ["../../packages/microservices/*"],
++      "@nestjs/websockets": ["../../packages/websockets"],
++      "@nestjs/websockets/*": ["../../packages/websockets/*"],
++      "@nestjs/testing": ["../../packages/testing"],
++      "@nestjs/testing/*": ["../../packages/testing/*"],
++      "@nestjs/platform-express": ["../../packages/platform-express"],
++      "@nestjs/platform-express/*": ["../../packages/platform-express/*"],
++      "@nestjs/platform-socket.io": ["../../packages/platform-socket.io"],
++      "@nestjs/platform-socket.io/*": ["../../packages/platform-socket.io/*"],
++      "@nestjs/platform-ws": ["../../packages/platform-ws"],
++      "@nestjs/platform-ws/*": ["../../packages/platform-ws/*"]
++    }
++  },
++  "include": [
++    "src/**/*",
++    "e2e/**/*",
++    "test/**/*"
++  ],
++  "exclude": [
++    "node_modules",
++  ]
++}

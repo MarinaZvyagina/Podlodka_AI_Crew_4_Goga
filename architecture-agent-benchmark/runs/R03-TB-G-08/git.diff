@@ -1,0 +1,332 @@
+diff --git a/packages/platform-socket.io/adapters/io-adapter.ts b/packages/platform-socket.io/adapters/io-adapter.ts
+index 90c640c..871769f 100644
+--- a/packages/platform-socket.io/adapters/io-adapter.ts
++++ b/packages/platform-socket.io/adapters/io-adapter.ts
+@@ -6,7 +6,11 @@ import { fromEvent, Observable } from 'rxjs';
+ import { filter, first, map, mergeMap, share, takeUntil } from 'rxjs/operators';
+ import { Namespace, Server, ServerOptions, Socket } from 'socket.io';
+ import { isFunction, isNil } from '@nestjs/common/internal';
+-import { DISCONNECT_EVENT } from '@nestjs/websockets/internal';
++import {
++  DISCONNECT_EVENT,
++  SHUTDOWN_EVENT,
++  SHUTDOWN_MESSAGE,
++} from '@nestjs/websockets/internal';
+ 
+ /**
+  * @publicApi
+@@ -93,10 +97,50 @@ export class IoAdapter extends AbstractWsAdapter {
+   }
+ 
+   public async close(server: Server): Promise<void> {
++    await this.notifyClientsOfShutdown(server);
++
+     if (this.forceCloseConnections && server.httpServer === this.httpServer) {
+       return;
+     }
+ 
+     return super.close(server);
+   }
++
++  /**
++   * Sends a heads-up message to every currently connected client, letting it
++   * know the server is going away, and gracefully disconnects it.
++   *
++   * `Server#close` discards the underlying engine.io transports without
++   * waiting for their write buffers to flush, so clients are disconnected
++   * here first (via the public, graceful `Socket#disconnect` API). Each
++   * disconnection is given a short, bounded window to actually complete
++   * before `Server#close` is allowed to forcibly tear down whatever is left,
++   * so the notification isn't lost to that race.
++   */
++  protected async notifyClientsOfShutdown(server: Server | Namespace) {
++    // `Server#sockets` is itself the default `Namespace`, whose `sockets`
++    // property holds the actual map of locally connected clients.
++    const namespace: Namespace =
++      server instanceof Server ? server.sockets : server;
++    const sockets = Array.from(namespace.sockets?.values() ?? []);
++
++    await Promise.all(sockets.map(socket => this.notifyAndDisconnect(socket)));
++  }
++
++  private notifyAndDisconnect(socket: Socket) {
++    return new Promise<void>(resolve => {
++      const timer = setTimeout(resolve, IoAdapter.SHUTDOWN_GRACE_PERIOD);
++      timer.unref?.();
++      const finish = () => {
++        clearTimeout(timer);
++        resolve();
++      };
++      socket.conn.once('close', finish);
++
++      socket.emit(SHUTDOWN_EVENT, SHUTDOWN_MESSAGE);
++      socket.disconnect(true);
++    });
++  }
++
++  private static readonly SHUTDOWN_GRACE_PERIOD = 300;
+ }
+diff --git a/packages/platform-socket.io/test/io-adapter-shutdown.spec.ts b/packages/platform-socket.io/test/io-adapter-shutdown.spec.ts
+new file mode 100644
+index 0000000..f11a9e8
+--- /dev/null
++++ b/packages/platform-socket.io/test/io-adapter-shutdown.spec.ts
+@@ -0,0 +1,131 @@
++import * as http from 'http';
++import { AddressInfo } from 'net';
++import { io as ioClient, Socket as ClientSocket } from 'socket.io-client';
++import { IoAdapter } from '../adapters/io-adapter.js';
++
++describe('IoAdapter', () => {
++  describe('close', () => {
++    let httpServer: http.Server;
++    let client: ClientSocket;
++
++    afterEach(async () => {
++      client?.close();
++      await new Promise<void>(resolve => httpServer.close(() => resolve()));
++    });
++
++    it('notifies connected clients before disconnecting them', async () => {
++      httpServer = http.createServer();
++      const adapter = new IoAdapter(httpServer);
++      const server = adapter.createIOServer(0);
++
++      await new Promise<void>(resolve => httpServer.listen(0, resolve));
++      const { port } = httpServer.address() as AddressInfo;
++
++      client = ioClient(`http://localhost:${port}`);
++      await new Promise<void>((resolve, reject) => {
++        client.once('connect', () => resolve());
++        client.once('connect_error', reject);
++      });
++
++      const shutdownMessage = new Promise<any>(resolve =>
++        client.once('shutdown', data => resolve(data)),
++      );
++
++      await adapter.close(server);
++
++      await expect(shutdownMessage).resolves.toBe(
++        'The server is shutting down. This connection will be closed.',
++      );
++    });
++
++    it('notifies clients stuck on the long-polling transport', async () => {
++      httpServer = http.createServer();
++      const adapter = new IoAdapter(httpServer);
++      const server = adapter.createIOServer(0);
++
++      await new Promise<void>(resolve => httpServer.listen(0, resolve));
++      const { port } = httpServer.address() as AddressInfo;
++
++      client = ioClient(`http://localhost:${port}`, {
++        transports: ['polling'],
++        upgrade: false,
++      });
++      await new Promise<void>((resolve, reject) => {
++        client.once('connect', () => resolve());
++        client.once('connect_error', reject);
++      });
++
++      const shutdownMessage = new Promise<any>(resolve =>
++        client.once('shutdown', data => resolve(data)),
++      );
++
++      await adapter.close(server);
++
++      await expect(shutdownMessage).resolves.toBe(
++        'The server is shutting down. This connection will be closed.',
++      );
++    });
++
++    it('notifies clients connected to a custom namespace', async () => {
++      httpServer = http.createServer();
++      const adapter = new IoAdapter(httpServer);
++      const rootServer = adapter.createIOServer(0);
++      const server = rootServer.of('/chat');
++
++      await new Promise<void>(resolve => httpServer.listen(0, resolve));
++      const { port } = httpServer.address() as AddressInfo;
++
++      client = ioClient(`http://localhost:${port}/chat`);
++      await new Promise<void>((resolve, reject) => {
++        client.once('connect', () => resolve());
++        client.once('connect_error', reject);
++      });
++
++      const shutdownMessage = new Promise<any>(resolve =>
++        client.once('shutdown', data => resolve(data)),
++      );
++
++      await adapter.close(server);
++
++      await expect(shutdownMessage).resolves.toBe(
++        'The server is shutting down. This connection will be closed.',
++      );
++    });
++
++    it('still notifies clients when forceCloseConnections is enabled', async () => {
++      httpServer = http.createServer();
++      const adapter = new IoAdapter(httpServer);
++      adapter.forceCloseConnections = true;
++      const server = adapter.createIOServer(0);
++
++      await new Promise<void>(resolve => httpServer.listen(0, resolve));
++      const { port } = httpServer.address() as AddressInfo;
++
++      client = ioClient(`http://localhost:${port}`);
++      await new Promise<void>((resolve, reject) => {
++        client.once('connect', () => resolve());
++        client.once('connect_error', reject);
++      });
++
++      const shutdownMessage = new Promise<any>(resolve =>
++        client.once('shutdown', data => resolve(data)),
++      );
++
++      await adapter.close(server);
++
++      await expect(shutdownMessage).resolves.toBe(
++        'The server is shutting down. This connection will be closed.',
++      );
++    });
++
++    it('does not throw when there are no connected clients', async () => {
++      httpServer = http.createServer();
++      const adapter = new IoAdapter(httpServer);
++      const server = adapter.createIOServer(0);
++
++      await new Promise<void>(resolve => httpServer.listen(0, resolve));
++
++      await expect(adapter.close(server)).resolves.toBeUndefined();
++    });
++  });
++});
+diff --git a/packages/platform-ws/adapters/ws-adapter.ts b/packages/platform-ws/adapters/ws-adapter.ts
+index fd75cf7..99c8c66 100644
+--- a/packages/platform-ws/adapters/ws-adapter.ts
++++ b/packages/platform-ws/adapters/ws-adapter.ts
+@@ -9,6 +9,8 @@ import {
+   CLOSE_EVENT,
+   CONNECTION_EVENT,
+   ERROR_EVENT,
++  SHUTDOWN_EVENT,
++  SHUTDOWN_MESSAGE,
+ } from '@nestjs/websockets/internal';
+ import type { MessageMappingProperties } from '@nestjs/websockets';
+ 
+@@ -197,6 +199,8 @@ export class WsAdapter extends AbstractWsAdapter {
+       server.close((err: Error) => (err ? reject(err) : resolve(undefined))),
+     );
+     if (server.clients) {
++      await this.notifyClientsOfShutdown(server.clients);
++
+       for (const ws of server.clients) {
+         ws.terminate();
+       }
+@@ -204,6 +208,28 @@ export class WsAdapter extends AbstractWsAdapter {
+     await closeEventSignal;
+   }
+ 
++  /**
++   * Sends a heads-up message to every currently connected client, letting it
++   * know the server is going away, right before the connections are torn
++   * down as part of the shutdown sequence.
++   */
++  protected async notifyClientsOfShutdown(clients: Iterable<any>) {
++    const payload = JSON.stringify({
++      event: SHUTDOWN_EVENT,
++      data: SHUTDOWN_MESSAGE,
++    });
++    await Promise.all(
++      Array.from(clients)
++        .filter(ws => ws.readyState === READY_STATE.OPEN_STATE)
++        .map(
++          ws =>
++            new Promise<void>(resolve => {
++              ws.send(payload, () => resolve());
++            }),
++        ),
++    );
++  }
++
+   public async dispose() {
+     const closeEventSignals = Array.from(this.httpServersRegistry)
+       .filter(([port]) => port !== UNDERLYING_HTTP_SERVER_PORT)
+diff --git a/packages/platform-ws/test/ws-adapter.spec.ts b/packages/platform-ws/test/ws-adapter.spec.ts
+new file mode 100644
+index 0000000..c64e44e
+--- /dev/null
++++ b/packages/platform-ws/test/ws-adapter.spec.ts
+@@ -0,0 +1,51 @@
++import * as http from 'http';
++import { AddressInfo } from 'net';
++import WebSocket from 'ws';
++import { WsAdapter } from '../adapters/ws-adapter.js';
++
++describe('WsAdapter', () => {
++  describe('close', () => {
++    it('notifies connected clients before terminating their connections', async () => {
++      const httpServer = http.createServer();
++      const adapter = new WsAdapter(httpServer);
++      const wsServer = adapter.create(0, { server: httpServer, path: '/' });
++
++      await new Promise<void>(resolve => httpServer.listen(0, resolve));
++      const { port } = httpServer.address() as AddressInfo;
++
++      const client = new WebSocket(`ws://localhost:${port}`);
++      await new Promise<void>((resolve, reject) => {
++        client.once('open', () => resolve());
++        client.once('error', reject);
++      });
++
++      const received: any[] = [];
++      const closed = new Promise<{ code: number }>(resolve => {
++        client.on('message', data => received.push(JSON.parse(data.toString())));
++        client.once('close', code => resolve({ code }));
++      });
++
++      await adapter.close(wsServer);
++      await closed;
++      await new Promise<void>(resolve => httpServer.close(() => resolve()));
++
++      expect(received).toHaveLength(1);
++      expect(received[0]).toEqual({
++        event: 'shutdown',
++        data: 'The server is shutting down. This connection will be closed.',
++      });
++    });
++
++    it('does not throw when there are no connected clients', async () => {
++      const httpServer = http.createServer();
++      const adapter = new WsAdapter(httpServer);
++      const wsServer = adapter.create(0, { server: httpServer, path: '/' });
++
++      await new Promise<void>(resolve => httpServer.listen(0, resolve));
++
++      await expect(adapter.close(wsServer)).resolves.toBeUndefined();
++
++      await new Promise<void>(resolve => httpServer.close(() => resolve()));
++    });
++  });
++});
+diff --git a/packages/websockets/constants.ts b/packages/websockets/constants.ts
+index e8b7b8e..5912af6 100644
+--- a/packages/websockets/constants.ts
++++ b/packages/websockets/constants.ts
+@@ -13,3 +13,14 @@ export const CONNECTION_EVENT = 'connection';
+ export const DISCONNECT_EVENT = 'disconnect';
+ export const CLOSE_EVENT = 'close';
+ export const ERROR_EVENT = 'error';
++
++/**
++ * Event name emitted to connected clients right before the server closes
++ * their connection as part of the application shutdown sequence.
++ */
++export const SHUTDOWN_EVENT = 'shutdown';
++/**
++ * Default payload sent alongside the `SHUTDOWN_EVENT` notification.
++ */
++export const SHUTDOWN_MESSAGE =
++  'The server is shutting down. This connection will be closed.';

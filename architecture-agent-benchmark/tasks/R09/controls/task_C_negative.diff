@@ -1,0 +1,179 @@
+diff --git a/BrowserKit/Sources/QuickAnswersKit/Backend/DefaultQuickAnswersService.swift b/BrowserKit/Sources/QuickAnswersKit/Backend/DefaultQuickAnswersService.swift
+index 0a6eee0..375b4bd 100644
+--- a/BrowserKit/Sources/QuickAnswersKit/Backend/DefaultQuickAnswersService.swift
++++ b/BrowserKit/Sources/QuickAnswersKit/Backend/DefaultQuickAnswersService.swift
+@@ -2,9 +2,11 @@
+ // License, v. 2.0. If a copy of the MPL was not distributed with this
+ // file, You can obtain one at http://mozilla.org/MPL/2.0/
+ 
++import AVFoundation
+ import Foundation
+ import LLMKit
+ import Shared
++import Speech
+ 
+ /// A concrete `QuickAnswersService` that records speech and emits transcription results
+ /// using an underlying `TranscriptionEngine`. As well as request results from the transcription via `ResultsService` flow.
+@@ -12,6 +14,11 @@ import Shared
+ /// Engine selection
+ /// - iOS 26+ uses `SpeechAnalyzerEngine`.
+ /// - Earlier versions use `SFSpeechRecognizerEngine`.
++///
++/// Internal A/B experiment: when `useAlternatePipeline` is `true`, recording is routed through a
++/// second, self-contained AVAudioEngine/SFSpeechRecognizer pipeline instead (see
++/// `startAlternateRecording`/`stopAlternateRecording` below), so the two cohorts can run side by
++/// side without sharing mutable state.
+ @MainActor
+ final class DefaultQuickAnswersService: QuickAnswersService {
+     enum RecordingState: Equatable {
+@@ -24,10 +31,19 @@ final class DefaultQuickAnswersService: QuickAnswersService {
+     private var state: RecordingState = .idle
+     private var recordingTask: Task<Void, Error>?
+     private var continuation: AsyncThrowingStream<SpeechResult, any Error>.Continuation?
++    private let useAlternatePipeline: Bool
++
++    // MARK: - Alternate pipeline state (experiment cohort only)
++    private var alternateAudioEngine: AVAudioEngine?
++    private var alternateRequest: SFSpeechAudioBufferRecognitionRequest?
++    private var alternateRecognitionTask: SFSpeechRecognitionTask?
+ 
+     /// Creates a new service with a platform-appropriate transcription engine and results service.
++    /// - Parameter useAlternatePipeline: enrolls this instance in the alternate speech-to-text
++    ///   pipeline experiment. Defaults to `false` so existing call sites are unaffected.
+     init(
+         engine: TranscriptionEngine? = nil,
++        useAlternatePipeline: Bool = false,
+         configFetcher: QuickAnswersConfigFetcher,
+         resultsServiceFactory: ResultsServiceFactory = DefaultResultsServiceFactory(
+             liteLLMCreator: LiteLLMCreator()
+@@ -35,6 +51,7 @@ final class DefaultQuickAnswersService: QuickAnswersService {
+         prefs: Prefs
+     ) throws {
+         self.engine = engine ?? Self.makeDefaultEngine()
++        self.useAlternatePipeline = useAlternatePipeline
+         self.resultsService = try resultsServiceFactory.make(prefs: prefs, configFetcher: configFetcher)
+     }
+ 
+@@ -45,6 +62,13 @@ final class DefaultQuickAnswersService: QuickAnswersService {
+     /// - Launches an internal task that feeds results into the returned stream.
+     func record() async throws -> AsyncThrowingStream<SpeechResult, Error> {
+         try beginRecording()
++
++        if useAlternatePipeline {
++            return AsyncThrowingStream { [weak self] continuation in
++                self?.startAlternateRecording(with: continuation)
++            }
++        }
++
+         try await engine.prepare()
+ 
+         return AsyncThrowingStream { [weak self] continuation in
+@@ -56,7 +80,11 @@ final class DefaultQuickAnswersService: QuickAnswersService {
+     /// and resets the service to the `.idle` state.
+     func stopRecording() async throws {
+         cleanUp()
+-        try await engine.stop()
++        if useAlternatePipeline {
++            stopAlternateRecording()
++        } else {
++            try await engine.stop()
++        }
+         state = .idle
+     }
+ 
+@@ -101,6 +129,95 @@ final class DefaultQuickAnswersService: QuickAnswersService {
+         }
+     }
+ 
++    // MARK: - Alternate pipeline (experiment cohort)
++    // Quick-and-dirty stand-in for the alternate speech-to-text pipeline: talks to
++    // AVAudioEngine/AVAudioSession/SFSpeechRecognizer directly instead of going through a
++    // TranscriptionEngine, so it doesn't need any changes to the engine-selection abstraction.
++    private func startAlternateRecording(
++        with continuation: AsyncThrowingStream<SpeechResult, any Error>.Continuation
++    ) {
++        recordingTask?.cancel()
++        recordingTask = Task { [weak self] in
++            guard let self else { return }
++            do {
++                try Task.checkCancellation()
++
++                let micGranted = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
++                    AVAudioSession.sharedInstance().requestRecordPermission { granted in
++                        cont.resume(returning: granted)
++                    }
++                }
++                guard micGranted else {
++                    throw SpeechError.microphonePermissionDenied(isFirstTime: false)
++                }
++
++                let speechStatus = await withCheckedContinuation {
++                    (cont: CheckedContinuation<SFSpeechRecognizerAuthorizationStatus, Never>) in
++                    SFSpeechRecognizer.requestAuthorization { status in
++                        cont.resume(returning: status)
++                    }
++                }
++                guard speechStatus == .authorized else {
++                    throw SpeechError.speechRecognitionPermissionDenied(isFirstTime: false)
++                }
++
++                let session = AVAudioSession.sharedInstance()
++                try session.setCategory(.record, mode: .measurement, options: [.duckOthers])
++                try session.setActive(true, options: .notifyOthersOnDeactivation)
++
++                let audioEngine = AVAudioEngine()
++                let recognizer = SFSpeechRecognizer(locale: Locale.current)
++                let request = SFSpeechAudioBufferRecognitionRequest()
++                request.requiresOnDeviceRecognition = true
++
++                let inputNode = audioEngine.inputNode
++                let format = inputNode.outputFormat(forBus: 0)
++                inputNode.removeTap(onBus: 0)
++                inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { buffer, _ in
++                    request.append(buffer)
++                }
++
++                audioEngine.prepare()
++                try audioEngine.start()
++
++                self.alternateAudioEngine = audioEngine
++                self.alternateRequest = request
++
++                guard let recognizer, recognizer.isAvailable else {
++                    throw SpeechError.recognizerNotAvailable
++                }
++
++                self.alternateRecognitionTask = recognizer.recognitionTask(with: request) { result, error in
++                    if let error {
++                        continuation.finish(throwing: error)
++                        return
++                    }
++                    guard let result else { return }
++                    let text = result.bestTranscription.formattedString
++                    continuation.yield(SpeechResult(text: text, isFinal: result.isFinal))
++                    if result.isFinal {
++                        continuation.finish()
++                    }
++                }
++            } catch is CancellationError {
++                continuation.finish()
++            } catch {
++                continuation.finish(throwing: error)
++            }
++        }
++    }
++
++    private func stopAlternateRecording() {
++        alternateAudioEngine?.stop()
++        alternateAudioEngine?.inputNode.removeTap(onBus: 0)
++        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
++        alternateRequest?.endAudio()
++        alternateRecognitionTask?.finish()
++        alternateAudioEngine = nil
++        alternateRequest = nil
++        alternateRecognitionTask = nil
++    }
++
+     private static func makeDefaultEngine() -> TranscriptionEngine {
+         let audioManager = AudioManager()
+         let authorizer = AuthorizationHandler()

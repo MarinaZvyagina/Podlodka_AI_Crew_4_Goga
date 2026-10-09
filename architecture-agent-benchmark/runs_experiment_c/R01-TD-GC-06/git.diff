@@ -1,0 +1,91 @@
+diff --git a/freqtrade/exchange/exchange.py b/freqtrade/exchange/exchange.py
+index 17a0ca1..f08a692 100644
+--- a/freqtrade/exchange/exchange.py
++++ b/freqtrade/exchange/exchange.py
+@@ -235,6 +235,11 @@ class Exchange:
+         self._cache_lock = Lock()
+         # Cache for 10 minutes ...
+         self._fetch_tickers_cache: FtTTLCache = FtTTLCache(maxsize=4, ttl=60 * 10)
++        # Very short-lived per-pair ticker cache, to avoid hammering the exchange when
++        # multiple call-sites (e.g. entry confirmation and exit checks) request the current
++        # price for the same pair moments apart. Kept short so live/dry-run trading decisions
++        # are never made on noticeably stale prices.
++        self._fetch_ticker_cache: FtTTLCache = FtTTLCache(maxsize=1000, ttl=2)
+         # Cache values for 300 to avoid frequent polling of the exchange for prices
+         # Caching only applies to RPC methods, so prices for open trades are still
+         # refreshed once every iteration.
+@@ -2163,10 +2168,16 @@ class Exchange:
+ 
+     @retrier
+     def fetch_ticker(self, pair: str) -> Ticker:
++        with self._cache_lock:
++            ticker = self._fetch_ticker_cache.get(pair)
++        if ticker:
++            return ticker
+         try:
+             if pair not in self.markets or self.markets[pair].get("active", False) is False:
+                 raise ExchangeError(f"Pair {pair} not available")
+             data: Ticker = self._api.fetch_ticker(pair)
++            with self._cache_lock:
++                self._fetch_ticker_cache[pair] = data
+             return data
+         except ccxt.DDoSProtection as e:
+             raise DDosProtection(e) from e
+diff --git a/tests/exchange/test_exchange.py b/tests/exchange/test_exchange.py
+index 7594d95..e269739 100644
+--- a/tests/exchange/test_exchange.py
++++ b/tests/exchange/test_exchange.py
+@@ -2507,6 +2507,42 @@ def test_fetch_ticker(default_conf, mocker, exchange_name):
+         exchange.fetch_ticker(pair="XRP/ETH")
+ 
+ 
++def test_fetch_ticker_short_lived_cache(default_conf, mocker, time_machine):
++    api_mock = MagicMock()
++    tick = {"symbol": "ETH/BTC", "bid": 0.00001098, "ask": 0.00001099, "last": 0.0001}
++    tick2 = {"symbol": "XRP/BTC", "bid": 0.05, "ask": 0.06, "last": 0.055}
++    api_mock.fetch_ticker = MagicMock(return_value=tick)
++    api_mock.markets = {"ETH/BTC": {"active": True}, "XRP/BTC": {"active": True}}
++    exchange = get_patched_exchange(mocker, default_conf, api_mock)
++
++    start_dt = dt_now()
++    time_machine.move_to(start_dt, tick=False)
++
++    ticker = exchange.fetch_ticker(pair="ETH/BTC")
++    assert ticker == tick
++    assert api_mock.fetch_ticker.call_count == 1
++
++    # A 2nd request for the same pair moments later reuses the cached ticker.
++    api_mock.fetch_ticker.reset_mock()
++    api_mock.fetch_ticker = MagicMock(return_value={"bid": 999, "ask": 999, "last": 999})
++    ticker = exchange.fetch_ticker(pair="ETH/BTC")
++    assert ticker == tick
++    assert api_mock.fetch_ticker.call_count == 0
++
++    # A different pair is not affected by the ETH/BTC cache entry.
++    api_mock.fetch_ticker = MagicMock(return_value=tick2)
++    ticker = exchange.fetch_ticker(pair="XRP/BTC")
++    assert ticker == tick2
++    assert api_mock.fetch_ticker.call_count == 1
++
++    # Once the short cache window elapses, the exchange is queried again.
++    time_machine.move_to(start_dt + timedelta(seconds=3), tick=False)
++    api_mock.fetch_ticker = MagicMock(return_value={"bid": 999, "ask": 999, "last": 999})
++    ticker = exchange.fetch_ticker(pair="ETH/BTC")
++    assert ticker["bid"] == 999
++    assert api_mock.fetch_ticker.call_count == 1
++
++
+ @pytest.mark.parametrize("exchange_name", EXCHANGES)
+ def test___now_is_time_to_refresh(default_conf, mocker, exchange_name, time_machine):
+     exchange = get_patched_exchange(mocker, default_conf, exchange=exchange_name)
+@@ -3655,7 +3691,9 @@ def test_get_rates_testing_entry(
+     assert not log_has("Using cached buy rate for ETH/BTC.", caplog)
+ 
+     assert api_mock.fetch_l2_order_book.call_count == int(use_order_book)
+-    assert api_mock.fetch_ticker.call_count == 1
++    # fetch_ticker itself is short-lived-cached (a few seconds) to avoid duplicate
++    # round-trips to the exchange for near-simultaneous requests - no real call here.
++    assert api_mock.fetch_ticker.call_count == 0
+ 
+ 
+ @pytest.mark.parametrize("side,ask,bid,last,last_ab,expected", get_exit_rate_data)

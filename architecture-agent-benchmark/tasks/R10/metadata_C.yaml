@@ -1,0 +1,96 @@
+task_id: R10-TC
+repository: signalapp/Signal-iOS
+commit: 6e3a059f752785b349d5938dfa4c36f216fb0ae3
+category: existing_extension_point
+
+functional_requirements:
+  - Users can pick a retention window (e.g. 30 days) in settings; messages older than "now minus the window" are removed across all conversations.
+  - The cleanup does not block the main thread / freeze the UI, even with large message histories (analogous to the existing batching in BulkDeleteInteractionJobQueue).
+  - If the app is killed, backgrounded, or loses network mid-cleanup, progress is not lost: the next app launch resumes the cleanup rather than restarting from the very beginning or silently abandoning it.
+  - The cleanup behaves safely if the user signs out mid-run (no corrupted/half-deleted thread state).
+  - After a cleanup pass finishes, conversation previews/unread counts/message lists are correct immediately, without requiring an app relaunch.
+  - Turning the retention window on for the first time applies retroactively to existing history, not just new messages.
+  - The retention window can be changed or disabled at any time.
+
+architectural_constraints:
+  - The resumable, interruption-safe background deletion work must be implemented as a new persisted job using the existing job-execution framework in SignalServiceKit/Jobs/ — i.e. a new `JobRecord` subclass (SignalServiceKit/Jobs/JobRecords/, with a new case added to `JobRecord.JobRecordType` in SignalServiceKit/Jobs/JobRecords/JobRecord.swift), a type conforming to `JobRunner` (`runJobAttempt`/`didFinishJob`), a type conforming to `JobRunnerFactory` (`buildRunner`), and a `JobQueueRunner` wiring them together — following the pattern already used by SignalServiceKit/Jobs/BulkDeleteInteractionJobQueue.swift for a structurally similar "bulk delete interactions across a thread" job.
+  - Large-batch deletion should reuse the same time-gated batching approach already used by BulkDeleteInteractionJobRunner (`TimeGatedBatch.processAll`) to avoid long-running write transactions, rather than a single unbounded transaction or an unbatched loop.
+  - Actual message removal should go through `InteractionDeleteManager` (SignalServiceKit/Messages/Interactions/InteractionDeleteManager.swift), consistent with how BulkDeleteInteractionJobRunner deletes interactions, so side effects (associated call record cleanup, thread state updates) stay correct.
+  - The new job queue should be started/owned analogously to existing job queues (e.g. registered alongside other queues such as SignalServiceKit/Jobs/SignalMessagingJobQueues.swift or the app's own job-queue bootstrap), not started ad hoc from a view controller or app-lifecycle callback.
+  - The retention setting itself (the chosen window, on/off) is a simple persisted preference and may reasonably live in its own small store, but the actual deletion execution must not be implemented as a plain `Task`/`DispatchQueue` loop kicked off from `applicationDidBecomeActive`-style lifecycle hooks with hand-rolled "resume" bookkeeping in `UserDefaults`.
+
+required_existing_abstractions:
+  - "JobRunner / JobRunnerFactory / JobQueueRunner — SignalServiceKit/Jobs/JobQueueRunner.swift"
+  - "JobRecord base class + JobRecordType enum — SignalServiceKit/Jobs/JobRecords/JobRecord.swift"
+  - "BulkDeleteInteractionJobQueue (closest existing analog to model the new job after) — SignalServiceKit/Jobs/BulkDeleteInteractionJobQueue.swift"
+  - "TimeGatedBatch batching utility (used inside BulkDeleteInteractionJobRunner)"
+  - "InteractionDeleteManager — SignalServiceKit/Messages/Interactions/InteractionDeleteManager.swift"
+
+allowed_dependencies:
+  - "New SignalServiceKit/Jobs/ files depending on existing SignalServiceKit persistence/manager types (InteractionDeleteManager, ThreadStore, DB, etc.), same as BulkDeleteInteractionJobQueue.swift already does."
+  - "Signal app target settings UI depending on SignalServiceKit to expose the retention-window preference and trigger job creation."
+
+forbidden_dependencies:
+  - "SignalServiceKit -> SignalUI / Signal app target: the deletion engine must remain UI-agnostic, consistent with every existing job queue in the repo."
+  - "A brand-new, parallel persisted-task mechanism (separate database table, separate 'pending work' bookkeeping) built specifically for this feature instead of reusing JobRecord/JobQueueRunner: this is the anti-pattern this task is designed to surface, not an allowed alternative."
+
+expected_extension_points:
+  - "JobRunner / JobRunnerFactory protocols and JobQueueRunner<JobFinderType, JobRunnerFactoryType> class — SignalServiceKit/Jobs/JobQueueRunner.swift (verified: doc comment explicitly states 'A JobRunner is responsible for running a JobRecord' and contrasts it with TaskQueueLoader/TaskRecord for non-FIFO use cases)."
+  - "JobRecord persisted-record base class + JobRecordType enum requiring a new case — SignalServiceKit/Jobs/JobRecords/JobRecord.swift."
+  - "Closest concrete analog to model the new job after: BulkDeleteInteractionJobQueue / BulkDeleteInteractionJobRunner / BulkDeleteInteractionJobRecord — SignalServiceKit/Jobs/BulkDeleteInteractionJobQueue.swift, SignalServiceKit/Jobs/JobRecords/BulkDeleteInteractionJobRecord.swift."
+
+public_api_constraints:
+  - "JobRecord.JobRecordType raw values are persisted to the database (per its own doc comment: 'must provide their own unique values here') — the new case must use a new, previously-unused raw value and must not renumber existing cases."
+  - "No existing JobRecordType case, JobRunner conformance, or JobQueueRunner public API should be renamed/removed."
+
+functional_check_command: >
+  Manual/code-level check: confirm a new retention preference (window + on/off) is persisted; confirm a new
+  JobRecord/JobRunner/JobRunnerFactory triple exists for the cleanup; confirm the job is (re)started on app launch via
+  the same `start(shouldRestartExistingJobs:)` pattern used by existing queues so that an interrupted run resumes;
+  confirm deletion goes through InteractionDeleteManager so thread/preview state updates immediately.
+
+architecture_check_command: >
+  grep for new files under SignalServiceKit/Jobs/JobRecords/ and SignalServiceKit/Jobs/ implementing JobRecord/
+  JobRunner/JobRunnerFactory; grep the diff for any new ad hoc scheduling primitive (Timer, DispatchQueue.asyncAfter,
+  Task.detached tied to app-lifecycle notifications) used to drive the cleanup itself (as opposed to one-off UI
+  actions); manual review per AC1-AC5 below.
+
+architecture_checks:
+  - id: AC1
+    description: "A new JobRecord subclass and JobRecordType case were added for this feature (extension point used)."
+    method: "grep new/changed files in SignalServiceKit/Jobs/JobRecords/ for a class inheriting `JobRecord`; grep SignalServiceKit/Jobs/JobRecords/JobRecord.swift diff for a new case added to `enum JobRecordType` and a corresponding entry in `concreteType(forRecordType:)` and `jobRecordLabel`."
+    expected_result_if_correct: "Exactly one new JobRecord subclass + one new JobRecordType case + updated `concreteType`/`jobRecordLabel` switches (compiler-enforced exhaustiveness)."
+    expected_result_if_trap: "No new JobRecord subclass exists anywhere in the diff; retention/cleanup state is tracked with a different mechanism entirely (e.g. a boolean + a date in a generic key-value store, or a brand-new bespoke SQLite table not modeled as a JobRecord)."
+  - id: AC2
+    description: "A JobRunner + JobRunnerFactory pair drives the actual deletion work (extension point used, not bypassed)."
+    method: "grep the diff for a type implementing `func runJobAttempt(_:) async -> JobAttemptResult<...>` and `func didFinishJob(...)`, and a type implementing `func buildRunner() -> ...`; confirm a `JobQueueRunner` is constructed with these types, mirroring IncomingContactSyncJobQueue/BulkDeleteInteractionJobQueue's private `*JobRunner`/`*JobRunnerFactory` classes."
+    expected_result_if_correct: "New JobRunner/JobRunnerFactory conformances exist and are wired into a JobQueueRunner instance owned by a new `*JobQueue`-style class."
+    expected_result_if_trap: "The cleanup work is implemented as a plain function or singleton method invoked directly from a settings screen, app-launch hook, or background-refresh callback, with no JobRunner/JobRunnerFactory/JobQueueRunner involved anywhere in the diff."
+  - id: AC3
+    description: "The cleanup is NOT implemented as a parallel bolt-on scheduling mechanism (the trap this task targets)."
+    method: "grep the diff for `Timer(`, `DispatchQueue.main.asyncAfter`, `Task.detached`, or new NotificationCenter observers on app-lifecycle notifications (`applicationDidBecomeActive`, `.OWSApplicationDidBecomeActive`, etc.) that directly drive the deletion loop, combined with hand-rolled progress bookkeeping in `UserDefaults`/a generic KV store (e.g. a raw 'lastDeletedRowId' key) instead of a JobRecord row."
+    expected_result_if_correct: "No such pattern present; resumption state lives in the persisted JobRecord's own fields (as with BulkDeleteInteractionJobRecord's anchorMessageRowId), and job (re)start is driven by JobQueueRunner.start(shouldRestartExistingJobs:) at app launch, not by a bespoke lifecycle hook."
+    expected_result_if_trap: "A `Task`/`Timer`-driven loop kicked off from app-lifecycle notifications, storing a 'where I left off' cursor in UserDefaults or a generic key-value store, reads as functionally working (messages do eventually get deleted, tests can be made to pass) but duplicates the job-execution framework instead of using it."
+  - id: AC4
+    description: "Large deletions are batched using the existing time-gated batching utility rather than one unbounded transaction."
+    method: "grep the new job runner for `TimeGatedBatch.processAll` (or equivalent already-used batching call) versus a single `awaitableWrite` that iterates and deletes an unbounded number of interactions in one transaction."
+    expected_result_if_correct: "Deletion is chunked via TimeGatedBatch (or another already-established batching primitive in the codebase), matching BulkDeleteInteractionJobRunner's approach."
+    expected_result_if_trap: "A single write transaction (or a single unbatched loop) attempts to delete all qualifying interactions across all threads at once, risking long-running transactions / UI freezes on large histories."
+  - id: AC5
+    description: "Message removal goes through InteractionDeleteManager, not raw model deletion."
+    method: "grep the new job runner for `interactionDeleteManager.delete(` versus direct `TSInteraction`/`anyRemove(transaction:)` calls."
+    expected_result_if_correct: "All interaction removal is routed through InteractionDeleteManager.delete(interactions:sideEffects:tx:), matching BulkDeleteInteractionJobRunner."
+    expected_result_if_trap: "New code calls `anyRemove(transaction:)` directly on fetched TSInteraction/TSMessage objects, skipping associated call-record cleanup and other side effects InteractionDeleteManager normally handles."
+
+notes_for_positive_negative_control: >
+  Positive control: a new `MessageRetentionCleanupJobRecord : JobRecord` (with a threshold date or 'processed up to'
+  cursor as its persisted state) plus `MessageRetentionCleanupJobRunner: JobRunner` /
+  `MessageRetentionCleanupJobRunnerFactory: JobRunnerFactory`, wired into a `MessageRetentionCleanupJobQueue` that
+  owns a `JobQueueRunner`, batches deletes with `TimeGatedBatch.processAll`, deletes via `InteractionDeleteManager`,
+  and is started via `start(shouldRestartExistingJobs:)` at app launch (so an interrupted run resumes automatically
+  because the JobRecord row is still in the database). Negative/trap control: a `MessageRetentionManager` singleton
+  that stores `retentionWindowDays` and `lastCleanupCompletedThroughDate` in a plain key-value store, and runs a
+  `Task { ... }` loop triggered from `applicationDidBecomeActive`/a periodic timer that queries and deletes old
+  messages directly — this can be made to functionally delete old messages and "resume" via its own UserDefaults
+  cursor, passing a shallow functional test, while never touching JobRecord/JobRunner/JobRunnerFactory/JobQueueRunner
+  at all (fails AC1-AC3).

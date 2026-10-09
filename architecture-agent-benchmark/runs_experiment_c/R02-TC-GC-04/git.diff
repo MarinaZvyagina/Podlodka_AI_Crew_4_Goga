@@ -1,0 +1,514 @@
+diff --git a/changelog/69900.added.md b/changelog/69900.added.md
+new file mode 100644
+index 0000000..120ac8d
+--- /dev/null
++++ b/changelog/69900.added.md
+@@ -0,0 +1 @@
++Added a `sqlite` minion data cache backend (`cache: sqlite`) that stores banks/keys in a single SQLite database file, using only the `sqlite3` module from the Python standard library. Useful for small, single-node masters that want the cache to persist across restarts without running a separate cache service.
+diff --git a/doc/ref/cache/all/index.rst b/doc/ref/cache/all/index.rst
+index 07a3799..7eea199 100644
+--- a/doc/ref/cache/all/index.rst
++++ b/doc/ref/cache/all/index.rst
+@@ -21,3 +21,4 @@ For understanding and usage of the cache modules see the :ref:`cache` topic.
+     mmap_key
+     mysql_cache
+     redis_cache
++    sqlite_cache
+diff --git a/doc/ref/cache/all/salt.cache.sqlite_cache.rst b/doc/ref/cache/all/salt.cache.sqlite_cache.rst
+new file mode 100644
+index 0000000..b7d7cbc
+--- /dev/null
++++ b/doc/ref/cache/all/salt.cache.sqlite_cache.rst
+@@ -0,0 +1,5 @@
++salt.cache.sqlite_cache
++=======================
++
++.. automodule:: salt.cache.sqlite_cache
++    :members:
+diff --git a/doc/ref/configuration/master.rst b/doc/ref/configuration/master.rst
+index b1d4844..9786863 100644
+--- a/doc/ref/configuration/master.rst
++++ b/doc/ref/configuration/master.rst
+@@ -916,6 +916,10 @@ Cache subsystem module to use for minion data cache.  Common values:
+   :ref:`mmap-cache` for benchmarks, sizing, and durability notes.
+ * ``consul``, ``redis``, ``etcd``, ``mysql`` — networked backends, useful
+   for sharing cache across multiple masters.
++* ``sqlite`` — single on-disk SQLite database file under
++  :conf_master:`cachedir`, using only the ``sqlite3`` module from the Python
++  standard library.  Good for single-node masters that want the cache to
++  persist across restarts without running a separate database service.
+ 
+ The minion-key store is selected separately via ``keys.cache_driver``
+ (``localfs_key`` by default; set to ``mmap_key`` for the memory-mapped
+diff --git a/doc/topics/cache/index.rst b/doc/topics/cache/index.rst
+index 4435e51..d72f1d7 100644
+--- a/doc/topics/cache/index.rst
++++ b/doc/topics/cache/index.rst
+@@ -24,6 +24,15 @@ setting needs to be established:
+ 
+     cache: consul
+ 
++For a single-node master that wants durable, on-disk storage without
++running a separate database service, the ``sqlite`` cache module stores the
++cache in a single SQLite database file under :conf_master:`cachedir`, using
++only the ``sqlite3`` module that ships with the Python standard library:
++
++.. code-block:: yaml
++
++    cache: sqlite
++
+ The pluggable data cache streamlines using various Salt topologies such as a
+ :ref:`Multi-Master <tutorial-multi-master>` or :ref:`Salt Syndics <syndic>` configuration
+ by allowing the data stored on the Salt Master about a Salt Minion to be available to
+diff --git a/salt/cache/sqlite_cache.py b/salt/cache/sqlite_cache.py
+new file mode 100644
+index 0000000..16ef6d5
+--- /dev/null
++++ b/salt/cache/sqlite_cache.py
+@@ -0,0 +1,290 @@
++"""
++Minion data cache plugin for SQLite.
++
++.. versionadded:: 3008.0
++
++This cache plugin stores banks/keys/data (cached grains, mine data, job
++returns, etc.) in a single ordinary SQLite database file on disk, using only
++the ``sqlite3`` module that ships with a standard Python installation -- no
++external database service and no third-party package need to be installed.
++
++It is intended for small, single-node masters that want the cache to survive
++a restart of the master process without standing up Redis, MySQL, or a
++similar dedicated cache service.
++
++.. warning::
++
++    The sqlite_cache.table_name value is directly added into certain
++    queries. Salt treats this as trusted input.
++
++To use sqlite as the minion data cache backend, set the master ``cache``
++config value to ``sqlite``:
++
++.. code-block:: yaml
++
++    cache: sqlite
++
++The following values can optionally be set in the master config. These are
++the defaults:
++
++.. code-block:: yaml
++
++    sqlite_cache.database: <cachedir>/cache.sqlite3
++    sqlite_cache.table_name: cache
++    sqlite_cache.timeout: 5.0
++
++``sqlite_cache.database`` defaults to a file named ``cache.sqlite3`` inside
++the configured ``cachedir``, so the data is written to, and read back from,
++the same on-disk location across restarts without any additional
++configuration.
++"""
++
++import logging
++import os
++import threading
++import time
++
++import salt.payload
++import salt.syspaths
++from salt.exceptions import SaltCacheError
++
++try:
++    import sqlite3
++
++    HAS_SQLITE3 = True
++except ImportError:
++    HAS_SQLITE3 = False
++
++
++_DEFAULT_TABLE_NAME = "cache"
++_DEFAULT_TIMEOUT = 5.0
++
++log = logging.getLogger(__name__)
++
++# A single sqlite3 connection is kept per process (in __context__) and may be
++# used from more than one thread within that process (e.g. the master's
++# request-handling threads); guard it with a lock since a Connection opened
++# with check_same_thread=False does not serialize concurrent statements on
++# its own.
++_LOCK = threading.RLock()
++
++# Module properties
++
++__virtualname__ = "sqlite"
++__func_alias__ = {"ls": "list"}
++
++
++def __virtual__():
++    """
++    Confirm that the sqlite3 module is available. It ships with the Python
++    standard library, so this should always succeed except on Python builds
++    that were compiled without SQLite support.
++    """
++    return bool(HAS_SQLITE3), (
++        "No sqlite3 module available in this Python installation."
++        if not HAS_SQLITE3
++        else ""
++    )
++
++
++def force_reconnect():
++    """
++    Force a reconnection to the sqlite cache database, by removing the
++    client from Salt's __context__.
++    """
++    conn = __context__.pop("sqlite_client", None)
++    if conn is not None:
++        conn.close()
++
++
++def _database_path():
++    cachedir = __opts__.get("cachedir", salt.syspaths.CACHE_DIR)
++    return __opts__.get(
++        "sqlite_cache.database", os.path.join(cachedir, "cache.sqlite3")
++    )
++
++
++def _table_name():
++    return __opts__.get("sqlite_cache.table_name", _DEFAULT_TABLE_NAME)
++
++
++def _connect():
++    """
++    Return the cached sqlite3 connection, creating (and initializing) it if
++    this is the first call in this process.
++    """
++    conn = __context__.get("sqlite_client")
++    if conn is not None:
++        return conn
++
++    database = _database_path()
++    directory = os.path.dirname(database)
++    if directory and not os.path.isdir(directory):
++        try:
++            os.makedirs(directory)
++        except OSError as exc:
++            raise SaltCacheError(
++                f"The sqlite cache directory, {directory}, could not be created: {exc}"
++            )
++
++    timeout = __opts__.get("sqlite_cache.timeout", _DEFAULT_TIMEOUT)
++    table_name = _table_name()
++    try:
++        conn = sqlite3.connect(
++            database,
++            timeout=timeout,
++            isolation_level=None,
++            check_same_thread=False,
++        )
++        # WAL mode allows readers and a writer to proceed concurrently, and
++        # busy_timeout makes concurrent writers from other master processes
++        # block-and-retry instead of immediately raising "database is locked".
++        with _LOCK:
++            conn.execute("PRAGMA journal_mode=WAL")
++            conn.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
++            conn.execute(
++                "CREATE TABLE IF NOT EXISTS {} ("
++                "bank TEXT NOT NULL, "
++                "cache_key TEXT NOT NULL, "
++                "data BLOB, "
++                "last_update INTEGER NOT NULL, "
++                "PRIMARY KEY (bank, cache_key)"
++                ")".format(table_name)
++            )
++    except sqlite3.Error as exc:
++        raise SaltCacheError(
++            f"Could not open the sqlite cache database {database}: {exc}"
++        )
++
++    log.info("sqlite_cache: using database %s, table %s", database, table_name)
++    __context__["sqlite_client"] = conn
++    return conn
++
++
++def store(bank, key, data):
++    """
++    Store a key value.
++    """
++    conn = _connect()
++    payload = salt.payload.dumps(data)
++    try:
++        with _LOCK:
++            conn.execute(
++                "INSERT OR REPLACE INTO {} "
++                "(bank, cache_key, data, last_update) VALUES (?, ?, ?, ?)".format(
++                    _table_name()
++                ),
++                (bank, key, payload, int(time.time())),
++            )
++    except sqlite3.Error as exc:
++        raise SaltCacheError(f"There was an error storing {bank}/{key}: {exc}")
++
++
++def fetch(bank, key):
++    """
++    Fetch a key value.
++    """
++    conn = _connect()
++    try:
++        with _LOCK:
++            cur = conn.execute(
++                "SELECT data FROM {} WHERE bank=? AND cache_key=?".format(
++                    _table_name()
++                ),
++                (bank, key),
++            )
++            row = cur.fetchone()
++    except sqlite3.Error as exc:
++        raise SaltCacheError(f"There was an error fetching {bank}/{key}: {exc}")
++    if row is None:
++        return {}
++    return salt.payload.loads(row[0])
++
++
++def updated(bank, key):
++    """
++    Return the integer Unix epoch update timestamp of the specified bank and
++    key, or None if the key does not exist.
++    """
++    conn = _connect()
++    try:
++        with _LOCK:
++            cur = conn.execute(
++                "SELECT last_update FROM {} WHERE bank=? AND cache_key=?".format(
++                    _table_name()
++                ),
++                (bank, key),
++            )
++            row = cur.fetchone()
++    except sqlite3.Error as exc:
++        raise SaltCacheError(
++            f"There was an error reading the update time for {bank}/{key}: {exc}"
++        )
++    return int(row[0]) if row else None
++
++
++def flush(bank, key=None):
++    """
++    Remove the key from the cache bank with all the key content. If no key
++    is specified, remove the entire bank.
++    """
++    conn = _connect()
++    try:
++        with _LOCK:
++            if key is None:
++                cur = conn.execute(
++                    "DELETE FROM {} WHERE bank=?".format(_table_name()), (bank,)
++                )
++            else:
++                cur = conn.execute(
++                    "DELETE FROM {} WHERE bank=? AND cache_key=?".format(
++                        _table_name()
++                    ),
++                    (bank, key),
++                )
++    except sqlite3.Error as exc:
++        raise SaltCacheError(f"There was an error removing {bank}/{key or ''}: {exc}")
++    return cur.rowcount > 0
++
++
++def ls(bank):
++    """
++    Return an iterable object containing all entries stored in the specified
++    bank.
++    """
++    conn = _connect()
++    try:
++        with _LOCK:
++            cur = conn.execute(
++                "SELECT cache_key FROM {} WHERE bank=?".format(_table_name()), (bank,)
++            )
++            return [row[0] for row in cur.fetchall()]
++    except sqlite3.Error as exc:
++        raise SaltCacheError(f"There was an error listing {bank}: {exc}")
++
++
++def contains(bank, key=None):
++    """
++    Checks if the specified bank contains the specified key. If key is None,
++    checks whether the bank itself contains any keys.
++    """
++    conn = _connect()
++    try:
++        with _LOCK:
++            if key is None:
++                cur = conn.execute(
++                    "SELECT EXISTS(SELECT 1 FROM {} WHERE bank=?)".format(
++                        _table_name()
++                    ),
++                    (bank,),
++                )
++            else:
++                cur = conn.execute(
++                    "SELECT EXISTS(SELECT 1 FROM {} WHERE bank=? AND cache_key=?)".format(
++                        _table_name()
++                    ),
++                    (bank, key),
++                )
++            return bool(cur.fetchone()[0])
++    except sqlite3.Error as exc:
++        raise SaltCacheError(f"There was an error checking {bank}/{key or ''}: {exc}")
+diff --git a/tests/pytests/functional/cache/test_sqlite.py b/tests/pytests/functional/cache/test_sqlite.py
+new file mode 100644
+index 0000000..61986f7
+--- /dev/null
++++ b/tests/pytests/functional/cache/test_sqlite.py
+@@ -0,0 +1,46 @@
++import logging
++
++import pytest
++
++import salt.cache
++from tests.pytests.functional.cache.helpers import run_common_cache_tests
++
++log = logging.getLogger(__name__)
++
++
++@pytest.fixture
++def cache(minion_opts, tmp_path):
++    opts = minion_opts.copy()
++    opts["cache"] = "sqlite"
++    opts["sqlite_cache.database"] = str(tmp_path / "cache.sqlite3")
++    cache = salt.cache.factory(opts)
++    return cache
++
++
++def test_caching(subtests, cache):
++    run_common_cache_tests(subtests, cache)
++
++
++def test_data_survives_a_new_cache_instance(cache):
++    """
++    Simulate a master restart: a brand new Cache/backend-module instance
++    pointed at the same database file must still see previously stored
++    data.
++    """
++    cache.store("minions/alpha", "data", {"grains": {"os": "Linux"}})
++
++    restarted_cache = salt.cache.factory(cache.opts)
++    assert restarted_cache.fetch("minions/alpha", "data") == {
++        "grains": {"os": "Linux"}
++    }
++
++
++def test_default_database_lives_under_cachedir(minion_opts, tmp_path):
++    opts = minion_opts.copy()
++    opts["cache"] = "sqlite"
++    opts["cachedir"] = str(tmp_path)
++
++    cache = salt.cache.factory(opts)
++    cache.store("bank", "key", "value")
++
++    assert (tmp_path / "cache.sqlite3").exists()
+diff --git a/tests/pytests/unit/cache/test_sqlite_cache.py b/tests/pytests/unit/cache/test_sqlite_cache.py
+new file mode 100644
+index 0000000..b032eb1
+--- /dev/null
++++ b/tests/pytests/unit/cache/test_sqlite_cache.py
+@@ -0,0 +1,98 @@
++"""
++Validate the functions in the sqlite_cache cache
++"""
++
++import os
++
++import pytest
++
++import salt.cache.sqlite_cache as sqlite_cache
++from salt.exceptions import SaltCacheError
++from tests.support.mock import patch
++
++
++@pytest.fixture
++def configure_loader_modules():
++    return {sqlite_cache: {}}
++
++
++@pytest.fixture
++def opts(tmp_path):
++    return {
++        "cachedir": str(tmp_path),
++        "sqlite_cache.database": str(tmp_path / "cache.sqlite3"),
++    }
++
++
++def test_store_and_fetch(opts):
++    with patch.dict(sqlite_cache.__opts__, opts):
++        sqlite_cache.store(bank="bank", key="key", data={"some": "data"})
++        assert sqlite_cache.fetch(bank="bank", key="key") == {"some": "data"}
++
++
++def test_fetch_missing_key_returns_empty_dict(opts):
++    with patch.dict(sqlite_cache.__opts__, opts):
++        assert sqlite_cache.fetch(bank="bank", key="nope") == {}
++
++
++def test_contains(opts):
++    with patch.dict(sqlite_cache.__opts__, opts):
++        assert sqlite_cache.contains(bank="bank", key="key") is False
++        assert sqlite_cache.contains(bank="bank", key=None) is False
++
++        sqlite_cache.store(bank="bank", key="key", data="value")
++
++        assert sqlite_cache.contains(bank="bank", key="key") is True
++        assert sqlite_cache.contains(bank="bank", key=None) is True
++        assert sqlite_cache.contains(bank="bank", key="other") is False
++
++
++def test_list_and_flush(opts):
++    with patch.dict(sqlite_cache.__opts__, opts):
++        sqlite_cache.store(bank="bank", key="k1", data=1)
++        sqlite_cache.store(bank="bank", key="k2", data=2)
++        assert set(sqlite_cache.ls(bank="bank")) == {"k1", "k2"}
++
++        assert sqlite_cache.flush(bank="bank", key="k1") is True
++        assert set(sqlite_cache.ls(bank="bank")) == {"k2"}
++
++        assert sqlite_cache.flush(bank="bank", key=None) is True
++        assert sqlite_cache.ls(bank="bank") == []
++
++
++def test_flush_nonexistent_key_returns_false(opts):
++    with patch.dict(sqlite_cache.__opts__, opts):
++        assert sqlite_cache.flush(bank="bank", key="nope") is False
++
++
++def test_updated(opts):
++    with patch.dict(sqlite_cache.__opts__, opts):
++        assert sqlite_cache.updated(bank="bank", key="key") is None
++        sqlite_cache.store(bank="bank", key="key", data="value")
++        assert isinstance(sqlite_cache.updated(bank="bank", key="key"), int)
++
++
++def test_database_defaults_under_cachedir(opts, tmp_path):
++    opts_without_database = {"cachedir": opts["cachedir"]}
++    with patch.dict(sqlite_cache.__opts__, opts_without_database):
++        sqlite_cache.store(bank="bank", key="key", data="value")
++        assert (tmp_path / "cache.sqlite3").exists()
++
++
++def test_data_persists_across_reconnects(opts):
++    """
++    Simulate a master restart: dropping the cached connection and
++    reconnecting must still see data written before the "restart".
++    """
++    with patch.dict(sqlite_cache.__opts__, opts):
++        sqlite_cache.store(bank="bank", key="key", data="value")
++        sqlite_cache.force_reconnect()
++        assert sqlite_cache.fetch(bank="bank", key="key") == "value"
++
++
++def test_connect_error_raises_salt_cache_error(opts):
++    with patch.dict(sqlite_cache.__opts__, opts):
++        with patch("os.makedirs", side_effect=OSError("boom")):
++            with patch("os.path.isdir", return_value=False):
++                with pytest.raises(SaltCacheError):
++                    sqlite_cache.store(bank="bank", key="key", data="value")

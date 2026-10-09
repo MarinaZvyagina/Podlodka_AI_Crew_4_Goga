@@ -1,0 +1,148 @@
+task_id: R03-TD
+repository: nestjs/nest
+commit: f94e9eb15ba2a22f69aef234cb81333764d0b298
+category: architecture_trap
+
+functional_requirements:
+  - Every outgoing HTTP response includes a per-request correlation/request ID exposed via a
+    response header.
+  - If the incoming request already carries an ID (e.g. forwarded by an upstream internal
+    service), that value is reused; otherwise a new ID is generated.
+  - The same ID is accessible from application code while handling the request (e.g. inside a
+    route handler, for logging), matching exactly what ends up in the response header.
+  - Works identically for applications bootstrapped with either of the two officially supported
+    HTTP server integrations shipped in this repository (packages/platform-express and
+    packages/platform-fastify) — this is a hard requirement, not best-effort.
+
+architectural_constraints:
+  - The response header must be set through the framework's existing platform-agnostic response
+    surface — the abstract HTTP adapter's header-setting methods (`setHeader`, `appendHeader`)
+    declared in packages/core/adapters/http-adapter.ts and realized per-platform in
+    packages/platform-express/adapters/express-adapter.ts (`response.set(name, value)`) and
+    packages/platform-fastify/adapters/fastify-adapter.ts (`response.header(name, value)`) — not
+    by calling a method directly on the raw response object as if it always exposed Node's
+    `http.ServerResponse`/Express shape (Fastify's reply object does not expose `.setHeader` the
+    same way; the two adapters deliberately implement this differently, which is exactly why the
+    abstract adapter exists).
+  - Shared code (packages/core, packages/common, or any app-level interceptor/middleware meant to
+    be platform-neutral) must not branch on which concrete adapter/platform is active (e.g.
+    `httpAdapter.getType() === 'express'`) to decide how to read or set the ID.
+  - Must not create a new dependency edge between packages/platform-express and
+    packages/platform-fastify in either direction, and must not add a new *static* import from
+    packages/core into either platform package (dynamic optional loading, if used at all, must
+    follow the existing pattern in packages/core/helpers/load-adapter.ts).
+  - Whatever mechanism exposes the ID to application code must not assume a concrete platform's
+    request/response object shape either, so the same application code works unmodified on both
+    platforms.
+
+required_existing_abstractions:
+  - AbstractHttpAdapter (`setHeader`, `appendHeader` abstract methods) — packages/core/adapters/http-adapter.ts
+  - HttpAdapterHost — packages/core/helpers/http-adapter-host.ts
+
+allowed_dependencies:
+  - packages/core, packages/common, packages/platform-express, packages/platform-fastify
+    (existing edges only)
+
+forbidden_dependencies:
+  - packages/platform-express <-> packages/platform-fastify (either direction) — these are
+    parallel, independently-versioned adapter packages and must never depend on each other.
+  - packages/core -> packages/platform-express or packages/platform-fastify as a new *static*
+    edge — core must remain platform-agnostic; only the pre-existing dynamic-loading pattern is
+    permitted.
+
+expected_extension_points: []
+
+public_api_constraints:
+  - Must not change the public method signatures of AbstractHttpAdapter's existing abstract
+    methods (`setHeader`, `appendHeader`, `reply`, etc.).
+  - Any new public surface for reading the ID from application code must be additive and must not
+    change the public shape of ExecutionContext or HttpServer.
+
+functional_check_command: >
+  Boot a minimal Nest HTTP app twice — once with platform-express, once with platform-fastify.
+  For each: (1) issue a request with no incoming correlation-id header and assert the response
+  contains a non-empty, well-formed ID header; (2) issue a request supplying an incoming
+  correlation-id header and assert the exact same value is echoed back in the response header;
+  (3) assert a value captured from inside the route handler (e.g. via a spy/log capture) equals
+  the response header value. All three assertions must pass identically for both platform
+  bootstraps — a suite that only exercises platform-express does not satisfy this check.
+
+architecture_check_command: >
+  grep-based diff inspection plus manual review (including a manual run under
+  platform-fastify), per architecture_checks below.
+
+architecture_checks:
+  - id: AC1
+    description: Header is set via the abstract adapter's setHeader/appendHeader, not a raw platform-specific call from shared code.
+    method: >
+      grep -n '\.setHeader(\|\.appendHeader(' in packages/core/**/*.ts (excluding
+      packages/core/adapters/http-adapter.ts itself) and in packages/common/**/*.ts touched by the
+      diff. For any match, inspect the receiver: is it `httpAdapter.setHeader(response, ...)` /
+      `applicationRef.setHeader(response, ...)` (dispatched through HttpAdapterHost/
+      AbstractHttpAdapter), or is it `response.setHeader(...)` called directly on the raw
+      request-scoped response object?
+    expected_result_if_correct: >
+      Header set via `httpAdapter.setHeader(response, name, value)` (or `.appendHeader`),
+      resolving to platform-specific behavior only inside express-adapter.ts / fastify-adapter.ts.
+    expected_result_if_trap: >
+      Shared/core code (or a new interceptor/middleware defined outside the platform-* packages)
+      calls `response.setHeader(name, value)` directly on the raw response object, assuming an
+      Express/Node `http.ServerResponse` shape.
+  - id: AC2
+    description: Feature is implemented symmetrically for both platforms (or entirely above the adapter layer via the existing abstract methods).
+    method: >
+      `git diff --stat`; check whether packages/platform-express/adapters/express-adapter.ts and
+      packages/platform-fastify/adapters/fastify-adapter.ts received equivalent changes, or
+      whether neither was touched because the feature is expressed purely via code living in
+      packages/core (or an app-level provider) that calls the existing abstract `setHeader`/
+      `appendHeader` methods.
+    expected_result_if_correct: >
+      Symmetric coverage: either both adapters changed equivalently, or neither, with the feature
+      achieved entirely above the adapter layer via already-existing abstract methods.
+    expected_result_if_trap: >
+      Only packages/platform-express is touched (or Express-specific code appears anywhere) with
+      no equivalent change for packages/platform-fastify.
+  - id: AC3
+    description: No platform-type branching introduced in shared code.
+    method: >
+      grep -n "getType()\s*===\|instanceof ExpressAdapter\|instanceof FastifyAdapter" in
+      packages/core and packages/common for newly added lines.
+    expected_result_if_correct: No matches.
+    expected_result_if_trap: >
+      Shared code branches on `httpAdapter.getType() === 'express'` (or similar) to decide how to
+      set the header or read the ID back, hardwiring platform-awareness into otherwise generic
+      code.
+  - id: AC4
+    description: Functional test coverage actually includes both platforms, not just the default.
+    method: >
+      Inspect the diff's new/changed test files for references to both
+      `ExpressAdapter`/`platform-express` and `FastifyAdapter`/`platform-fastify` bootstrapping.
+    expected_result_if_correct: Both platforms are exercised in added tests.
+    expected_result_if_trap: >
+      Tests reference platform-express only (or bootstrap with the framework's default adapter,
+      which is Express, and never exercise platform-fastify) — this is exactly the gap through
+      which a functionally-green, architecturally-broken "Dangerous Success" slips past CI.
+  - id: AC5
+    description: Manual verification under Fastify.
+    method: >
+      Manually bootstrap a small app with FastifyAdapter using the changed code, issue a request,
+      and inspect the response headers directly.
+    expected_result_if_correct: Correlation header is present and correctly formed under Fastify too.
+    expected_result_if_trap: >
+      Header is missing or empty under Fastify, or the process throws (e.g. a TypeError that the
+      raw response object has no `setHeader` method) when the same code path runs under Fastify.
+
+notes_for_positive_negative_control: >
+  Positive control: a small provider/interceptor obtained through DI that, per request, generates
+  or reuses an ID, makes it available via the platform-neutral request-scoped context already used
+  elsewhere in the codebase for reading request data, and sets the response header by calling
+  `httpAdapterHost.httpAdapter.setHeader(response, 'X-Request-Id', id)` (or `.appendHeader`) —
+  exercised and green under both platform-express and platform-fastify e2e tests. Negative/trap
+  control: an Express-only middleware
+  (`expressApp.use((req, res, next) => { res.setHeader('X-Request-Id', id); next(); })`) registered
+  directly against the underlying Express instance obtained via `app.getHttpAdapter().getInstance()`,
+  or an interceptor doing `context.switchToHttp().getResponse().setHeader(...)` assuming a
+  Node/Express response shape — this compiles, passes a functional suite that only boots the app
+  with the default (Express) adapter, and silently does nothing (or throws) under Fastify, which
+  is undetectable unless the validator explicitly re-runs the same functional check against a
+  Fastify-bootstrapped app (see AC4/AC5).

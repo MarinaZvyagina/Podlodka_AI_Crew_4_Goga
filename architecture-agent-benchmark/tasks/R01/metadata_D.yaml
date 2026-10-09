@@ -1,0 +1,125 @@
+task_id: R01-TD
+repository: freqtrade/freqtrade
+commit: 936f28e28cbcd4e9e146cbc076c54933517a92eb
+category: architecture_trap
+
+functional_requirements:
+  - "Repeated requests for the same pair's current ticker/price within a short time window (seconds,
+     well below the strategy's candle timeframe) must reuse a cached result instead of issuing a new
+     exchange API call each time."
+  - "Cached entries must expire automatically after a short, bounded TTL — no indefinite/unbounded
+     caching that could serve arbitrarily stale prices."
+  - "Backtesting and hyperopt runs (freqtrade/optimize/backtesting.py, freqtrade/optimize/hyperopt/*),
+     which never call the live ticker endpoint, must be functionally unaffected."
+  - "On a cache miss, the caller-visible behavior (return type/shape, exceptions raised on exchange
+     errors) must be identical to the current, uncached behavior."
+
+architectural_constraints:
+  - "Caching must be added inside the layer that already owns communication with the exchange/ccxt —
+     `Exchange.fetch_ticker()` (freqtrade/exchange/exchange.py, lines 2165-2178, already wrapped by the
+     `@retrier` retry/error-translation decorator) — or the single mediating layer the rest of the bot is
+     required to go through for this data, `DataProvider.ticker()` (freqtrade/data/dataprovider.py, lines
+     565-577, which today calls `self._exchange.fetch_ticker(pair)` on every single call with a docstring
+     warning 'Performs a network request - so use with common sense')."
+  - "`freqtrade/strategy/interface.py` (`IStrategy`, the user-facing strategy base class) must NOT gain a
+     new import of `freqtrade.exchange.Exchange` or any direct exchange access — confirmed today (base
+     commit) that interface.py imports only timeframe helper functions from freqtrade.exchange, never the
+     Exchange class itself, and accesses market data exclusively via `self.dp` (DataProvider)."
+  - "`freqtrade/freqtradebot.py` must not gain new ad hoc, call-site-specific caching logic (e.g. wrapping
+     one particular call to fetch a price with a local cache) — caching must be centralized behind
+     Exchange/DataProvider so every caller benefits and there is exactly one cache to reason about."
+  - "Must reuse the existing short-lived auto-expiring cache utility already used elsewhere in this exact
+     codebase for this exact purpose — `PeriodicCache` (freqtrade/util/periodic_cache.py, a
+     `cachetools.TTLCache` subclass), already imported and used by `DataProvider.__msg_cache`
+     (dataprovider.py line 65-67) and by pairlist handlers such as AgeFilter and ShuffleFilter — rather
+     than a hand-rolled unbounded dict or `functools.lru_cache`/`@cache` (which never expires)."
+  - "Must not bypass or remove the existing `@retrier` decorator around the network call — the cache-miss
+     path must still go through the retried, error-translated `fetch_ticker` implementation, not a raw,
+     new, undecorated call to `self._api.fetch_ticker` (ccxt) added elsewhere."
+  - "If a manually-managed (non-TTLCache) cache structure is used instead, it must integrate with
+     DataProvider's existing pair-data cache-invalidation lifecycle (`__cached_pairs`, `clear_cache()` at
+     dataprovider.py line 443, already called at backtest per-pair reset in
+     freqtrade/optimize/backtesting.py line 505) rather than inventing a second, independent
+     freshness/reset mechanism."
+
+required_existing_abstractions:
+  - "PeriodicCache — freqtrade/util/periodic_cache.py"
+  - "DataProvider.ticker() as the intended single access path for live price data outside Exchange itself — freqtrade/data/dataprovider.py lines 565-577"
+  - "Exchange.fetch_ticker() (@retrier-wrapped) — freqtrade/exchange/exchange.py lines 2164-2178"
+
+allowed_dependencies:
+  - "cachetools (already a project dependency via PeriodicCache/TTLCache usage) — no new third-party
+     dependency should be required."
+
+forbidden_dependencies:
+  - "freqtrade/strategy/ -> freqtrade/exchange/Exchange (direct class access): forbidden. Strategies must
+     keep going through self.dp only; adding this edge is the classic 'reach into internals it shouldn't'
+     violation for this codebase."
+  - "freqtrade/freqtradebot.py must not add a second/independent caching dependency (e.g. importing
+     functools.lru_cache or a new caching library) specifically to wrap exchange price calls — the
+     existing Exchange/DataProvider layer is the single place this concern belongs."
+
+expected_extension_points: []
+
+public_api_constraints:
+  - "Exchange.fetch_ticker(pair) and DataProvider.ticker(pair) signatures and return types must be
+     unchanged (same Ticker type, same exceptions on failure) so all existing callers keep working
+     without modification."
+
+functional_check_command: >
+  New/extended tests mirroring tests/exchange/test_exchange.py's and tests/data/test_dataprovider.py's
+  existing patterns: (1) mock the underlying ccxt fetch_ticker call, call
+  exchange.fetch_ticker(pair)/dataprovider.ticker(pair) twice in quick succession for the same pair, and
+  assert the underlying mock was invoked only once (cache hit on the second call); (2) advance time past
+  the configured TTL (e.g. via freezegun, already used elsewhere in this test suite) and call again,
+  asserting the underlying mock is invoked a second time (cache correctly expired, not serving stale
+  data indefinitely); (3) run the existing `pytest tests/optimize/test_backtesting.py` suite unchanged and
+  confirm no regressions, verifying backtesting behavior is unaffected.
+
+architecture_check_command: "See architecture_checks below."
+
+architecture_checks:
+  - id: AC1
+    description: "No new direct Exchange access was added to the strategy layer."
+    method: "grep -n 'from freqtrade.exchange import Exchange\\|freqtrade\\.exchange\\.Exchange\\|self\\._exchange' freqtrade/strategy/interface.py and any other freqtrade/strategy/*.py files changed in the diff; compare against the base-commit import list (only timeframe_to_minutes/timeframe_to_next_date/timeframe_to_seconds should be imported from freqtrade.exchange)."
+    expected_result_if_correct: "No new Exchange import or self._exchange usage in freqtrade/strategy/."
+    expected_result_if_trap: "freqtrade/strategy/interface.py (or a strategy helper) imports Exchange directly and implements its own ticker cache there, or is handed a reference to the live Exchange instance to cache against."
+  - id: AC2
+    description: "Caching logic is centralized in Exchange.fetch_ticker or DataProvider.ticker, not scattered at call sites."
+    method: "git diff --stat; confirm the caching implementation (new cache attribute + lookup/store logic) appears inside freqtrade/exchange/exchange.py's fetch_ticker method or freqtrade/data/dataprovider.py's ticker method, and grep the rest of the diff for any second, independent cache dict/decorator added near unrelated call sites (e.g. inside freqtradebot.py or rpc.py)."
+    expected_result_if_correct: "Exactly one cache, defined and consulted entirely within Exchange or DataProvider."
+    expected_result_if_trap: "A cache (or memoization decorator) is added directly around a specific call site in freqtrade/freqtradebot.py or freqtrade/rpc/rpc.py, duplicating/bypassing the shared Exchange/DataProvider layer for that one caller only."
+  - id: AC3
+    description: "The cache is bounded/expiring, not a permanently-frozen cache."
+    method: "grep -n 'lru_cache\\|@cache\\b\\|functools\\.cache' across the diff — none should appear wrapping the price-fetch path. Separately, confirm a TTL/expiry parameter (PeriodicCache/TTLCache ttl=..., or an explicit timestamp comparison with a short bound such as a few seconds) is present in the new caching code."
+    expected_result_if_correct: "Cache uses PeriodicCache/TTLCache (or an equivalent explicit short TTL check) — no lru_cache/@cache present."
+    expected_result_if_trap: "functools.lru_cache or @cache (or an unbounded plain dict with no expiry logic at all) is used to memoize fetch_ticker/ticker results, meaning the first fetched price for a pair is returned forever afterward."
+  - id: AC4
+    description: "The @retrier-decorated network call path is preserved on cache miss; no undecorated bypass call was introduced."
+    method: "Manual review of freqtrade/exchange/exchange.py's fetch_ticker method diff: confirm the @retrier decorator line is still present directly above `def fetch_ticker`, and that the cache-miss branch still calls through the same decorated method body (self._api.fetch_ticker via the existing try/except ccxt error translation), not a new bare call to self._api.fetch_ticker added elsewhere without the decorator/error handling."
+    expected_result_if_correct: "@retrier still directly decorates fetch_ticker; error translation (DDosProtection/TemporaryError/OperationalException handling) unchanged."
+    expected_result_if_trap: "A new, undecorated helper method or inline call to self._api.fetch_ticker is added to implement the cache-miss path, silently dropping retry/error-translation behavior for cached lookups."
+  - id: AC5
+    description: "If a manual (non-TTLCache) cache dict was used, it participates in DataProvider's existing clear_cache() lifecycle rather than a bespoke reset."
+    method: "grep -n 'clear_cache' freqtrade/data/dataprovider.py — if a new cache dict was added to DataProvider (as opposed to using PeriodicCache's self-expiry, or adding the cache to Exchange instead), confirm it is reset inside the existing clear_cache() method rather than through a newly introduced separate reset function."
+    expected_result_if_correct: "New dict-based cache (if used at all) is cleared by the existing clear_cache() method; OR caching lives in Exchange/uses PeriodicCache, making this check not applicable (accepted as pass by inspection)."
+    expected_result_if_trap: "A new, separate reset/invalidation method is added (e.g. DataProvider.clear_ticker_cache()) that nothing calls, or that duplicates clear_cache()'s responsibility inconsistently."
+  - id: AC6
+    description: "Backtesting/hyperopt are unaffected."
+    method: "pytest tests/optimize/test_backtesting.py tests/optimize/test_hyperopt.py — must pass unchanged; additionally confirm no new import from freqtrade/optimize/ into the new caching code specific to live ticker fetching."
+    expected_result_if_correct: "Backtesting/hyperopt test suites pass without modification; no coupling introduced between optimize/ and the new cache."
+    expected_result_if_trap: "Backtesting tests fail or needed modification because the new caching logic was accidentally invoked in, or interfered with, the backtest simulation path."
+
+notes_for_positive_negative_control: >
+  Trap (functional-pass / architecture-fail): wrap DataProvider.ticker() or a freqtradebot.py call site
+  with `functools.lru_cache`, or give IStrategy its own `self._exchange` reference and a hand-rolled
+  `self._ticker_cache = {}` dict populated inside interface.py, with no TTL/expiry at all. A crude
+  functional test that just counts exchange calls before/after two rapid successive requests would show
+  the call count drop from 2 to 1 and "pass" — but every subsequent request for that pair, forever
+  afterward (or until process restart), would silently return the first-ever fetched price: a live-trading
+  bot making entry/exit decisions on a frozen, arbitrarily stale price. It also creates a second exchange
+  access path outside Exchange/DataProvider (if implemented via a new self._exchange on IStrategy),
+  violating the strategy layer's existing boundary. Correct (functional-pass / architecture-pass): a
+  PeriodicCache (or equivalent short, explicit TTL) added inside Exchange.fetch_ticker or
+  DataProvider.ticker, cache-miss path still routed through the @retrier-decorated network call, no new
+  strategy-layer exchange access, backtesting untouched.

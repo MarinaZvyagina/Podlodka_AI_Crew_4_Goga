@@ -1,0 +1,246 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+index f47eddb..6259dce 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+@@ -62,6 +62,9 @@ public class SearchRepository {
+ 
+   private static final int MAX_SNIPPET_SIZE = 100;
+ 
++  private static final SearchResultCache resultCache             = new SearchResultCache();
++  private static volatile boolean        cacheInvalidationLinked = false;
++
+   private final Context           context;
+   private final String            noteToSelfTitle;
+   private final SearchTable       searchDatabase;
+@@ -81,10 +84,33 @@ public class SearchRepository {
+     this.mentionTable      = SignalDatabase.mentions();
+     this.messageTable      = SignalDatabase.messages();
+     this.serialExecutor    = new SerialExecutor(SignalExecutors.BOUNDED);
++
++    linkCacheInvalidation();
++  }
++
++  /**
++   * Registers {@link #resultCache} for invalidation the first time a {@link SearchRepository} is
++   * constructed. Done lazily (rather than in a static initializer) so referencing purely static
++   * helpers on this class doesn't require {@link AppDependencies} to be initialized.
++   */
++  private static void linkCacheInvalidation() {
++    if (!cacheInvalidationLinked) {
++      synchronized (SearchRepository.class) {
++        if (!cacheInvalidationLinked) {
++          AppDependencies.getDatabaseObserver().registerConversationListObserver(resultCache::clear);
++          cacheInvalidationLinked = true;
++        }
++      }
++    }
+   }
+ 
+   @WorkerThread
+   public @NonNull ThreadSearchResult queryThreadsSync(@NonNull String query, boolean unreadOnly) {
++    ThreadSearchResult cached = resultCache.getThreads(query, unreadOnly);
++    if (cached != null) {
++      return cached;
++    }
++
+     SignalTrace.beginSection("ConversationListSearch-Threads");
+     try {
+       long                      start  = System.currentTimeMillis();
+@@ -92,7 +118,9 @@ public class SearchRepository {
+ 
+       Log.d(TAG, "[threads] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new ThreadSearchResult(result, query);
++      ThreadSearchResult searchResult = new ThreadSearchResult(result, query);
++      resultCache.putThreads(query, unreadOnly, searchResult);
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -100,6 +128,11 @@ public class SearchRepository {
+ 
+   @WorkerThread
+   public @NonNull MessageSearchResult queryMessagesSync(@NonNull String query, @NonNull SearchFilter filter) {
++    MessageSearchResult cached = resultCache.getMessages(query, filter);
++    if (cached != null) {
++      return cached;
++    }
++
+     SignalTrace.beginSection("ConversationListSearch-Messages");
+     try {
+       long start = System.currentTimeMillis();
+@@ -111,7 +144,9 @@ public class SearchRepository {
+ 
+       Log.d(TAG, "[messages] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new MessageSearchResult(combined, query);
++      MessageSearchResult searchResult = new MessageSearchResult(combined, query);
++      resultCache.putMessages(query, filter, searchResult);
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/search/SearchResultCache.java b/app/src/main/java/org/thoughtcrime/securesms/search/SearchResultCache.java
+new file mode 100644
+index 0000000..f2eae36
+--- /dev/null
++++ b/app/src/main/java/org/thoughtcrime/securesms/search/SearchResultCache.java
+@@ -0,0 +1,62 @@
++/*
++ * Copyright 2026 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++package org.thoughtcrime.securesms.search;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++
++import org.signal.core.util.LRUCache;
++
++import java.util.AbstractMap;
++import java.util.Map;
++
++/**
++ * Memoizes {@link SearchRepository} results by (query, filter) so repeating an identical search
++ * is served from memory instead of re-running the underlying database query.
++ * <p>
++ * Callers own invalidation: {@link #clear()} must be invoked whenever data that could affect
++ * search results changes, since this cache has no way to know which cached queries a given
++ * write might affect.
++ */
++public class SearchResultCache {
++
++  private static final int DEFAULT_MAX_ENTRIES = 20;
++
++  private final Object                                                        lock         = new Object();
++  private final LRUCache<Map.Entry<String, SearchFilter>, MessageSearchResult> messageCache = new LRUCache<>(DEFAULT_MAX_ENTRIES);
++  private final LRUCache<Map.Entry<String, Boolean>, ThreadSearchResult>       threadCache  = new LRUCache<>(DEFAULT_MAX_ENTRIES);
++
++  public @Nullable MessageSearchResult getMessages(@NonNull String query, @NonNull SearchFilter filter) {
++    synchronized (lock) {
++      return messageCache.get(new AbstractMap.SimpleImmutableEntry<>(query, filter));
++    }
++  }
++
++  public void putMessages(@NonNull String query, @NonNull SearchFilter filter, @NonNull MessageSearchResult result) {
++    synchronized (lock) {
++      messageCache.put(new AbstractMap.SimpleImmutableEntry<>(query, filter), result);
++    }
++  }
++
++  public @Nullable ThreadSearchResult getThreads(@NonNull String query, boolean unreadOnly) {
++    synchronized (lock) {
++      return threadCache.get(new AbstractMap.SimpleImmutableEntry<>(query, unreadOnly));
++    }
++  }
++
++  public void putThreads(@NonNull String query, boolean unreadOnly, @NonNull ThreadSearchResult result) {
++    synchronized (lock) {
++      threadCache.put(new AbstractMap.SimpleImmutableEntry<>(query, unreadOnly), result);
++    }
++  }
++
++  /** Drops all cached results. Must be called whenever messages/conversations may have changed. */
++  public void clear() {
++    synchronized (lock) {
++      messageCache.clear();
++      threadCache.clear();
++    }
++  }
++}
+diff --git a/app/src/test/java/org/thoughtcrime/securesms/search/SearchResultCacheTest.kt b/app/src/test/java/org/thoughtcrime/securesms/search/SearchResultCacheTest.kt
+new file mode 100644
+index 0000000..792e949
+--- /dev/null
++++ b/app/src/test/java/org/thoughtcrime/securesms/search/SearchResultCacheTest.kt
+@@ -0,0 +1,90 @@
++/*
++ * Copyright 2026 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.search
++
++import assertk.assertThat
++import assertk.assertions.isNotNull
++import assertk.assertions.isNull
++import assertk.assertions.isSameAs
++import org.junit.Test
++
++class SearchResultCacheTest {
++
++  @Test
++  fun getMessagesMissesUntilPut() {
++    val cache = SearchResultCache()
++
++    assertThat(cache.getMessages("hello", SearchFilter.EMPTY)).isNull()
++
++    val result = MessageSearchResult(emptyList(), "hello")
++    cache.putMessages("hello", SearchFilter.EMPTY, result)
++
++    assertThat(cache.getMessages("hello", SearchFilter.EMPTY)).isSameAs(result)
++  }
++
++  @Test
++  fun getMessagesIsIndependentPerQuery() {
++    val cache = SearchResultCache()
++    cache.putMessages("hello", SearchFilter.EMPTY, MessageSearchResult(emptyList(), "hello"))
++
++    assertThat(cache.getMessages("goodbye", SearchFilter.EMPTY)).isNull()
++  }
++
++  @Test
++  fun getMessagesIsIndependentPerFilter() {
++    val cache = SearchResultCache()
++    val filterA = SearchFilter.EMPTY
++    val filterB = SearchFilter(startDate = 1000L)
++
++    cache.putMessages("hello", filterA, MessageSearchResult(emptyList(), "hello"))
++
++    assertThat(cache.getMessages("hello", filterB)).isNull()
++  }
++
++  @Test
++  fun getThreadsMissesUntilPut() {
++    val cache = SearchResultCache()
++
++    assertThat(cache.getThreads("hello", false)).isNull()
++
++    val result = ThreadSearchResult(emptyList(), "hello")
++    cache.putThreads("hello", false, result)
++
++    assertThat(cache.getThreads("hello", false)).isSameAs(result)
++  }
++
++  @Test
++  fun getThreadsIsIndependentPerUnreadFlag() {
++    val cache = SearchResultCache()
++    cache.putThreads("hello", false, ThreadSearchResult(emptyList(), "hello"))
++
++    assertThat(cache.getThreads("hello", true)).isNull()
++  }
++
++  @Test
++  fun clearRemovesAllCachedEntries() {
++    val cache = SearchResultCache()
++    cache.putMessages("hello", SearchFilter.EMPTY, MessageSearchResult(emptyList(), "hello"))
++    cache.putThreads("hello", false, ThreadSearchResult(emptyList(), "hello"))
++
++    cache.clear()
++
++    assertThat(cache.getMessages("hello", SearchFilter.EMPTY)).isNull()
++    assertThat(cache.getThreads("hello", false)).isNull()
++  }
++
++  @Test
++  fun evictsLeastRecentlyUsedEntryPastCapacity() {
++    val cache = SearchResultCache()
++
++    for (i in 0 until 21) {
++      cache.putMessages("query$i", SearchFilter.EMPTY, MessageSearchResult(emptyList(), "query$i"))
++    }
++
++    assertThat(cache.getMessages("query0", SearchFilter.EMPTY)).isNull()
++    assertThat(cache.getMessages("query20", SearchFilter.EMPTY)).isNotNull()
++  }
++}

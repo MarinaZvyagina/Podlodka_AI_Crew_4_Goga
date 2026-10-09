@@ -1,0 +1,132 @@
+diff --git a/docs/arch/maintenance-mode.md b/docs/arch/maintenance-mode.md
+new file mode 100644
+index 0000000..95db67e
+--- /dev/null
++++ b/docs/arch/maintenance-mode.md
+@@ -0,0 +1,126 @@
++# Architecture Plan: Maintenance Mode
++
++## Problem
++
++Individual route handlers/controllers and WebSocket message handlers need to be markable
++as "affected by maintenance mode". A runtime-toggleable flag (no redeploy) determines
++whether marked handlers currently reject calls before their logic runs. Unmarked handlers
++must be unaffected. One mechanism must cover both HTTP and WS.
++
++## Key finding driving the design
++
++Guards (`CanActivate` + `ExecutionContext`) are already the single mechanism Nest uses to
++gate handler execution for **both** transports, ahead of the handler body:
++
++- HTTP: `packages/core/router` (`RouterExecutionContext`) resolves guards via
++  `core/guards` (`GuardsContextCreator`) and evaluates them via `GuardsConsumer.tryActivate`
++  before invoking the handler.
++- WS: `packages/websockets/context/ws-context-creator.ts` (`WsContextCreator`) resolves
++  guards through the *same* `core/guards` classes and calls
++  `fnCanActivate(args)` — which wraps `GuardsConsumer.tryActivate` — before
++  `interceptorsConsumer.intercept(...)` runs the message handler.
++
++`GuardsConsumer.tryActivate` calls `guard.canActivate(context)` with no try/catch, so an
++exception thrown by a guard propagates to the caller unmodified. Each transport already
++has its own exception-handling layer downstream (HTTP exception filters / WS
++`exceptionHandler` in `wsProxy.create`), so a guard that **throws** an `HttpException`
++subclass is reported correctly on both transports without either cell needing to know
++about maintenance mode.
++
++Consequence: maintenance mode needs no changes to `core/router`, `core/guards`, or
++`packages/websockets/context` — it is implemented entirely as a new `CanActivate`
++guard plus a decorator, consumed the same way any other guard already is
++(`@UseGuards(...)` per-handler/class, or `APP_GUARD` globally).
++
++## Dependency direction constraint
++
++`packages/common` has zero dependency on `packages/core` (verified via `package.json`);
++`packages/core` depends on `@nestjs/common`. `Reflector` lives in `packages/core/services`.
++Therefore the metadata-setting decorator (no `Reflector` needed — same `SetMetadata`-style
++pattern as `packages/common/decorators/core/use-guards.decorator.ts`) must live in
++`packages/common`, while the guard (needs `Reflector`) must live in `packages/core`.
++
++## New cells
++
++### 1. `packages/common/maintenance` (leaf — no cell dependencies)
++
++```yaml
++"Maintainable() -> decorator: CustomDecorator<string>":
++  location: maintainable.decorator.ts
++  # Routine. Method/class decorator, same construction pattern as SetMetadata:
++  # Reflect.defineMetadata on descriptor.value (method) or target (class).
++  # Exposes its metadata key as `.KEY` (CustomDecorator convention already
++  # used by SetMetadata in this codebase) so packages/core/maintenance can
++  # read it via Reflector without duplicating the key string.
++
++"MaintenanceModeState()":
++  location: maintenance-mode-state.ts
++  # Entity. @Injectable(). In-memory toggle, starts disabled.
++  methods:
++    "enable()": turn maintenance mode on
++    "disable()": turn maintenance mode off
++    "isEnabled() -> enabled:boolean": current state
++```
++
++No `Imports` — mirrors `packages/core/adapters` as the other zero-dependency cell in
++this project.
++
++### 2. `packages/core/maintenance` (depends on `common/maintenance`, `common/exceptions`)
++
++```yaml
++Imports:
++  - Types:
++      - Maintainable
++      - MaintenanceModeState
++    From: packages/common/maintenance
++  - Types:
++      - ServiceUnavailableException
++    From: packages/common/exceptions
++
++"MaintenanceGuard(state: MaintenanceModeState)":
++  location: maintenance.guard.ts
++  # Entity implementing CanActivate (ambient common/interfaces type, same
++  # convention as core/guards: not tracked via formal Imports).
++  # Constructor also takes a core-native Reflector (packages/core/services,
++  # undocumented cell, same precedent as core/guards' own dependencies).
++  methods:
++    "canActivate(context: ExecutionContext) -> allowed:boolean":
++      Algorithm:
++      1. reflector.getAllAndOverride(Maintainable.KEY, [context.getHandler(), context.getClass()])
++      2. Not marked -> return true
++      3. Marked and state.isEnabled() is false -> return true
++      4. Marked and state.isEnabled() is true -> throw ServiceUnavailableException
++```
++
++Consumers apply `@Maintainable()` to a method or controller class, and register
++`MaintenanceGuard` the normal way (`@UseGuards(MaintenanceGuard)` locally, or
++`{ provide: APP_GUARD, useClass: MaintenanceGuard }` globally — global registration
++means the guard runs for every handler but only ever denies the ones carrying
++`@Maintainable()`). Same decorator, same guard class, same registration story for
++HTTP controllers and WS gateways.
++
++## Unit testability
++
++`MaintenanceGuard` is a plain class (`new MaintenanceGuard(new MaintenanceModeState())`
++plus a `Reflector`). Tests decorate a throwaway class/method with `@Maintainable()`,
++build a minimal fake `ExecutionContext` (`getHandler`/`getClass` stubs — no HTTP
++server, no socket), toggle `state.enable()/disable()`, and assert `canActivate()`
++rejects only for the marked target. This is the same test shape `core/guards` already
++uses for `GuardsConsumer`/`GuardsContextCreator`.
++
++## Dependency diagram
++
++```
++packages/common/maintenance   packages/common/exceptions
++        |                              |
++        +---------------+--------------+
++                         |
++              packages/core/maintenance
++                         |
++        (consumed like any CanActivate: @UseGuards / APP_GUARD)
++                         |
++        +----------------+----------------+
++        |                                 |
++packages/core/router              packages/websockets/context
++(HTTP, unchanged)                 (WS, unchanged)
++```

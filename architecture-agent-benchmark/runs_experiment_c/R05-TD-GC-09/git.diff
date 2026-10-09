@@ -1,0 +1,996 @@
+diff --git a/app/vmstorage/main.go b/app/vmstorage/main.go
+index 5409201..d23d474 100644
+--- a/app/vmstorage/main.go
++++ b/app/vmstorage/main.go
+@@ -1,6 +1,7 @@
+ package vmstorage
+ 
+ import (
++	"encoding/json"
+ 	"flag"
+ 	"fmt"
+ 	"io"
+@@ -104,12 +105,20 @@ var (
+ 	cacheSizeMetricNamesStats = flagutil.NewBytes("storage.cacheSizeMetricNamesStats", 0, "Overrides max size for storage/metricNamesStatsTracker cache. "+
+ 		"See https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#cache-tuning")
+ 
++	trackDroppedSeriesNames = flag.Bool("storage.trackDroppedSeriesNames", true, "Whether to track which metric names had samples dropped because of "+
++		"-storage.maxHourlySeries or -storage.maxDailySeries. This only has effect when one of these flags is set. "+
++		"See /internal/rejected_series_names for accessing the collected data")
++	cacheSizeDroppedSeriesNames = flagutil.NewBytes("storage.cacheSizeDroppedSeriesNames", 0, "Overrides max size for storage/droppedSeriesNamesTracker cache. "+
++		"See https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#cache-tuning")
++
+ 	idbPrefillStart = flag.Duration("storage.idbPrefillStart", time.Hour, "Specifies how early VictoriaMetrics starts pre-filling indexDB records before indexDB rotation. "+
+ 		"Starting the pre-fill process earlier can help reduce resource usage spikes during rotation. "+
+ 		"In most cases, this value should not be changed. The maximum allowed value is 23h.")
+ 
+ 	logNewSeriesAuthKey = flagutil.NewPassword("logNewSeriesAuthKey", "authKey, which must be passed in query string to /internal/log_new_series. It overrides -httpAuth.*")
+ 
++	rejectedSeriesNamesResetAuthKey = flagutil.NewPassword("rejectedSeriesNamesResetAuthKey", "authKey, which must be passed in query string to /internal/rejected_series_names/reset. It overrides -httpAuth.*")
++
+ 	metadataStorageSize = flagutil.NewBytes("storage.maxMetadataStorageSize", 0, "Overrides max size for metrics metadata entries in-memory storage. "+
+ 		"If set to 0 or a negative value, defaults to 1% of allowed memory.")
+ )
+@@ -131,6 +140,7 @@ func Init(vmselectMaxConcurrentRequests int, vmselectMaxQueueDuration time.Durat
+ 	}
+ 	storage.SetFinalDedupScheduleInterval(*finalDedupScheduleInterval)
+ 	storage.SetMetricNamesStatsCacheSize(cacheSizeMetricNamesStats.IntN())
++	storage.SetDroppedSeriesNamesCacheSize(cacheSizeDroppedSeriesNames.IntN())
+ 	storage.SetMetricNameCacheSize(cacheSizeStorageMetricName.IntN())
+ 	storage.SetMetadataStorageSize(metadataStorageSize.IntN())
+ 	mergeset.SetIndexBlocksCacheSize(cacheSizeIndexDBIndexBlocks.IntN())
+@@ -160,6 +170,7 @@ func Init(vmselectMaxConcurrentRequests int, vmselectMaxQueueDuration time.Durat
+ 		MaxDailySeries:              getMaxDailySeries(),
+ 		DisablePerDayIndex:          *disablePerDayIndex,
+ 		TrackMetricNamesStats:       *trackMetricNamesStats,
++		TrackDroppedSeriesNames:     *trackDroppedSeriesNames,
+ 		IDBPrefillStart:             *idbPrefillStart,
+ 		LogNewSeries:                *logNewSeries,
+ 	}
+@@ -296,6 +307,37 @@ func (vms *VMStorage) requestHandler(w http.ResponseWriter, r *http.Request) boo
+ 		fmt.Fprintf(w, `{"status":"success","data":{"logEndTime":%q}}`, time.Unix(int64(endTime), 0))
+ 		return true
+ 	}
++
++	if path == "/internal/rejected_series_names" {
++		limit := 10
++		if limitStr := r.FormValue("limit"); len(limitStr) > 0 {
++			n, err := strconv.Atoi(limitStr)
++			if err != nil {
++				jsonResponseError(w, fmt.Errorf("cannot parse `limit` arg %q: %w", limitStr, err))
++				return true
++			}
++			limit = n
++		}
++		rejectedSeriesNamesRequests.Inc()
++		result := vms.s.GetDroppedSeriesNamesStats(limit)
++		w.Header().Set("Content-Type", "application/json")
++		data, err := json.Marshal(result)
++		if err != nil {
++			logger.Panicf("BUG: cannot marshal dropped series names stats: %s", err)
++		}
++		w.Write(data)
++		return true
++	}
++	if path == "/internal/rejected_series_names/reset" {
++		if !httpserver.CheckAuthFlag(w, r, rejectedSeriesNamesResetAuthKey) {
++			return true
++		}
++		rejectedSeriesNamesResetRequests.Inc()
++		vms.s.ResetDroppedSeriesNamesStats()
++		w.WriteHeader(http.StatusNoContent)
++		return true
++	}
++
+ 	prometheusCompatibleResponse := false
+ 	if path == "/api/v1/admin/tsdb/snapshot" {
+ 		// Handle Prometheus API - https://prometheus.io/docs/prometheus/latest/querying/api/#snapshot .
+@@ -377,6 +419,9 @@ func (vms *VMStorage) requestHandler(w http.ResponseWriter, r *http.Request) boo
+ }
+ 
+ var (
++	rejectedSeriesNamesRequests      = metrics.NewCounter(`vm_http_requests_total{path="/internal/rejected_series_names"}`)
++	rejectedSeriesNamesResetRequests = metrics.NewCounter(`vm_http_requests_total{path="/internal/rejected_series_names/reset"}`)
++
+ 	activeForceMerges = metrics.NewCounter("vm_active_force_merges")
+ 
+ 	snapshotsCreateTotal = metrics.NewCounter(`vm_http_requests_total{path="/snapshot/create"}`)
+@@ -618,6 +663,12 @@ func (vms *VMStorage) writeStorageMetrics(w io.Writer) {
+ 		metrics.WriteCounterUint64(w, `vm_cache_size_max_bytes{type="storage/metricNamesStatsTracker"}`, m.MetricNamesUsageTrackerSizeMaxBytes)
+ 	}
+ 
++	if *trackDroppedSeriesNames && (getMaxHourlySeries() > 0 || getMaxDailySeries() > 0) {
++		metrics.WriteCounterUint64(w, `vm_cache_size_bytes{type="storage/droppedSeriesNamesTracker"}`, m.DroppedSeriesNamesTrackerSizeBytes)
++		metrics.WriteCounterUint64(w, `vm_cache_size{type="storage/droppedSeriesNamesTracker"}`, m.DroppedSeriesNamesTrackerSize)
++		metrics.WriteCounterUint64(w, `vm_cache_size_max_bytes{type="storage/droppedSeriesNamesTracker"}`, m.DroppedSeriesNamesTrackerSizeMaxBytes)
++	}
++
+ 	metrics.WriteGaugeUint64(w, `vm_downsampling_partitions_scheduled`, tm.ScheduledDownsamplingPartitions)
+ 	metrics.WriteGaugeUint64(w, `vm_downsampling_partitions_scheduled_size_bytes`, tm.ScheduledDownsamplingPartitionsSize)
+ 
+diff --git a/lib/storage/CODEMANIFEST b/lib/storage/CODEMANIFEST
+index 9f5b5d0..543e6d7 100644
+--- a/lib/storage/CODEMANIFEST
++++ b/lib/storage/CODEMANIFEST
+@@ -16,6 +16,13 @@ Imports:
+       - StatRecord
+     From: lib/storage/metricnamestats
+ 
++  - Types:
++      - DroppedSeriesTracker
++      - DroppedSeriesTrackerMetrics
++      - DroppedSeriesStatsResult
++      - Record AS DroppedSeriesNameRecord
++    From: lib/storage/droppedseriesnames
++
+ Usages:
+   god_package: |
+     This is VictoriaMetrics's largest and most tightly-coupled package: ~14,100 non-test lines
+@@ -51,14 +58,20 @@ Annotations: |
+   per-day/global index logic built entirely on top of one `Table` instance from lib/mergeset,
+   which knows nothing about tags or metric IDs.
+ 
+-  This cell delegates two narrower concerns to sibling child cells rather than implementing them
+-  itself: per-metric-family HELP/UNIT/TYPE tracking is held in one `MetadataStorage` instance
+-  (`Row` is its per-family record, `MetadataStorageMetrics` its size-snapshot struct) from
+-  lib/storage/metricsmetadata, and ingested-vs-queried metric-name usage accounting is held in
++  This cell delegates three narrower concerns to sibling child cells rather than implementing
++  them itself: per-metric-family HELP/UNIT/TYPE tracking is held in one `MetadataStorage`
++  instance (`Row` is its per-family record, `MetadataStorageMetrics` its size-snapshot struct)
++  from lib/storage/metricsmetadata; ingested-vs-queried metric-name usage accounting is held in
+   one `Tracker` instance (`TrackerMetrics` for its size metrics, `StatsResult`/`StatRecord` for
+-  its query responses) from lib/storage/metricnamestats. Both are held as plain fields on
+-  `Storage` and driven directly by AddRows/DeleteSeries/search call sites; neither participates
+-  in the tag-filter/index/search path above.
++  its query responses) from lib/storage/metricnamestats; and per-metric-name counting of samples
++  dropped due to the hourly/daily series cardinality limiters is held in one
++  `DroppedSeriesTracker` instance (`DroppedSeriesTrackerMetrics` for its size metrics,
++  `DroppedSeriesStatsResult`/`DroppedSeriesNameRecord` for its query responses) from
++  lib/storage/droppedseriesnames, populated only from the two series-cardinality-limiter reject
++  branches inside AddRows and left nil (a no-op receiver) whenever that tracking is disabled or
++  neither limiter is configured. All three are held as plain fields on `Storage` and driven
++  directly by AddRows/DeleteSeries/search call sites; none participates in the
++  tag-filter/index/search path above.
+ 
+ ---
+ 
+diff --git a/lib/storage/droppedseriesnames/CODEMANIFEST b/lib/storage/droppedseriesnames/CODEMANIFEST
+new file mode 100644
+index 0000000..9e0eb73
+--- /dev/null
++++ b/lib/storage/droppedseriesnames/CODEMANIFEST
+@@ -0,0 +1,83 @@
++Usages:
++  fill_until_full_no_eviction: |
++    Like its sibling metricnamestats, DroppedSeriesTracker never evicts individual entries once
++    the configured byte budget is reached: cacheIsFull checks currentSizeBytes against
++    maxSizeBytes and, once exceeded, IncrementDropCount becomes a silent no-op for any metric
++    name not already tracked — existing entries keep being incremented forever until an
++    explicit Reset clears the whole map. store is a flat map[string]*atomic.Uint64 with counter
++    and metric-name allocations bump-batched (counterBuf/metricNamesBuf, reset together in
++    initEmpty), the same batching idea metricnamestats and metricsmetadata each use for their
++    own per-entry allocations.
++
++    Unlike metricnamestats, this cell holds no tenant dimension (no accountID/projectID) and no
++    on-disk persistence: state is reset to empty on every process restart, matching the
++    lifecycle of the aggregate HourlySeriesLimitRowsDropped/DailySeriesLimitRowsDropped counters
++    it complements in lib/storage.
++
++Annotations: |
++  In-memory, bounded tracker of, per metric name, how many samples were dropped because adding
++  that series would have exceeded a configured hourly or daily unique-series cardinality limit
++  (lib/storage's -storage.maxHourlySeries / -storage.maxDailySeries) — the data backing
++  support's "which metric names hit our series limit" question, surfaced via TopRecords. All
++  exported DroppedSeriesTracker methods tolerate a nil receiver as a no-op, so an owning cell
++  may hold a `DroppedSeriesTracker` field that is intentionally left nil (e.g. the feature
++  disabled, or neither limiter configured) without a nil-check at every call site.
++
++  Use `fill_until_full_no_eviction` before changing IncrementDropCount, cacheIsFull, or Reset —
++  this cell's cache-fullness policy and lack of persistence are intentional, not oversights.
++
++---
++
++"DroppedSeriesTracker(maxSizeBytes: uint64)":
++  location: tracker.go
++  annotations: |
++    Obtained via the NewTracker factory function. `maxSizeBytes` bounds total tracked-entry
++    size; a value of 0 falls back to DefaultMaxSizeBytes. See `fill_until_full_no_eviction` for
++    what happens once the budget is reached.
++  methods:
++    "IncrementDropCount(metricName: []byte)": |
++      Record one dropped sample for `metricName`, creating a new zero-based counter for it if
++      one does not already exist. No-ops once the cache is full — see
++      `fill_until_full_no_eviction`. Nil-safe.
++    "TopRecords(limit: int) -> result:DroppedSeriesStatsResult": |
++      Return at most `limit` tracked metric names with the highest DroppedRowsCount, sorted in
++      descending order (ties broken by MetricName ascending), together with tracker-wide
++      totals. A negative `limit` returns every tracked record. Nil-safe.
++    "IsEmpty() -> isEmpty:bool": |
++      Report whether any entries are currently tracked. Nil-safe.
++    "Reset()": |
++      Clear all tracked entries and restart the collection window returned as
++      DroppedSeriesStatsResult's collectedSinceTs property. Nil-safe.
++    "UpdateMetrics(dst: DroppedSeriesTrackerMetrics)": |
++      Populate `dst` with the current tracked-item count, byte size, and configured
++      maxSizeBytes. Nil-safe.
++
++"DroppedSeriesStatsResult(collectedSinceTs: uint64, trackedNames: uint64, maxSizeBytes: uint64, currentSizeBytes: uint64, records: []Record)":
++  location: tracker.go
++  annotations: |
++    Response payload for a TopRecords call: the matched `Record`s plus the tracker-wide totals
++    (irrespective of any limit the call requested) as of the call.
++
++"Record(metricName: string, droppedRowsCount: uint64)":
++  location: tracker.go
++  annotations: |
++    One tracked metric name's dropped-samples count, as surfaced to a caller.
++
++"DroppedSeriesTrackerMetrics(currentSizeBytes: uint64, currentItemsCount: uint64, maxSizeBytes: uint64)":
++  location: tracker.go
++  annotations: |
++    Plain snapshot struct populated by DroppedSeriesTracker's UpdateMetrics method; carries no
++    behavior of its own.
++
++---
++
++Author: Goga
++CreatedAt: 21/09/26
++Description: |
++  In-memory, bounded, non-persisted, non-tenant-aware tracker of per-metric-name dropped-sample
++  counts caused by lib/storage's hourly/daily series cardinality limiters, with the same
++  fill-until-full (no per-entry eviction) cache-fullness policy as the sibling metricnamestats
++  cell — see `fill_until_full_no_eviction`. Added as a new nested Goga cell under lib/storage so
++  that support engineers can answer "which metric names hit our series limit" without asking
++  customers to dig through their own instrumentation. Consumed directly by lib/storage, which
++  feeds it from the two series-cardinality-limiter reject branches inside AddRows.
+diff --git a/lib/storage/droppedseriesnames/tracker.go b/lib/storage/droppedseriesnames/tracker.go
+new file mode 100644
+index 0000000..b09e85b
+--- /dev/null
++++ b/lib/storage/droppedseriesnames/tracker.go
+@@ -0,0 +1,241 @@
++// Package droppedseriesnames tracks, per metric name, how many samples were
++// dropped because adding the corresponding series would have exceeded the
++// configured -storage.maxHourlySeries or -storage.maxDailySeries unique-series
++// limit.
++package droppedseriesnames
++
++import (
++	"sort"
++	"sync"
++	"sync/atomic"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
++)
++
++const (
++	// metricNameBufSize defines size of buffer for batched metric name allocations.
++	metricNameBufSize = 16 * 1024
++	// counterBufSize defines size of buffer for batched counter allocations.
++	counterBufSize = 1024
++	// storeOverhead approximates the in-memory overhead of a single tracked
++	// entry: map bucket + counter pointer + string header.
++	storeOverhead = 24 + 8 + 16
++
++	// DefaultMaxSizeBytes is the memory bound applied when a DroppedSeriesTracker is created
++	// without an explicit size override. It is a fixed value independent of
++	// total system memory, so that installations with millions of distinct
++	// metric names cannot make this diagnostic feature consume arbitrary
++	// amounts of memory.
++	DefaultMaxSizeBytes = 8 * 1024 * 1024
++)
++
++// DroppedSeriesTracker is an in-memory, bounded tracker of per-metric-name counts of
++// samples dropped due to series cardinality limits.
++//
++// DroppedSeriesTracker never evicts individual entries once the configured byte budget is
++// reached: IncrementDropCount becomes a no-op for any metric name not already
++// tracked until Reset is called. All exported methods tolerate a nil receiver
++// as a no-op, so an owning cell may hold a `*DroppedSeriesTracker` field that is
++// intentionally left nil (e.g. the feature disabled) without a nil-check at
++// every call site.
++type DroppedSeriesTracker struct {
++	maxSizeBytes uint64
++
++	creationTs        atomic.Uint64
++	currentSizeBytes  atomic.Uint64
++	currentItemsCount atomic.Uint64
++
++	mu sync.RWMutex
++
++	store map[string]*atomic.Uint64
++	// holds batch allocations for counters
++	counterBuf []atomic.Uint64
++	// holds batch allocations for metric names
++	metricNamesBuf []byte
++
++	getCurrentTs func() uint64
++}
++
++// NewTracker creates a DroppedSeriesTracker bounded to maxSizeBytes of total tracked-entry
++// size. If maxSizeBytes is 0, DefaultMaxSizeBytes is used instead.
++func NewTracker(maxSizeBytes uint64) *DroppedSeriesTracker {
++	if maxSizeBytes == 0 {
++		maxSizeBytes = DefaultMaxSizeBytes
++	}
++	t := &DroppedSeriesTracker{
++		maxSizeBytes: maxSizeBytes,
++		getCurrentTs: fasttime.UnixTimestamp,
++	}
++	t.initEmpty()
++	return t
++}
++
++func (t *DroppedSeriesTracker) initEmpty() {
++	t.store = make(map[string]*atomic.Uint64)
++	t.metricNamesBuf = make([]byte, 0, metricNameBufSize)
++	t.counterBuf = nil
++	t.currentSizeBytes.Store(0)
++	t.currentItemsCount.Store(0)
++	t.creationTs.Store(t.getCurrentTs())
++}
++
++func (t *DroppedSeriesTracker) nextCounterLocked() *atomic.Uint64 {
++	n := len(t.counterBuf) + 1
++	if n > cap(t.counterBuf) {
++		// allocate a new slice instead of reallocating the existing one:
++		// it saves memory and reduces GC pressure.
++		t.counterBuf = make([]atomic.Uint64, 0, counterBufSize)
++		n = 1
++	}
++	t.counterBuf = t.counterBuf[:n]
++	return &t.counterBuf[n-1]
++}
++
++// cloneMetricNameLocked uses the same idea as strings.Clone, but instead of a
++// direct []byte allocation for each cloned string, it allocates
++// metricNamesBuf, copies the provided metricName into it, and uses a string
++// reference into that subslice.
++func (t *DroppedSeriesTracker) cloneMetricNameLocked(metricName []byte) string {
++	if len(metricName) > metricNameBufSize {
++		b := make([]byte, len(metricName))
++		copy(b, metricName)
++		return bytesutil.ToUnsafeString(b)
++	}
++	idx := len(t.metricNamesBuf)
++	n := len(metricName) + len(t.metricNamesBuf)
++	if n > cap(t.metricNamesBuf) {
++		t.metricNamesBuf = make([]byte, 0, metricNameBufSize)
++		idx = 0
++	}
++	t.metricNamesBuf = append(t.metricNamesBuf, metricName...)
++	return bytesutil.ToUnsafeString(t.metricNamesBuf[idx:])
++}
++
++func (t *DroppedSeriesTracker) cacheIsFull() bool {
++	return t.currentSizeBytes.Load() > t.maxSizeBytes
++}
++
++// IncrementDropCount records one dropped sample for metricName, creating a new
++// zero-based counter for it if one does not already exist. Once the tracker's
++// byte budget is exhausted, it becomes a no-op for any metric name not already
++// tracked. Nil-safe.
++func (t *DroppedSeriesTracker) IncrementDropCount(metricName []byte) {
++	if t == nil {
++		return
++	}
++	t.mu.RLock()
++	c, ok := t.store[bytesutil.ToUnsafeString(metricName)]
++	t.mu.RUnlock()
++	if ok {
++		c.Add(1)
++		return
++	}
++	if t.cacheIsFull() {
++		return
++	}
++
++	t.mu.Lock()
++	c, ok = t.store[bytesutil.ToUnsafeString(metricName)]
++	if !ok {
++		c = t.nextCounterLocked()
++		key := t.cloneMetricNameLocked(metricName)
++		t.store[key] = c
++	}
++	t.mu.Unlock()
++
++	if !ok {
++		t.currentSizeBytes.Add(uint64(len(metricName)) + storeOverhead)
++		t.currentItemsCount.Add(1)
++	}
++	c.Add(1)
++}
++
++// IsEmpty reports whether any entries are currently tracked. Nil-safe.
++func (t *DroppedSeriesTracker) IsEmpty() bool {
++	if t == nil {
++		return true
++	}
++	return t.currentItemsCount.Load() == 0
++}
++
++// Reset clears all tracked entries and restarts the collection window
++// returned as DroppedSeriesStatsResult.CollectedSinceTs. Nil-safe.
++func (t *DroppedSeriesTracker) Reset() {
++	if t == nil {
++		return
++	}
++	t.mu.Lock()
++	t.initEmpty()
++	t.mu.Unlock()
++}
++
++// DroppedSeriesTrackerMetrics holds DroppedSeriesTracker's internal metrics to report.
++type DroppedSeriesTrackerMetrics struct {
++	CurrentSizeBytes  uint64
++	CurrentItemsCount uint64
++	MaxSizeBytes      uint64
++}
++
++// UpdateMetrics writes internal metrics to dst. Nil-safe.
++func (t *DroppedSeriesTracker) UpdateMetrics(dst *DroppedSeriesTrackerMetrics) {
++	if t == nil {
++		return
++	}
++	dst.CurrentSizeBytes = t.currentSizeBytes.Load()
++	dst.CurrentItemsCount = t.currentItemsCount.Load()
++	dst.MaxSizeBytes = t.maxSizeBytes
++}
++
++// Record is one tracked metric name's dropped-samples count.
++type Record struct {
++	MetricName       string
++	DroppedRowsCount uint64
++}
++
++// DroppedSeriesStatsResult is the response for a TopRecords query.
++type DroppedSeriesStatsResult struct {
++	CollectedSinceTs uint64
++	TrackedNames     uint64
++	MaxSizeBytes     uint64
++	CurrentSizeBytes uint64
++	Records          []Record
++}
++
++// TopRecords returns at most limit tracked metric names with the highest
++// DroppedRowsCount, sorted by DroppedRowsCount in descending order (ties
++// broken by MetricName), together with tracker-wide totals. A negative limit
++// returns all tracked records. Nil-safe.
++func (t *DroppedSeriesTracker) TopRecords(limit int) DroppedSeriesStatsResult {
++	var result DroppedSeriesStatsResult
++	if t == nil {
++		return result
++	}
++
++	t.mu.RLock()
++	defer t.mu.RUnlock()
++
++	result.CollectedSinceTs = t.creationTs.Load()
++	result.TrackedNames = t.currentItemsCount.Load()
++	result.MaxSizeBytes = t.maxSizeBytes
++	result.CurrentSizeBytes = t.currentSizeBytes.Load()
++
++	records := make([]Record, 0, len(t.store))
++	for name, c := range t.store {
++		records = append(records, Record{
++			MetricName:       name,
++			DroppedRowsCount: c.Load(),
++		})
++	}
++	sort.Slice(records, func(i, j int) bool {
++		if records[i].DroppedRowsCount == records[j].DroppedRowsCount {
++			return records[i].MetricName < records[j].MetricName
++		}
++		return records[i].DroppedRowsCount > records[j].DroppedRowsCount
++	})
++	if limit >= 0 && limit < len(records) {
++		records = records[:limit]
++	}
++	result.Records = records
++	return result
++}
+diff --git a/lib/storage/droppedseriesnames/tracker_test.go b/lib/storage/droppedseriesnames/tracker_test.go
+new file mode 100644
+index 0000000..c038dc8
+--- /dev/null
++++ b/lib/storage/droppedseriesnames/tracker_test.go
+@@ -0,0 +1,217 @@
++package droppedseriesnames
++
++import (
++	"fmt"
++	"sync"
++	"testing"
++
++	"github.com/google/go-cmp/cmp"
++	"github.com/google/go-cmp/cmp/cmpopts"
++)
++
++var statsResultCmpOpts = cmpopts.IgnoreFields(DroppedSeriesStatsResult{}, "CollectedSinceTs", "MaxSizeBytes", "CurrentSizeBytes")
++
++func TestTrackerNilIsNoop(t *testing.T) {
++	var tr *DroppedSeriesTracker
++
++	tr.IncrementDropCount([]byte("metric_1"))
++	tr.Reset()
++
++	if !tr.IsEmpty() {
++		t.Fatalf("expected nil DroppedSeriesTracker to report IsEmpty")
++	}
++
++	var tm DroppedSeriesTrackerMetrics
++	tr.UpdateMetrics(&tm)
++	if tm != (DroppedSeriesTrackerMetrics{}) {
++		t.Fatalf("expected nil DroppedSeriesTracker to leave DroppedSeriesTrackerMetrics untouched, got %+v", tm)
++	}
++
++	got := tr.TopRecords(10)
++	if len(got.Records) != 0 {
++		t.Fatalf("expected nil DroppedSeriesTracker to return no records, got %+v", got)
++	}
++}
++
++func TestTrackerRecordsMultipleMetricNames(t *testing.T) {
++	tr := NewTracker(0)
++
++	tr.IncrementDropCount([]byte("metric_a"))
++	tr.IncrementDropCount([]byte("metric_b"))
++	tr.IncrementDropCount([]byte("metric_b"))
++	tr.IncrementDropCount([]byte("metric_c"))
++	tr.IncrementDropCount([]byte("metric_c"))
++	tr.IncrementDropCount([]byte("metric_c"))
++
++	if tr.IsEmpty() {
++		t.Fatalf("expected DroppedSeriesTracker to have tracked entries")
++	}
++
++	got := tr.TopRecords(-1)
++	expected := DroppedSeriesStatsResult{
++		TrackedNames: 3,
++		Records: []Record{
++			{MetricName: "metric_c", DroppedRowsCount: 3},
++			{MetricName: "metric_b", DroppedRowsCount: 2},
++			{MetricName: "metric_a", DroppedRowsCount: 1},
++		},
++	}
++	if !cmp.Equal(expected, got, statsResultCmpOpts) {
++		t.Fatalf("unexpected TopRecords result: %s", cmp.Diff(expected, got, statsResultCmpOpts))
++	}
++}
++
++func TestTrackerTopRecordsOrderingAndLimit(t *testing.T) {
++	tr := NewTracker(0)
++
++	counts := map[string]int{
++		"metric_low":    1,
++		"metric_mid":    5,
++		"metric_high":   10,
++		"metric_medium": 3,
++	}
++	for name, n := range counts {
++		for range n {
++			tr.IncrementDropCount([]byte(name))
++		}
++	}
++
++	got := tr.TopRecords(2)
++	expected := DroppedSeriesStatsResult{
++		TrackedNames: 4,
++		Records: []Record{
++			{MetricName: "metric_high", DroppedRowsCount: 10},
++			{MetricName: "metric_mid", DroppedRowsCount: 5},
++		},
++	}
++	if !cmp.Equal(expected, got, statsResultCmpOpts) {
++		t.Fatalf("unexpected top-2 TopRecords result: %s", cmp.Diff(expected, got, statsResultCmpOpts))
++	}
++}
++
++func TestTrackerRespectsMaxSizeBytes(t *testing.T) {
++	// Only enough budget for 2 metric names of this size.
++	tr := NewTracker(storeOverhead + 2*10)
++
++	names := []string{"metric_0001", "metric_0002", "metric_0003", "metric_0004", "metric_0005"}
++	for _, name := range names {
++		tr.IncrementDropCount([]byte(name))
++	}
++
++	got := tr.TopRecords(-1)
++	if len(got.Records) >= len(names) {
++		t.Fatalf("expected DroppedSeriesTracker to stop tracking new metric names once maxSizeBytes is exceeded, got %d records", len(got.Records))
++	}
++	if got.CurrentSizeBytes > tr.maxSizeBytes+uint64(len(names[0]))+storeOverhead {
++		t.Fatalf("CurrentSizeBytes %d grew far beyond maxSizeBytes %d", got.CurrentSizeBytes, tr.maxSizeBytes)
++	}
++
++	// Already-tracked names must keep being incremented even once the tracker is full.
++	trackedName := got.Records[0].MetricName
++	before := got.Records[0].DroppedRowsCount
++	tr.IncrementDropCount([]byte(trackedName))
++	got = tr.TopRecords(-1)
++	var after uint64
++	for _, r := range got.Records {
++		if r.MetricName == trackedName {
++			after = r.DroppedRowsCount
++		}
++	}
++	if after != before+1 {
++		t.Fatalf("expected already-tracked metric name to keep being incremented once full: before=%d after=%d", before, after)
++	}
++}
++
++func TestTrackerDefaultMaxSizeBytes(t *testing.T) {
++	tr := NewTracker(0)
++	if tr.maxSizeBytes != DefaultMaxSizeBytes {
++		t.Fatalf("expected NewTracker(0) to fall back to DefaultMaxSizeBytes=%d, got %d", DefaultMaxSizeBytes, tr.maxSizeBytes)
++	}
++}
++
++func TestTrackerUnboundedGrowthIsCapped(t *testing.T) {
++	// Even with a huge number of distinct metric names, the tracker's tracked
++	// item count must stay bounded by the configured byte budget.
++	const maxSizeBytes = 64 * 1024
++	tr := NewTracker(maxSizeBytes)
++
++	for i := range 1_000_000 {
++		tr.IncrementDropCount([]byte(fmt.Sprintf("metric_%d", i)))
++	}
++
++	got := tr.TopRecords(-1)
++	if got.CurrentSizeBytes > maxSizeBytes*2 {
++		t.Fatalf("tracker memory grew unbounded: CurrentSizeBytes=%d, maxSizeBytes=%d", got.CurrentSizeBytes, maxSizeBytes)
++	}
++	if len(got.Records) >= 1_000_000 {
++		t.Fatalf("expected tracker to cap tracked names well below 1_000_000, got %d", len(got.Records))
++	}
++}
++
++func TestTrackerReset(t *testing.T) {
++	tr := NewTracker(0)
++	tr.IncrementDropCount([]byte("metric_1"))
++	tr.IncrementDropCount([]byte("metric_2"))
++
++	if tr.IsEmpty() {
++		t.Fatalf("expected DroppedSeriesTracker to have tracked entries before Reset")
++	}
++
++	tr.Reset()
++
++	if !tr.IsEmpty() {
++		t.Fatalf("expected DroppedSeriesTracker to be empty after Reset")
++	}
++	got := tr.TopRecords(-1)
++	if len(got.Records) != 0 {
++		t.Fatalf("expected no records after Reset, got %+v", got.Records)
++	}
++}
++
++func TestTrackerConcurrentIncrements(t *testing.T) {
++	tr := NewTracker(0)
++	const concurrency = 8
++	const incrementsPerGoroutine = 200
++
++	var wg sync.WaitGroup
++	for range concurrency {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			for range incrementsPerGoroutine {
++				tr.IncrementDropCount([]byte("metric_hot"))
++			}
++		}()
++	}
++	wg.Wait()
++
++	got := tr.TopRecords(-1)
++	expected := DroppedSeriesStatsResult{
++		TrackedNames: 1,
++		Records: []Record{
++			{MetricName: "metric_hot", DroppedRowsCount: concurrency * incrementsPerGoroutine},
++		},
++	}
++	if !cmp.Equal(expected, got, statsResultCmpOpts) {
++		t.Fatalf("unexpected concurrent TopRecords result: %s", cmp.Diff(expected, got, statsResultCmpOpts))
++	}
++}
++
++func TestTrackerUpdateMetrics(t *testing.T) {
++	tr := NewTracker(1000)
++	tr.IncrementDropCount([]byte("metric_1"))
++	tr.IncrementDropCount([]byte("metric_2"))
++
++	var tm DroppedSeriesTrackerMetrics
++	tr.UpdateMetrics(&tm)
++
++	if tm.MaxSizeBytes != 1000 {
++		t.Fatalf("unexpected MaxSizeBytes: got %d, want 1000", tm.MaxSizeBytes)
++	}
++	if tm.CurrentItemsCount != 2 {
++		t.Fatalf("unexpected CurrentItemsCount: got %d, want 2", tm.CurrentItemsCount)
++	}
++	if tm.CurrentSizeBytes == 0 {
++		t.Fatalf("expected non-zero CurrentSizeBytes")
++	}
++}
+diff --git a/lib/storage/storage.go b/lib/storage/storage.go
+index 4b8f6cd..2bfeceb 100644
+--- a/lib/storage/storage.go
++++ b/lib/storage/storage.go
+@@ -23,6 +23,7 @@ import (
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/querytracer"
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/snapshot/snapshotutil"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage/droppedseriesnames"
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage/metricnamestats"
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage/metricsmetadata"
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timeutil"
+@@ -88,6 +89,11 @@ type Storage struct {
+ 	hourlySeriesLimiter *bloomfilter.Limiter
+ 	dailySeriesLimiter  *bloomfilter.Limiter
+ 
++	// droppedSeriesNamesTracker tracks, per metric name, how many samples were
++	// dropped because of hourlySeriesLimiter/dailySeriesLimiter. It is nil when
++	// disabled or when neither limiter is configured.
++	droppedSeriesNamesTracker *droppedseriesnames.DroppedSeriesTracker
++
+ 	// tsidCache is MetricName -> TSID cache.
+ 	tsidCache *workingsetcache.Cache
+ 
+@@ -171,6 +177,7 @@ type OpenOptions struct {
+ 	MaxDailySeries              int
+ 	DisablePerDayIndex          bool
+ 	TrackMetricNamesStats       bool
++	TrackDroppedSeriesNames     bool
+ 	IDBPrefillStart             time.Duration
+ 	LogNewSeries                bool
+ }
+@@ -243,6 +250,9 @@ func MustOpenStorage(path string, opts OpenOptions) *Storage {
+ 	if opts.MaxDailySeries > 0 {
+ 		s.dailySeriesLimiter = bloomfilter.NewLimiter(opts.MaxDailySeries, 24*time.Hour)
+ 	}
++	if opts.TrackDroppedSeriesNames && (s.hourlySeriesLimiter != nil || s.dailySeriesLimiter != nil) {
++		s.droppedSeriesNamesTracker = droppedseriesnames.NewTracker(uint64(getDroppedSeriesNamesCacheSize()))
++	}
+ 
+ 	// Load caches.
+ 	mem := memory.Allowed()
+@@ -363,6 +373,21 @@ func getMetricNamesStatsCacheSize() int {
+ 	return maxMetricNamesStatsCacheSize
+ }
+ 
++var maxDroppedSeriesNamesCacheSize int
++
++// SetDroppedSeriesNamesCacheSize overrides the default size of
++// storage/droppedSeriesNamesTracker cache.
++func SetDroppedSeriesNamesCacheSize(size int) {
++	maxDroppedSeriesNamesCacheSize = size
++}
++
++func getDroppedSeriesNamesCacheSize() int {
++	if maxDroppedSeriesNamesCacheSize <= 0 {
++		return droppedseriesnames.DefaultMaxSizeBytes
++	}
++	return maxDroppedSeriesNamesCacheSize
++}
++
+ var maxMetricNameCacheSize int
+ 
+ // SetMetricNameCacheSize overrides the default size of storage/metricName cache
+@@ -594,6 +619,10 @@ type Metrics struct {
+ 	MetricNamesUsageTrackerSizeBytes    uint64
+ 	MetricNamesUsageTrackerSizeMaxBytes uint64
+ 
++	DroppedSeriesNamesTrackerSize         uint64
++	DroppedSeriesNamesTrackerSizeBytes    uint64
++	DroppedSeriesNamesTrackerSizeMaxBytes uint64
++
+ 	MetadataStorageItemsCurrent     uint64
+ 	MetadataStorageCurrentSizeBytes uint64
+ 	MetadataStorageMaxSizeBytes     uint64
+@@ -684,6 +713,12 @@ func (s *Storage) UpdateMetrics(m *Metrics) {
+ 	m.MetricNamesUsageTrackerSize = tm.CurrentItemsCount
+ 	m.MetricNamesUsageTrackerSizeMaxBytes = tm.MaxSizeBytes
+ 
++	var dtm droppedseriesnames.DroppedSeriesTrackerMetrics
++	s.droppedSeriesNamesTracker.UpdateMetrics(&dtm)
++	m.DroppedSeriesNamesTrackerSizeBytes = dtm.CurrentSizeBytes
++	m.DroppedSeriesNamesTrackerSize = dtm.CurrentItemsCount
++	m.DroppedSeriesNamesTrackerSizeMaxBytes = dtm.MaxSizeBytes
++
+ 	var mr metricsmetadata.MetadataStorageMetrics
+ 	s.metadataStorage.UpdateMetrics(&mr)
+ 	m.MetadataStorageItemsCurrent = uint64(mr.ItemsCurrent)
+@@ -861,6 +896,10 @@ func (s *Storage) MustClose() {
+ 
+ 	s.metricsTracker.MustClose()
+ 
++	// droppedSeriesNamesTracker is not persisted across restarts, in line with
++	// the aggregate HourlySeriesLimitRowsDropped/DailySeriesLimitRowsDropped
++	// counters it complements.
++
+ 	s.metadataStorage.MustClose()
+ 
+ 	// Release lock file.
+@@ -2156,17 +2195,33 @@ func (s *Storage) registerSeriesCardinality(metricNameRaw []byte) bool {
+ 	metricID := xxhash.Sum64(metricNameRaw)
+ 	if sl := s.hourlySeriesLimiter; sl != nil && !sl.Add(metricID) {
+ 		s.hourlySeriesLimitRowsDropped.Add(1)
++		s.trackDroppedSeriesName(metricNameRaw)
+ 		logSkippedSeries(metricNameRaw, "-storage.maxHourlySeries", sl.MaxItems())
+ 		return false
+ 	}
+ 	if sl := s.dailySeriesLimiter; sl != nil && !sl.Add(metricID) {
+ 		s.dailySeriesLimitRowsDropped.Add(1)
++		s.trackDroppedSeriesName(metricNameRaw)
+ 		logSkippedSeries(metricNameRaw, "-storage.maxDailySeries", sl.MaxItems())
+ 		return false
+ 	}
+ 	return true
+ }
+ 
++// trackDroppedSeriesName records metricNameRaw's metric name in
++// droppedSeriesNamesTracker, if tracking is enabled. It is a no-op (single nil
++// check) when tracking is disabled.
++func (s *Storage) trackDroppedSeriesName(metricNameRaw []byte) {
++	if s.droppedSeriesNamesTracker == nil {
++		return
++	}
++	mn := GetMetricName()
++	if err := mn.UnmarshalRaw(metricNameRaw); err == nil {
++		s.droppedSeriesNamesTracker.IncrementDropCount(mn.MetricGroup)
++	}
++	PutMetricName(mn)
++}
++
+ func logSkippedSeries(metricNameRaw []byte, flagName string, flagValue int) {
+ 	select {
+ 	case <-logSkippedSeriesTicker.C:
+@@ -2668,6 +2723,19 @@ func (s *Storage) ResetMetricNamesStats(_ *querytracer.Tracer) {
+ 	s.metricsTracker.Reset(s.tsidCache.Reset)
+ }
+ 
++// GetDroppedSeriesNamesStats returns the metric names most responsible for
++// samples dropped due to -storage.maxHourlySeries / -storage.maxDailySeries,
++// with at most limit entries, sorted by dropped-samples count in descending
++// order. A negative limit returns all tracked names.
++func (s *Storage) GetDroppedSeriesNamesStats(limit int) droppedseriesnames.DroppedSeriesStatsResult {
++	return s.droppedSeriesNamesTracker.TopRecords(limit)
++}
++
++// ResetDroppedSeriesNamesStats resets state for the dropped series names tracker.
++func (s *Storage) ResetDroppedSeriesNamesStats() {
++	s.droppedSeriesNamesTracker.Reset()
++}
++
+ // GetMetadataRows returns time series metric names metadata for the given args
+ func (s *Storage) GetMetadataRows(qt *querytracer.Tracer, limit int, metricName string) []*metricsmetadata.Row {
+ 	var (
+diff --git a/lib/storage/storage_test.go b/lib/storage/storage_test.go
+index b114bdc..ec7370a 100644
+--- a/lib/storage/storage_test.go
++++ b/lib/storage/storage_test.go
+@@ -1992,6 +1992,123 @@ func TestStorageRowsNotAdded_SeriesLimitExceeded(t *testing.T) {
+ 	})
+ }
+ 
++func TestStorageDroppedSeriesNamesStats(t *testing.T) {
++	defer testRemoveAll(t)
++
++	rng := rand.New(rand.NewSource(1))
++	minTimestamp := time.Now().UnixMilli()
++	maxTimestamp := minTimestamp + 1000
++	tr := TimeRange{minTimestamp, maxTimestamp}
++
++	newRowForName := func(name string) MetricRow {
++		var mn MetricName
++		mn.MetricGroup = []byte(name)
++		return MetricRow{
++			MetricNameRaw: mn.marshalRaw(nil),
++			Timestamp:     rng.Int63n(maxTimestamp-minTimestamp) + minTimestamp,
++			Value:         rng.NormFloat64(),
++		}
++	}
++
++	t.Run("DisabledByDefault", func(t *testing.T) {
++		defer testRemoveAll(t)
++		const maxHourlySeries = 1
++		s := MustOpenStorage(t.Name(), OpenOptions{MaxHourlySeries: maxHourlySeries})
++		defer s.MustClose()
++
++		s.AddRows(testGenerateMetricRowsWithPrefix(rng, 10, "m", tr), defaultPrecisionBits)
++		s.DebugFlush()
++
++		got := s.GetDroppedSeriesNamesStats(-1)
++		if len(got.Records) != 0 {
++			t.Fatalf("expected no dropped series names to be tracked when TrackDroppedSeriesNames is unset, got %+v", got.Records)
++		}
++	})
++
++	t.Run("RecordsMultipleNamesAndTopOffenders", func(t *testing.T) {
++		defer testRemoveAll(t)
++		const maxHourlySeries = 3
++		s := MustOpenStorage(t.Name(), OpenOptions{
++			MaxHourlySeries:         maxHourlySeries,
++			TrackDroppedSeriesNames: true,
++		})
++		defer s.MustClose()
++
++		// Fill up the hourly series limit with distinct series, so that every
++		// subsequently ingested new metric name gets rejected.
++		s.AddRows(testGenerateMetricRowsWithPrefix(rng, maxHourlySeries, "seed", tr), defaultPrecisionBits)
++		s.DebugFlush()
++
++		namesAndCounts := map[string]int{
++			"rejected_a": 5,
++			"rejected_b": 2,
++			"rejected_c": 8,
++		}
++		for name, count := range namesAndCounts {
++			for range count {
++				s.AddRows([]MetricRow{newRowForName(name)}, defaultPrecisionBits)
++			}
++		}
++		s.DebugFlush()
++
++		stats := s.GetDroppedSeriesNamesStats(-1)
++		if stats.TrackedNames != uint64(len(namesAndCounts)) {
++			t.Fatalf("unexpected TrackedNames: got %d, want %d", stats.TrackedNames, len(namesAndCounts))
++		}
++		got := make(map[string]uint64, len(stats.Records))
++		for _, r := range stats.Records {
++			got[r.MetricName] = r.DroppedRowsCount
++		}
++		for name, count := range namesAndCounts {
++			if got[name] != uint64(count) {
++				t.Fatalf("unexpected drop count for %q: got %d, want %d", name, got[name], count)
++			}
++		}
++
++		top1 := s.GetDroppedSeriesNamesStats(1)
++		if len(top1.Records) != 1 || top1.Records[0].MetricName != "rejected_c" {
++			t.Fatalf("unexpected top-1 offender: got %+v, want rejected_c", top1.Records)
++		}
++
++		s.ResetDroppedSeriesNamesStats()
++		afterReset := s.GetDroppedSeriesNamesStats(-1)
++		if len(afterReset.Records) != 0 {
++			t.Fatalf("expected no records after ResetDroppedSeriesNamesStats, got %+v", afterReset.Records)
++		}
++	})
++
++	t.Run("MemoryBoundRespected", func(t *testing.T) {
++		defer testRemoveAll(t)
++		defer SetDroppedSeriesNamesCacheSize(0)
++
++		const maxHourlySeries = 1
++		// Only enough space to track a handful of metric names.
++		SetDroppedSeriesNamesCacheSize(256)
++		s := MustOpenStorage(t.Name(), OpenOptions{
++			MaxHourlySeries:         maxHourlySeries,
++			TrackDroppedSeriesNames: true,
++		})
++		defer s.MustClose()
++
++		s.AddRows(testGenerateMetricRowsWithPrefix(rng, maxHourlySeries, "seed", tr), defaultPrecisionBits)
++		s.DebugFlush()
++
++		const rejectedNamesCount = 1000
++		for i := range rejectedNamesCount {
++			s.AddRows([]MetricRow{newRowForName(fmt.Sprintf("rejected_%d", i))}, defaultPrecisionBits)
++		}
++		s.DebugFlush()
++
++		stats := s.GetDroppedSeriesNamesStats(-1)
++		if len(stats.Records) >= rejectedNamesCount {
++			t.Fatalf("expected tracked names count to be bounded well below %d, got %d", rejectedNamesCount, len(stats.Records))
++		}
++		if stats.CurrentSizeBytes > 2*stats.MaxSizeBytes {
++			t.Fatalf("tracked size %d grew far beyond configured bound %d", stats.CurrentSizeBytes, stats.MaxSizeBytes)
++		}
++	})
++}
++
+ // testCountAllMetricNames is a test helper function that counts the names of
+ // all time series within the given time range.
+ func testCountAllMetricNames(s *Storage, tr TimeRange) int {

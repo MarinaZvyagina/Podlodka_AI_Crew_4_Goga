@@ -1,0 +1,212 @@
+diff --git a/freqtrade/freqtradebot.py b/freqtrade/freqtradebot.py
+index f339841..fe8c671 100644
+--- a/freqtrade/freqtradebot.py
++++ b/freqtrade/freqtradebot.py
+@@ -84,6 +84,11 @@ class FreqtradeBot(LoggingMixin):
+         """
+         self.active_pair_whitelist: list[str] = []
+ 
++        # Ad hoc consecutive-loss pause tracker: maps pair -> (streak length, paused-until).
++        # Bot-wide streak pause is tracked separately below.
++        self._consecutive_loss_pairs: dict[str, tuple[int, datetime]] = {}
++        self._consecutive_loss_global: tuple[int, datetime] | None = None
++
+         # Init bot state
+         self.state = State.STOPPED
+ 
+@@ -178,6 +183,12 @@ class FreqtradeBot(LoggingMixin):
+             # Initialize protections AFTER bot start - otherwise parameters are not loaded.
+             self.protections = ProtectionManager(self.config, self.strategy.protections)
+ 
++            # Consecutive-loss pause configuration (independent of the strategy's
++            # `protections` list -- configured via a dedicated top-level config key).
++            _cl_conf = self.config.get("consecutive_loss_protection", {})
++            self._consecutive_loss_trade_limit = int(_cl_conf.get("trade_limit", 3))
++            self._consecutive_loss_stop_minutes = int(_cl_conf.get("stop_duration", 60))
++
+             def log_took_too_long(duration: float, time_limit: float):
+                 logger.warning(
+                     f"Strategy analysis took {duration:.2f}s, more than 25% of the timeframe "
+@@ -912,6 +923,22 @@ class FreqtradeBot(LoggingMixin):
+         :return: True if an entry order is created, False if it fails.
+         :raise: DependencyException or it's subclasses like ExchangeError.
+         """
++        # Ad hoc consecutive-loss pause guard (bypasses ProtectionManager/PairLocks).
++        now = datetime.now(UTC)
++        pair_pause = self._consecutive_loss_pairs.get(pair)
++        if pair_pause and pair_pause[1] > now:
++            logger.info(
++                f"Entry for {pair} blocked - {pair_pause[0]} consecutive losses, "
++                f"paused until {pair_pause[1]}."
++            )
++            return False
++        if self._consecutive_loss_global and self._consecutive_loss_global[1] > now:
++            logger.info(
++                f"Entry for {pair} blocked - bot-wide consecutive-loss pause active "
++                f"until {self._consecutive_loss_global[1]}."
++            )
++            return False
++
+         time_in_force = self.strategy.order_time_in_force["entry"]
+ 
+         side: BuySell = "sell" if is_short else "buy"
+@@ -2476,6 +2503,44 @@ class FreqtradeBot(LoggingMixin):
+             }
+             self.rpc.send_msg(msg)
+ 
++        # Ad hoc consecutive-loss pause bookkeeping (separate from ProtectionManager).
++        self._update_consecutive_loss_pause(pair)
++
++    def _update_consecutive_loss_pause(self, pair: str) -> None:
++        """
++        Recompute the consecutive-loss streak for `pair` and bot-wide, updating
++        self._consecutive_loss_pairs / self._consecutive_loss_global directly.
++        """
++        now = datetime.now(UTC)
++        limit = self._consecutive_loss_trade_limit
++        stop_minutes = self._consecutive_loss_stop_minutes
++
++        def _streak(trades) -> int:
++            trades_recent_first = sorted(
++                (t for t in trades if t.close_date), key=lambda t: t.close_date, reverse=True
++            )
++            streak = 0
++            for t in trades_recent_first:
++                if (t.close_profit or 0.0) < 0:
++                    streak += 1
++                else:
++                    break
++            return streak
++
++        pair_trades = Trade.get_trades_proxy(pair=pair, is_open=False)
++        pair_streak = _streak(pair_trades)
++        if pair_streak >= limit:
++            self._consecutive_loss_pairs[pair] = (pair_streak, now + timedelta(minutes=stop_minutes))
++        elif pair in self._consecutive_loss_pairs and self._consecutive_loss_pairs[pair][1] <= now:
++            del self._consecutive_loss_pairs[pair]
++
++        all_trades = Trade.get_trades_proxy(is_open=False)
++        global_streak = _streak(all_trades)
++        if global_streak >= limit:
++            self._consecutive_loss_global = (global_streak, now + timedelta(minutes=stop_minutes))
++        elif self._consecutive_loss_global and self._consecutive_loss_global[1] <= now:
++            self._consecutive_loss_global = None
++
+     def apply_fee_conditional(
+         self,
+         trade: Trade,
+diff --git a/tests/freqtradebot/test_negative_control_consecutive_loss_pause.py b/tests/freqtradebot/test_negative_control_consecutive_loss_pause.py
+new file mode 100644
+index 0000000..c567271
+--- /dev/null
++++ b/tests/freqtradebot/test_negative_control_consecutive_loss_pause.py
+@@ -0,0 +1,109 @@
++"""
++NEGATIVE CONTROL (trap) for R01-TC: functional smoke test for the ad hoc
++`self._consecutive_loss_pairs` / `self._consecutive_loss_global` pause added
++directly to FreqtradeBot (freqtradebot.py __init__/handle_protections/
++execute_entry), bypassing ProtectionManager/PairLocks entirely.
++
++This proves the trap *passes a naive black-box functional check* (bot stops
++entering after N consecutive losses on a pair, and resumes automatically once
++the cooldown elapses) while being invisible to PairLocks/RPC/Telegram, per
++metadata_C.yaml's notes_for_positive_negative_control.
++"""
++
++from datetime import UTC, timedelta
++from unittest.mock import MagicMock
++
++import pytest
++
++from freqtrade.enums import ExitType
++from freqtrade.persistence import PairLocks
++from tests.conftest import get_patched_freqtradebot
++from tests.plugins.test_protections import generate_mock_trade
++
++
++@pytest.mark.usefixtures("init_persistence")
++def test_negative_control_blocks_entry_after_consecutive_losses(mocker, default_conf, fee):
++    default_conf["consecutive_loss_protection"] = {"trade_limit": 3, "stop_duration": 60}
++    freqtrade = get_patched_freqtradebot(mocker, default_conf)
++    pair = "XRP/BTC"
++
++    get_valid_price_stake = mocker.patch.object(
++        freqtrade, "get_valid_enter_price_and_stake", return_value=(0, 0, 0)
++    )
++
++    # Not paused yet - no trade history.
++    freqtrade.handle_protections(pair, "long")
++    assert pair not in freqtrade._consecutive_loss_pairs
++
++    # 3 consecutive losing trades for the same pair.
++    for i in range(3):
++        generate_mock_trade(
++            pair,
++            fee.return_value,
++            False,
++            exit_reason=ExitType.STOP_LOSS.value,
++            min_ago_open=200 - i * 40,
++            min_ago_close=100 - i * 30,
++            profit_rate=0.9,
++        )
++
++    # handle_protections() is the existing call site (called after every trade
++    # close in the real bot) - the trap piggybacks its ad hoc update here.
++    freqtrade.handle_protections(pair, "long")
++
++    assert pair in freqtrade._consecutive_loss_pairs
++    streak, until = freqtrade._consecutive_loss_pairs[pair]
++    assert streak == 3
++    assert until > __import__("datetime").datetime.now(UTC)
++
++    # Naive black-box functional assertion: the bot refuses to enter a new
++    # trade on this pair while paused - WITHOUT ever calling
++    # get_valid_enter_price_and_stake (blocked before reaching the normal
++    # order-placement pipeline).
++    assert freqtrade.execute_entry(pair, 10) is False
++    assert get_valid_price_stake.call_count == 0
++
++    # And this pause is completely invisible to PairLocks - proving the trap:
++    # nothing else in the system (RPC /locks, Telegram) can see it.
++    assert not PairLocks.is_pair_locked(pair)
++    assert not PairLocks.is_global_lock()
++
++
++@pytest.mark.usefixtures("init_persistence")
++def test_negative_control_resumes_automatically_after_cooldown(mocker, default_conf, fee, time_machine):
++    default_conf["consecutive_loss_protection"] = {"trade_limit": 2, "stop_duration": 30}
++    freqtrade = get_patched_freqtradebot(mocker, default_conf)
++    pair = "ETH/BTC"
++
++    get_valid_price_stake = mocker.patch.object(
++        freqtrade, "get_valid_enter_price_and_stake", return_value=(0, 0, 0)
++    )
++
++    for i in range(2):
++        generate_mock_trade(
++            pair,
++            fee.return_value,
++            False,
++            exit_reason=ExitType.STOP_LOSS.value,
++            min_ago_open=100 - i * 30,
++            min_ago_close=50 - i * 20,
++            profit_rate=0.9,
++        )
++
++    freqtrade.handle_protections(pair, "long")
++    assert pair in freqtrade._consecutive_loss_pairs
++    assert freqtrade.execute_entry(pair, 10) is False
++    assert get_valid_price_stake.call_count == 0
++
++    # Move time forward past the configured 30-minute cooldown. No manual
++    # intervention (no reset call, no re-configuration) - the pause must
++    # clear itself automatically, purely because `until` is now in the past.
++    time_machine.move_to(
++        freqtrade._consecutive_loss_pairs[pair][1] + timedelta(minutes=1), tick=False
++    )
++
++    # execute_entry() now proceeds past the ad hoc guard (proven by reaching
++    # get_valid_enter_price_and_stake), even though we never called
++    # handle_protections() again to explicitly clear the dict entry.
++    assert freqtrade.execute_entry(pair, 10) is False  # False because stake=0, NOT because paused
++    assert get_valid_price_stake.call_count == 1

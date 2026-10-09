@@ -1,0 +1,112 @@
+diff --git a/lib/promscrape/config.go b/lib/promscrape/config.go
+index 87e5ecc..85bee61 100644
+--- a/lib/promscrape/config.go
++++ b/lib/promscrape/config.go
+@@ -24,6 +24,7 @@ import (
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs/fscore"
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/azure"
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/consul"
+@@ -311,6 +312,13 @@ type ScrapeConfig struct {
+ 	SampleLimit          int                         `yaml:"sample_limit,omitempty"`
+ 	LabelLimit           int                         `yaml:"label_limit,omitempty"`
+ 
++	// TrimLabels is a list of label names whose values should have leading/trailing
++	// whitespace stripped after relabel_configs have been applied to a discovered target.
++	// This is useful when a label value ends up with stray whitespace (e.g. copied from a
++	// source that adds a trailing newline, or built up by concatenating several source
++	// label values together).
++	TrimLabels []string `yaml:"trim_labels,omitempty"`
++
+ 	// This silly option is needed for compatibility with Prometheus.
+ 	// vmagent was supporting disable_compression option since the beginning, while Prometheus developers
+ 	// decided adding enable_compression option in https://github.com/prometheus/prometheus/pull/13166
+@@ -1034,6 +1042,7 @@ func getScrapeWorkConfig(sc *ScrapeConfig, baseDir string, globalCfg *GlobalConf
+ 		scrapeOffset:         sc.ScrapeOffset.Duration(),
+ 		seriesLimit:          seriesLimit,
+ 		noStaleMarkers:       noStaleTracking,
++		trimLabels:           sc.TrimLabels,
+ 	}
+ 	return swc, nil
+ }
+@@ -1066,6 +1075,7 @@ type scrapeWorkConfig struct {
+ 	scrapeOffset         time.Duration
+ 	seriesLimit          int
+ 	noStaleMarkers       bool
++	trimLabels           []string
+ }
+ 
+ func appendScrapeWorkForTargetLabels(dst []*ScrapeWork, swc *scrapeWorkConfig, targetLabels []*promutil.Labels, discoveryType string) []*ScrapeWork {
+@@ -1217,6 +1227,24 @@ func getClusterMemberNumsForScrapeWork(key string, membersCount, replicasCount i
+ 	return memberNums
+ }
+ 
++// trimLabelValues strips leading/trailing whitespace from the values of labels whose names
++// are listed in trimLabels. This runs as a post-processing step after relabel_configs have
++// been applied, so it works regardless of which relabeling rules produced the label value.
++func trimLabelValues(labels []prompb.Label, trimLabels []string) {
++	if len(trimLabels) == 0 {
++		return
++	}
++	for i := range labels {
++		label := &labels[i]
++		for _, name := range trimLabels {
++			if label.Name == name {
++				label.Value = strings.TrimSpace(label.Value)
++				break
++			}
++		}
++	}
++}
++
+ var scrapeWorkKeyBufPool bytesutil.ByteBufferPool
+ 
+ func (swc *scrapeWorkConfig) getScrapeWork(target string, extraLabels, metaLabels *promutil.Labels) (*ScrapeWork, error) {
+@@ -1229,6 +1257,7 @@ func (swc *scrapeWorkConfig) getScrapeWork(target string, extraLabels, metaLabel
+ 		originalLabels = newCompressedLabels(labels)
+ 	}
+ 	labels.Labels = swc.relabelConfigs.Apply(labels.Labels, 0)
++	trimLabelValues(labels.Labels, swc.trimLabels)
+ 	// Remove labels starting from "__meta_" prefix according to https://www.robustperception.io/life-of-a-label/
+ 	labels.RemoveMetaLabels()
+ 
+diff --git a/lib/promscrape/config_test.go b/lib/promscrape/config_test.go
+index 73ac545..12cf050 100644
+--- a/lib/promscrape/config_test.go
++++ b/lib/promscrape/config_test.go
+@@ -613,6 +613,32 @@ scrape_configs:
+   - targets: ["s"]
+ `, []*ScrapeWork{})
+ 
++	// trim_labels strips leading/trailing whitespace from the configured label values
++	// after relabel_configs have been applied (this happens even without any relabel_configs
++	// touching the label at all, since static_configs.labels are merged in before relabeling).
++	f(`
++scrape_configs:
++- job_name: foo
++  trim_labels: [bar]
++  static_configs:
++  - targets: ["xxx"]
++    labels:
++      bar: "  baz  "
++`, []*ScrapeWork{
++		{
++			ScrapeURL:      "http://xxx/metrics",
++			ScrapeInterval: defaultScrapeInterval,
++			ScrapeTimeout:  defaultScrapeTimeout,
++			MaxScrapeSize:  maxScrapeSize.N,
++			Labels: promutil.NewLabelsFromMap(map[string]string{
++				"instance": "xxx:80",
++				"job":      "foo",
++				"bar":      "baz",
++			}),
++			jobNameOriginal: "foo",
++		},
++	})
++
+ 	// Scrape config with missing source_labels for action=keep in relabel_configs must be skipped
+ 	f(`
+ scrape_configs:

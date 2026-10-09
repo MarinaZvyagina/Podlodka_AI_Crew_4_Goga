@@ -1,0 +1,268 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModel.kt b/app/src/main/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModel.kt
+index bafbb3f..036974d 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModel.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModel.kt
+@@ -39,6 +39,7 @@ import org.signal.paging.PagingConfig
+ import org.signal.paging.PagingController
+ import org.signal.paging.StateFlowPagedData
+ import org.thoughtcrime.securesms.conversationlist.chatfilter.ConversationFilterRequest
++import org.thoughtcrime.securesms.database.RxDatabaseObserver
+ import org.thoughtcrime.securesms.database.model.DistributionListPrivacyMode
+ import org.thoughtcrime.securesms.groups.SelectionLimits
+ import org.thoughtcrime.securesms.recipients.Recipient
+@@ -118,6 +119,9 @@ class ContactSearchViewModel(
+         internalConfigurationState.update { it.copy(query = query) }
+       }
+     }
++
++    // Discards cached search results whenever a message/conversation change could make them stale.
++    disposables += RxDatabaseObserver.conversationList.subscribe { searchRepository.clearCache() }
+   }
+ 
+   /** The paging controller for the current data source. Null until [setConfiguration] is called. */
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+index f47eddb..953e585 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+@@ -49,6 +49,7 @@ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.Executor;
+ 
+ import static org.thoughtcrime.securesms.database.SearchTable.SNIPPET_WRAP;
+@@ -72,6 +73,9 @@ public class SearchRepository {
+ 
+   private final Executor serialExecutor;
+ 
++  private final Map<ThreadCacheKey, ThreadSearchResult>   threadResultCache  = new ConcurrentHashMap<>();
++  private final Map<MessageCacheKey, MessageSearchResult> messageResultCache = new ConcurrentHashMap<>();
++
+   public SearchRepository(@NonNull String noteToSelfTitle) {
+     this.context           = AppDependencies.getApplication().getApplicationContext();
+     this.noteToSelfTitle   = noteToSelfTitle;
+@@ -83,8 +87,25 @@ public class SearchRepository {
+     this.serialExecutor    = new SerialExecutor(SignalExecutors.BOUNDED);
+   }
+ 
++  /**
++   * Discards all cached search results. Must be called whenever data that could affect a
++   * previously-cached search (message inserts/edits/deletes, conversation changes) occurs, since
++   * a cached result is otherwise served verbatim on a repeat search rather than re-queried.
++   */
++  public void clearCache() {
++    threadResultCache.clear();
++    messageResultCache.clear();
++  }
++
+   @WorkerThread
+   public @NonNull ThreadSearchResult queryThreadsSync(@NonNull String query, boolean unreadOnly) {
++    ThreadCacheKey     cacheKey = new ThreadCacheKey(query, unreadOnly);
++    ThreadSearchResult cached   = threadResultCache.get(cacheKey);
++
++    if (cached != null) {
++      return cached;
++    }
++
+     SignalTrace.beginSection("ConversationListSearch-Threads");
+     try {
+       long                      start  = System.currentTimeMillis();
+@@ -92,7 +113,9 @@ public class SearchRepository {
+ 
+       Log.d(TAG, "[threads] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new ThreadSearchResult(result, query);
++      ThreadSearchResult searchResult = new ThreadSearchResult(result, query);
++      threadResultCache.put(cacheKey, searchResult);
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -100,6 +123,13 @@ public class SearchRepository {
+ 
+   @WorkerThread
+   public @NonNull MessageSearchResult queryMessagesSync(@NonNull String query, @NonNull SearchFilter filter) {
++    MessageCacheKey     cacheKey = new MessageCacheKey(query, filter);
++    MessageSearchResult cached   = messageResultCache.get(cacheKey);
++
++    if (cached != null) {
++      return cached;
++    }
++
+     SignalTrace.beginSection("ConversationListSearch-Messages");
+     try {
+       long start = System.currentTimeMillis();
+@@ -111,7 +141,9 @@ public class SearchRepository {
+ 
+       Log.d(TAG, "[messages] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new MessageSearchResult(combined, query);
++      MessageSearchResult searchResult = new MessageSearchResult(combined, query);
++      messageResultCache.put(cacheKey, searchResult);
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -442,6 +474,52 @@ public class SearchRepository {
+     return combined;
+   }
+ 
++  private static final class ThreadCacheKey {
++    private final String  query;
++    private final boolean unreadOnly;
++
++    ThreadCacheKey(@NonNull String query, boolean unreadOnly) {
++      this.query      = query;
++      this.unreadOnly = unreadOnly;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++      if (this == o) return true;
++      if (!(o instanceof ThreadCacheKey)) return false;
++      ThreadCacheKey that = (ThreadCacheKey) o;
++      return unreadOnly == that.unreadOnly && query.equals(that.query);
++    }
++
++    @Override
++    public int hashCode() {
++      return Objects.hash(query, unreadOnly);
++    }
++  }
++
++  private static final class MessageCacheKey {
++    private final String       query;
++    private final SearchFilter filter;
++
++    MessageCacheKey(@NonNull String query, @NonNull SearchFilter filter) {
++      this.query  = query;
++      this.filter = filter;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++      if (this == o) return true;
++      if (!(o instanceof MessageCacheKey)) return false;
++      MessageCacheKey that = (MessageCacheKey) o;
++      return query.equals(that.query) && filter.equals(that.filter);
++    }
++
++    @Override
++    public int hashCode() {
++      return Objects.hash(query, filter);
++    }
++  }
++
+   private static class ThreadModelBuilder implements ModelBuilder<ThreadWithRecipient> {
+ 
+     private final ThreadTable threadTable;
+diff --git a/app/src/test/java/org/thoughtcrime/securesms/search/SearchRepositoryTest_caching.kt b/app/src/test/java/org/thoughtcrime/securesms/search/SearchRepositoryTest_caching.kt
+new file mode 100644
+index 0000000..924d150
+--- /dev/null
++++ b/app/src/test/java/org/thoughtcrime/securesms/search/SearchRepositoryTest_caching.kt
+@@ -0,0 +1,103 @@
++/*
++ * Copyright 2026 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.search
++
++import android.app.Application
++import assertk.assertThat
++import assertk.assertions.hasSize
++import assertk.assertions.isEmpty
++import assertk.assertions.isSameAs
++import io.mockk.every
++import org.junit.Before
++import org.junit.Rule
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import org.signal.core.models.ServiceId.ACI
++import org.signal.core.models.ServiceId.PNI
++import org.thoughtcrime.securesms.database.MessageTable
++import org.thoughtcrime.securesms.database.MessageType
++import org.thoughtcrime.securesms.database.RecipientTable
++import org.thoughtcrime.securesms.database.SignalDatabase
++import org.thoughtcrime.securesms.mms.IncomingMessage
++import org.thoughtcrime.securesms.recipients.RecipientId
++import org.thoughtcrime.securesms.testutil.RecipientTestRule
++import org.whispersystems.signalservice.api.push.ServiceIds
++import java.util.UUID
++
++/**
++ * Verifies that [SearchRepository] caches repeat identical searches and that [SearchRepository.clearCache]
++ * is what forces a subsequent search to see newly-changed data.
++ */
++@RunWith(RobolectricTestRunner::class)
++@Config(manifest = Config.NONE, application = Application::class)
++class SearchRepositoryTest_caching {
++
++  @get:Rule
++  val recipientRule = RecipientTestRule()
++
++  private lateinit var recipients: RecipientTable
++  private lateinit var messages: MessageTable
++  private lateinit var alice: RecipientId
++  private lateinit var searchRepository: SearchRepository
++
++  @Before
++  fun setUp() {
++    recipients = SignalDatabase.recipients
++    messages = SignalDatabase.messages
++
++    every { recipientRule.signalStore.account.getServiceIds() } returns ServiceIds(ACI.from(UUID.randomUUID()), PNI.from(UUID.randomUUID()))
++
++    alice = recipients.getOrInsertFromServiceId(ACI.from(UUID.randomUUID()))
++    searchRepository = SearchRepository("Note to Self")
++  }
++
++  @Test
++  fun repeatMessageSearchIsCachedUntilInvalidated() {
++    val inserted = messages.insertMessageInbox(incoming(body = "the eagle has landed")).get()
++
++    val first = searchRepository.queryMessagesSync("eagle", SearchFilter.EMPTY)
++    assertThat(first.results).hasSize(1)
++
++    messages.deleteMessage(inserted.messageId)
++
++    // Same query, no clearCache() call yet -- must return the exact cached snapshot rather than re-querying.
++    val second = searchRepository.queryMessagesSync("eagle", SearchFilter.EMPTY)
++    assertThat(second).isSameAs(first)
++
++    // Once invalidated, the same query must reflect that the message was deleted.
++    searchRepository.clearCache()
++    val third = searchRepository.queryMessagesSync("eagle", SearchFilter.EMPTY)
++    assertThat(third.results).isEmpty()
++  }
++
++  @Test
++  fun differentQueriesAreCachedIndependently() {
++    messages.insertMessageInbox(incoming(body = "the eagle has landed", sentTimeMillis = 1000))
++    messages.insertMessageInbox(incoming(body = "hello world", sentTimeMillis = 2000))
++
++    val eagleResult = searchRepository.queryMessagesSync("eagle", SearchFilter.EMPTY)
++    val helloResult = searchRepository.queryMessagesSync("hello", SearchFilter.EMPTY)
++
++    assertThat(eagleResult.results).hasSize(1)
++    assertThat(helloResult.results).hasSize(1)
++    assertThat(searchRepository.queryMessagesSync("eagle", SearchFilter.EMPTY)).isSameAs(eagleResult)
++    assertThat(searchRepository.queryMessagesSync("hello", SearchFilter.EMPTY)).isSameAs(helloResult)
++  }
++
++  private fun incoming(body: String, sentTimeMillis: Long = 1000): IncomingMessage {
++    return IncomingMessage(
++      type = MessageType.NORMAL,
++      from = alice,
++      sentTimeMillis = sentTimeMillis,
++      serverTimeMillis = sentTimeMillis,
++      receivedTimeMillis = sentTimeMillis,
++      body = body,
++      isUnidentified = true
++    )
++  }
++}

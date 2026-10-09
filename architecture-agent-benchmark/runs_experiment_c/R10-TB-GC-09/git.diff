@@ -1,0 +1,230 @@
+diff --git a/Signal/ConversationView/ConversationSearch.swift b/Signal/ConversationView/ConversationSearch.swift
+index bb0e7b0..06d5b36 100644
+--- a/Signal/ConversationView/ConversationSearch.swift
++++ b/Signal/ConversationView/ConversationSearch.swift
+@@ -39,6 +39,9 @@ public class ConversationSearchController: NSObject {
+     private var lastSearchText: String?
+     private var currentSearchTask: Task<Void, Never>?
+ 
++    /// When enabled, search results are narrowed to messages with a photo, video, voice message, or file attachment.
++    private var isAttachmentsOnlyFilterEnabled = false
++
+     // MARK: Initializer
+ 
+     public init(thread: TSThread) {
+@@ -51,11 +54,43 @@ public class ConversationSearchController: NSObject {
+ 
+         uiSearchController.hidesNavigationBarDuringPresentation = true
+         uiSearchController.obscuresBackgroundDuringPresentation = false
++
++        searchBar.delegate = self
++        searchBar.showsBookmarkButton = true
++        updateAttachmentsOnlyFilterIcon()
+     }
+ 
+     var searchBar: UISearchBar {
+         return uiSearchController.searchBar
+     }
++
++    private func updateAttachmentsOnlyFilterIcon() {
++        let icon = Theme.iconImage(.photo16)
++        if isAttachmentsOnlyFilterEnabled {
++            searchBar.setImage(icon.withTintColor(.Signal.accent, renderingMode: .alwaysOriginal), for: .bookmark, state: .normal)
++        } else {
++            searchBar.setImage(icon, for: .bookmark, state: .normal)
++        }
++    }
++}
++
++extension ConversationSearchController: UISearchBarDelegate {
++    public func searchBarBookmarkButtonClicked(_ searchBar: UISearchBar) {
++        isAttachmentsOnlyFilterEnabled.toggle()
++        updateAttachmentsOnlyFilterIcon()
++
++        let announcementKey = isAttachmentsOnlyFilterEnabled
++            ? "CONVERSATION_SEARCH_FILTER_ATTACHMENTS_ON"
++            : "CONVERSATION_SEARCH_FILTER_ATTACHMENTS_OFF"
++        UIAccessibility.post(notification: .announcement, argument: OWSLocalizedString(
++            announcementKey,
++            comment: "VoiceOver announcement when toggling the in-conversation search filter that narrows results to messages with attachments",
++        ))
++
++        // Force a refresh even if the search text hasn't changed.
++        lastSearchText = nil
++        updateSearchResults(for: uiSearchController)
++    }
+ }
+ 
+ extension ConversationSearchController: UISearchControllerDelegate {
+@@ -76,7 +111,10 @@ extension ConversationSearchController: UISearchResultsUpdating {
+     public func updateSearchResults(for searchController: UISearchController) {
+         let searchText = FullTextSearchIndexer.normalizeText((searchController.searchBar.text ?? "").stripped)
+ 
+-        guard searchText.count >= ConversationSearchController.kMinimumSearchTextLength else {
++        // The attachments-only filter can browse all shared media in the thread with no search text.
++        let canBrowseAttachmentsWithoutText = isAttachmentsOnlyFilterEnabled && searchText.isEmpty
++
++        guard searchText.count >= ConversationSearchController.kMinimumSearchTextLength || canBrowseAttachmentsWithoutText else {
+             self.resultsBar.updateResults(resultSet: nil)
+             self.delegate?.conversationSearchController(self, didUpdateSearchResults: nil)
+             self.lastSearchText = nil
+@@ -90,6 +128,8 @@ extension ConversationSearchController: UISearchResultsUpdating {
+         }
+         lastSearchText = searchText
+ 
++        let onlyMessagesWithAttachments = isAttachmentsOnlyFilterEnabled
++
+         self.currentSearchTask?.cancel()
+         self.currentSearchTask = Task {
+             let resultSet: ConversationScreenSearchResultSet
+@@ -98,6 +138,7 @@ extension ConversationSearchController: UISearchResultsUpdating {
+                     searchText: searchText,
+                     threadUniqueId: thread.uniqueId,
+                     isGroupThread: thread is TSGroupThread,
++                    onlyMessagesWithAttachments: onlyMessagesWithAttachments,
+                 )
+                 if Task.isCancelled {
+                     throw CancellationError()
+@@ -116,6 +157,7 @@ extension ConversationSearchController: UISearchResultsUpdating {
+         searchText: String,
+         threadUniqueId: String,
+         isGroupThread: Bool,
++        onlyMessagesWithAttachments: Bool,
+     ) async throws(CancellationError) -> ConversationScreenSearchResultSet {
+         let databaseStorage = SSKEnvironment.shared.databaseStorageRef
+         return try databaseStorage.read { tx throws(CancellationError) in
+@@ -123,6 +165,7 @@ extension ConversationSearchController: UISearchResultsUpdating {
+                 threadUniqueId: threadUniqueId,
+                 isGroupThread: isGroupThread,
+                 searchText: searchText,
++                onlyMessagesWithAttachments: onlyMessagesWithAttachments,
+                 transaction: tx,
+             )
+         }
+diff --git a/Signal/translations/en.lproj/Localizable.strings b/Signal/translations/en.lproj/Localizable.strings
+index c811732..c07a6c0 100644
+--- a/Signal/translations/en.lproj/Localizable.strings
++++ b/Signal/translations/en.lproj/Localizable.strings
+@@ -2575,6 +2575,12 @@
+ /* navbar header */
+ "CONVERSATION_PICKER_TITLE" = "Choose Recipients";
+ 
++/* VoiceOver announcement when toggling the in-conversation search filter that narrows results to messages with attachments */
++"CONVERSATION_SEARCH_FILTER_ATTACHMENTS_OFF" = "Attachments filter off";
++
++/* VoiceOver announcement when toggling the in-conversation search filter that narrows results to messages with attachments */
++"CONVERSATION_SEARCH_FILTER_ATTACHMENTS_ON" = "Attachments filter on";
++
+ /* keyboard toolbar label when no messages match the search string */
+ "CONVERSATION_SEARCH_NO_RESULTS" = "No matches";
+ 
+diff --git a/SignalServiceKit/Storage/MediaGallery/MediaGalleryAttachmentFinder.swift b/SignalServiceKit/Storage/MediaGallery/MediaGalleryAttachmentFinder.swift
+index 3bc78c0..3a96360 100644
+--- a/SignalServiceKit/Storage/MediaGallery/MediaGalleryAttachmentFinder.swift
++++ b/SignalServiceKit/Storage/MediaGallery/MediaGalleryAttachmentFinder.swift
+@@ -268,6 +268,48 @@ public struct MediaGalleryAttachmentFinder {
+         ).count)
+     }
+ 
++    /// Returns the sqlite row ids of messages in `threadId` that have at least one body attachment
++    /// (of any media type — photo, video, voice message, or file), optionally restricted to a given
++    /// set of candidate row ids. Used to filter in-conversation search results down to messages with
++    /// attachments, without needing a separate index: this queries the same table the "All Media"
++    /// gallery already reads from, so results always reflect the attachment's current association.
++    public static func messageRowIdsWithBodyAttachments(
++        inThreadId threadId: Int64,
++        restrictedToMessageRowIds: Set<Int64>? = nil,
++        limit: Int? = nil,
++        tx: DBReadTransaction,
++    ) -> Set<Int64> {
++        let threadIdColumn = Column(RecordType.CodingKeys.threadRowId)
++        let ownerTypeColumn = Column(RecordType.CodingKeys.ownerType)
++        let isViewOnceColumn = Column(RecordType.CodingKeys.isViewOnce)
++        let isPastEditRevisionColumn = Column(RecordType.CodingKeys.ownerIsPastEditRevision)
++        let ownerIdColumn = Column(RecordType.CodingKeys.ownerRowId)
++
++        var rowIdQuery = RecordType
++            .filter(threadIdColumn == threadId)
++            .filter(ownerTypeColumn == RecordType.OwnerType.bodyAttachment.rawValue)
++            .filter(isViewOnceColumn == false)
++            .filter(isPastEditRevisionColumn == false)
++            .select(ownerIdColumn, as: Int64.self)
++            .distinct()
++
++        if let restrictedToMessageRowIds {
++            rowIdQuery = rowIdQuery.filter(restrictedToMessageRowIds.contains(ownerIdColumn))
++        }
++
++        rowIdQuery = rowIdQuery.order(ownerIdColumn.desc)
++        if let limit {
++            rowIdQuery = rowIdQuery.limit(limit)
++        }
++
++        do {
++            return Set(try rowIdQuery.fetchAll(tx.database))
++        } catch {
++            owsFailDebug("Error fetching message row ids with attachments: \(error)")
++            return []
++        }
++    }
++
+     // MARK: - Private
+ 
+     typealias RecordType = AttachmentReference.MessageAttachmentReferenceRecord
+diff --git a/SignalUI/Search/FullTextSearcher.swift b/SignalUI/Search/FullTextSearcher.swift
+index 1bf2114..24af41b 100644
+--- a/SignalUI/Search/FullTextSearcher.swift
++++ b/SignalUI/Search/FullTextSearcher.swift
+@@ -644,6 +644,7 @@ public class FullTextSearcher {
+         isGroupThread: Bool,
+         searchText: String,
+         maxResults: Int = kDefaultMaxResults,
++        onlyMessagesWithAttachments: Bool = false,
+         transaction: DBReadTransaction,
+     ) throws(CancellationError) -> ConversationScreenSearchResultSet {
+         var messages: [UInt64: MessageSearchResult] = [:]
+@@ -654,6 +655,27 @@ public class FullTextSearcher {
+             messages[message.sortId] = searchResult
+         }
+ 
++        let threadRowId = TSThread.fetchViaCache(uniqueId: threadUniqueId, transaction: transaction)?.sqliteRowId
++
++        guard !searchText.isEmpty else {
++            // The filter alone (no search text) browses all attachment-bearing messages in the thread.
++            guard onlyMessagesWithAttachments, let threadRowId else {
++                return ConversationScreenSearchResultSet(searchText: searchText, messages: [])
++            }
++            let attachmentRowIds = MediaGalleryAttachmentFinder.messageRowIdsWithBodyAttachments(
++                inThreadId: threadRowId,
++                limit: maxResults,
++                tx: transaction,
++            )
++            for rowId in attachmentRowIds {
++                guard let message = DependenciesBridge.shared.interactionStore.fetchInteraction(rowId: rowId, tx: transaction) as? TSMessage else {
++                    continue
++                }
++                appendMessage(message)
++            }
++            return ConversationScreenSearchResultSet(searchText: searchText, messages: messages.values.sorted(by: >))
++        }
++
+         FullTextSearchIndexer.search(
+             for: searchText,
+             maxResults: maxResults,
+@@ -696,6 +718,16 @@ public class FullTextSearcher {
+             }
+         }
+ 
++        if onlyMessagesWithAttachments, let threadRowId {
++            let candidateRowIds = Set(messages.keys.map { Int64($0) })
++            let attachmentRowIds = MediaGalleryAttachmentFinder.messageRowIdsWithBodyAttachments(
++                inThreadId: threadRowId,
++                restrictedToMessageRowIds: candidateRowIds,
++                tx: transaction,
++            )
++            messages = messages.filter { sortId, _ in attachmentRowIds.contains(Int64(sortId)) }
++        }
++
+         // We want most recent first
+         let sortedMessages = messages.values.sorted(by: >)
+ 

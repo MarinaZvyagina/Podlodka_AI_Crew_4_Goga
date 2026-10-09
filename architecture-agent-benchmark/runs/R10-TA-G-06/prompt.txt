@@ -1,0 +1,12 @@
+Right now, when someone controls which network conditions are required before Signal automatically downloads photos, videos, audio, and other files shared in a chat, voice messages are lumped in with regular audio attachments — they follow the exact same on/off/Wi-Fi-only rule as, say, a music file someone sent as a document.
+
+Several users have asked for voice messages to be treated as their own category, separate from other audio attachments. For example, someone might want short voice messages to always come through immediately (even on cellular), while still keeping large audio file attachments restricted to Wi-Fi only to save data.
+
+Please add a new, independently configurable auto-download setting specifically for voice messages, alongside the existing per-type controls (photos, videos, audio, documents). It should:
+
+- Appear in the data/network usage settings screen next to the other auto-download categories, with its own on/never/Wi-Fi-only/Wi-Fi-and-cellular style choice.
+- Persist across app launches, the same way the other auto-download preferences already do.
+- Actually change whether a voice message attachment gets auto-downloaded — this needs to be a real behavior change in the download logic, not just a new row in the settings UI.
+- Leave the existing behavior for non-voice audio attachments (e.g., a song or audio file someone sends as a regular attachment) unchanged.
+
+Small, very short voice messages that are auto-downloaded immediately regardless of network settings today should keep that fast-path behavior — this task is about giving users control over the larger voice messages that currently just inherit the general audio rule.

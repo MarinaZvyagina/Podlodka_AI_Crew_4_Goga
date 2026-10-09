@@ -1,0 +1,360 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/mediasend/SkipTransformMediaTransform.java b/app/src/main/java/org/thoughtcrime/securesms/mediasend/SkipTransformMediaTransform.java
+new file mode 100644
+index 0000000..bb519f4
+--- /dev/null
++++ b/app/src/main/java/org/thoughtcrime/securesms/mediasend/SkipTransformMediaTransform.java
+@@ -0,0 +1,37 @@
++package org.thoughtcrime.securesms.mediasend;
++
++import android.content.Context;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.WorkerThread;
++
++import org.signal.core.models.media.Media;
++import org.signal.core.models.media.TransformProperties;
++
++/**
++ * Marks {@link TransformProperties#skipTransform} on the transformed media, so the attachment is sent as-is instead of
++ * going through the normal compression pass. Safe to use in a pipeline with other transforms.
++ */
++public final class SkipTransformMediaTransform implements MediaTransform {
++
++  @WorkerThread
++  @Override
++  public @NonNull Media transform(@NonNull Context context, @NonNull Media media) {
++    TransformProperties existing = media.getTransformProperties();
++    TransformProperties updated  = (existing != null ? existing : TransformProperties.empty()).withSkipTransform();
++
++    return new Media(media.getUri(),
++                      media.getContentType(),
++                      media.getDate(),
++                      media.getWidth(),
++                      media.getHeight(),
++                      media.getSize(),
++                      media.getDuration(),
++                      media.isBorderless(),
++                      media.isVideoGif(),
++                      media.getBucketId(),
++                      media.getCaption(),
++                      updated,
++                      media.getFileName());
++  }
++}
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/mediasend/v2/MediaSelectionRepository.kt b/app/src/main/java/org/thoughtcrime/securesms/mediasend/v2/MediaSelectionRepository.kt
+index 0aecb08..9adb54d 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/mediasend/v2/MediaSelectionRepository.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/mediasend/v2/MediaSelectionRepository.kt
+@@ -33,6 +33,7 @@ import org.thoughtcrime.securesms.mediasend.MediaSendActivityResult
+ import org.thoughtcrime.securesms.mediasend.MediaTransform
+ import org.thoughtcrime.securesms.mediasend.MediaUploadRepository
+ import org.thoughtcrime.securesms.mediasend.SentMediaQualityTransform
++import org.thoughtcrime.securesms.mediasend.SkipTransformMediaTransform
+ import org.thoughtcrime.securesms.mediasend.VideoTrimTransform
+ import org.thoughtcrime.securesms.mms.GifSlide
+ import org.thoughtcrime.securesms.mms.ImageSlide
+@@ -88,7 +89,8 @@ class MediaSelectionRepository(context: Context) {
+     mentions: List<Mention>,
+     bodyRanges: BodyRangeList?,
+     sendType: MessageSendType,
+-    scheduledTime: Long = -1
++    scheduledTime: Long = -1,
++    fullQualityMediaUris: Set<Uri> = emptySet()
+   ): Maybe<MediaSendActivityResult> {
+     if (selectedMedia.isEmpty()) {
+       throw IllegalStateException("No selected media!")
+@@ -100,7 +102,7 @@ class MediaSelectionRepository(context: Context) {
+       val trimmedBody: String = if (isViewOnce) "" else getTruncatedBody(message?.toString()?.trim()) ?: ""
+       val trimmedMentions: List<Mention> = if (isViewOnce) emptyList() else mentions
+       val trimmedBodyRanges: BodyRangeList? = if (isViewOnce) null else bodyRanges
+-      val modelsToTransform: Map<Media, MediaTransform> = buildModelsToTransform(selectedMedia, stateMap, quality)
++      val modelsToTransform: Map<Media, MediaTransform> = buildModelsToTransform(selectedMedia, stateMap, quality, fullQualityMediaUris)
+       val oldToNewMediaMap: Map<Media, Media> = MediaRepository.transformMediaSync(context, selectedMedia, modelsToTransform)
+       val updatedMedia = oldToNewMediaMap.values.toList()
+ 
+@@ -251,7 +253,8 @@ class MediaSelectionRepository(context: Context) {
+   private fun buildModelsToTransform(
+     selectedMedia: List<Media>,
+     stateMap: Map<Uri, Any>,
+-    quality: SentMediaQuality
++    quality: SentMediaQuality,
++    fullQualityMediaUris: Set<Uri> = emptySet()
+   ): Map<Media, MediaTransform> {
+     val modelsToRender: MutableMap<Media, MediaTransform> = mutableMapOf()
+ 
+@@ -277,6 +280,17 @@ class MediaSelectionRepository(context: Context) {
+           CompositeMediaTransform(existingTransform, SentMediaQualityTransform(quality))
+         }
+       }
++
++      // Applied last so a per-item full-quality override always wins over the batch-wide quality setting above.
++      if (it.uri in fullQualityMediaUris) {
++        val existingTransform: MediaTransform? = modelsToRender[it]
++
++        modelsToRender[it] = if (existingTransform == null) {
++          SkipTransformMediaTransform()
++        } else {
++          CompositeMediaTransform(existingTransform, SkipTransformMediaTransform())
++        }
++      }
+     }
+ 
+     return modelsToRender
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/mediasend/v3/MediaSendV3Repository.kt b/app/src/main/java/org/thoughtcrime/securesms/mediasend/v3/MediaSendV3Repository.kt
+index e5a7ccc..e87871a 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/mediasend/v3/MediaSendV3Repository.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/mediasend/v3/MediaSendV3Repository.kt
+@@ -224,6 +224,7 @@ object MediaSendV3Repository : MediaSendRepository {
+         selectedMedia = request.selectedMedia,
+         stateMap = legacyEditorStateMap,
+         quality = request.quality,
++        fullQualityMediaUris = request.fullQualityMediaUris,
+         message = request.message,
+         isViewOnce = request.isViewOnce,
+         singleContact = singleContact,
+diff --git a/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowEvent.kt b/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowEvent.kt
+index ee2ec7e..11be95e 100644
+--- a/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowEvent.kt
++++ b/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowEvent.kt
+@@ -47,6 +47,7 @@ internal sealed interface MediaSendFlowEvent {
+   data class VideoTrimChanged(val videoTrimData: VideoTrimData, val editingComplete: Boolean) : MediaSendFlowEvent
+   data object ToggleViewOnce : MediaSendFlowEvent
+   data object ToggleVideoMuted : MediaSendFlowEvent
++  data object ToggleFullQuality : MediaSendFlowEvent
+ 
+   //endregion
+ 
+diff --git a/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowState.kt b/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowState.kt
+index 3f0b2a4..933663a 100644
+--- a/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowState.kt
++++ b/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowState.kt
+@@ -47,6 +47,12 @@ data class MediaSendFlowState(
+    * Per-media editor state keyed by URI (video trim data, image editor data, etc.).
+    */
+   val editorStateMap: Map<Uri, EditorState> = emptyMap(),
++  /**
++   * URIs of media the user has marked to send at full/original quality, overriding [sentMediaQuality] for just those
++   * items. A plain set rather than part of [editorStateMap] because it stacks with an item's other edits instead of
++   * replacing them.
++   */
++  val fullQualityMediaUris: Set<Uri> = emptySet(),
+   /**
+    * View-once toggle state. Cycles: OFF -> ONCE -> OFF.
+    */
+diff --git a/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowViewModel.kt b/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowViewModel.kt
+index b0f4a18..4790a78 100644
+--- a/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowViewModel.kt
++++ b/feature/media-send/src/main/java/org/signal/mediasend/MediaSendFlowViewModel.kt
+@@ -261,6 +261,7 @@ class MediaSendFlowViewModel(
+       )
+       MediaSendFlowEvent.ToggleViewOnce -> toggleViewOnce()
+       MediaSendFlowEvent.ToggleVideoMuted -> toggleVideoMuted()
++      MediaSendFlowEvent.ToggleFullQuality -> toggleFullQuality()
+ 
+       is MediaSendFlowEvent.AddMessageRequested -> onAddMessageRequested(event.startWithEmojiKeyboard)
+       is MediaSendFlowEvent.ScheduleSendRequested -> onScheduleSendClick(event.option)
+@@ -775,6 +776,34 @@ class MediaSendFlowViewModel(
+     )
+   }
+ 
++  /**
++   * Toggles whether the focused item is sent at full/original quality, overriding [MediaSendFlowState.sentMediaQuality]
++   * for just that one item. Any pre-upload already in flight for it is canceled so it is not sent compressed; [send]
++   * re-uploads it once the override is reflected in [MediaSendFlowState.fullQualityMediaUris].
++   */
++  private fun toggleFullQuality() {
++    val snapshot = state.value
++    val uri = snapshot.focusedMedia?.uri ?: return
++    val isNowFullQuality = uri !in snapshot.fullQualityMediaUris
++
++    updateState {
++      copy(
++        fullQualityMediaUris = if (isNowFullQuality) fullQualityMediaUris + uri else fullQualityMediaUris - uri
++      )
++    }
++
++    if (isNowFullQuality) {
++      internalToastEvents.trySend(
++        ToastEvent(
++          icon = SignalIcons.QualityHigh,
++          message = ToastMessage.Text(R.string.MediaSendViewModel__item_will_be_sent_in_full_quality)
++        )
++      )
++    }
++
++    snapshot.selectedMedia.firstOrNull { it.uri == uri }?.let { preUploadController.cancelUpload(it) }
++  }
++
+   //endregion
+ 
+   //region Video Editing
+@@ -1148,6 +1177,7 @@ class MediaSendFlowViewModel(
+     val request = SendRequest(
+       selectedMedia = snapshot.selectedMedia,
+       editorStateMap = snapshot.editorStateMap,
++      fullQualityMediaUris = snapshot.fullQualityMediaUris,
+       quality = snapshot.sentMediaQuality,
+       message = snapshot.message,
+       isViewOnce = isViewOnceEnabled(),
+diff --git a/feature/media-send/src/main/java/org/signal/mediasend/MediaSendRepository.kt b/feature/media-send/src/main/java/org/signal/mediasend/MediaSendRepository.kt
+index 982b8d6..2e5eed9 100644
+--- a/feature/media-send/src/main/java/org/signal/mediasend/MediaSendRepository.kt
++++ b/feature/media-send/src/main/java/org/signal/mediasend/MediaSendRepository.kt
+@@ -219,7 +219,9 @@ data class SendRequest(
+   /**
+    * Media already pre-uploaded by the flow, so the send does not have to upload it again.
+    */
+-  val preUploadResults: List<PreUploadResult> = emptyList()
++  val preUploadResults: List<PreUploadResult> = emptyList(),
++  /** URIs of [selectedMedia] to send at full/original quality, overriding [quality] for just those items. */
++  val fullQualityMediaUris: Set<Uri> = emptySet()
+ )
+ 
+ /**
+diff --git a/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditScreenEvents.kt b/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditScreenEvents.kt
+index 244ba93..f47da8d 100644
+--- a/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditScreenEvents.kt
++++ b/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditScreenEvents.kt
+@@ -37,4 +37,5 @@ sealed interface MediaEditScreenEvents {
+   data class VideoTrimChanged(val videoTrimData: VideoTrimData, val editingComplete: Boolean) : MediaEditScreenEvents
+   data class VideoSeek(val positionUs: Long, val editingComplete: Boolean) : MediaEditScreenEvents
+   data object ToggleVideoMuted : MediaEditScreenEvents
++  data object ToggleFullQuality : MediaEditScreenEvents
+ }
+diff --git a/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditState.kt b/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditState.kt
+index 99807a7..cdb2c94 100644
+--- a/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditState.kt
++++ b/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditState.kt
+@@ -22,6 +22,8 @@ internal data class MediaEditState(
+   val selectedMedia: List<Media> = emptyList(),
+   val focusedMedia: Media? = null,
+   val editorStateMap: Map<Uri, EditorState> = emptyMap(),
++  /** URIs of media marked to send at full/original quality, overriding [sentMediaQuality] for just those items. */
++  val fullQualityMediaUris: Set<Uri> = emptySet(),
+   /** The camera-first capture, which backing out of the editor discards rather than keeps. */
+   val cameraFirstCapture: Media? = null,
+   /** The single recipient this media is headed to, or null when the destination is still to be chosen. */
+@@ -59,6 +61,7 @@ internal data class MediaEditState(
+     selectedMedia = parentState.selectedMedia,
+     focusedMedia = parentState.focusedMedia,
+     editorStateMap = parentState.editorStateMap,
++    fullQualityMediaUris = parentState.fullQualityMediaUris,
+     cameraFirstCapture = parentState.cameraFirstCapture,
+     recipientId = parentState.recipientId,
+     message = parentState.message,
+diff --git a/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditViewModel.kt b/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditViewModel.kt
+index 46557d6..f9bfcb0 100644
+--- a/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditViewModel.kt
++++ b/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditViewModel.kt
+@@ -77,6 +77,7 @@ internal class MediaEditViewModel(
+       is MediaEditScreenEvents.VideoTrimChanged -> parentEventEmitter(MediaSendFlowEvent.VideoTrimChanged(event.videoTrimData, event.editingComplete))
+       MediaEditScreenEvents.ToggleViewOnce -> parentEventEmitter(MediaSendFlowEvent.ToggleViewOnce)
+       MediaEditScreenEvents.ToggleVideoMuted -> parentEventEmitter(MediaSendFlowEvent.ToggleVideoMuted)
++      MediaEditScreenEvents.ToggleFullQuality -> parentEventEmitter(MediaSendFlowEvent.ToggleFullQuality)
+       is MediaEditScreenEvents.AddMessageClick -> parentEventEmitter(MediaSendFlowEvent.AddMessageRequested(event.startWithEmojiKeyboard))
+       is MediaEditScreenEvents.ScheduleSendClick -> parentEventEmitter(MediaSendFlowEvent.ScheduleSendRequested(event.option))
+       MediaEditScreenEvents.StickerClick -> parentEventEmitter(MediaSendFlowEvent.StickerRequested)
+diff --git a/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditorToolbar.kt b/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditorToolbar.kt
+index a047a73..49c2f4c 100644
+--- a/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditorToolbar.kt
++++ b/feature/media-send/src/main/java/org/signal/mediasend/screens/edit/MediaEditorToolbar.kt
+@@ -25,6 +25,7 @@ import androidx.compose.runtime.setValue
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.graphics.vector.ImageVector
+ import androidx.compose.ui.platform.testTag
++import androidx.compose.ui.res.stringResource
+ import androidx.compose.ui.unit.dp
+ import org.signal.core.ui.WindowBreakpoint
+ import org.signal.core.ui.compose.IconButtons
+@@ -32,6 +33,7 @@ import org.signal.core.ui.compose.SignalIcons
+ import org.signal.core.ui.compose.copied.androidx.compose.material3.IconButtonColors
+ import org.signal.core.ui.rememberWindowBreakpoint
+ import org.signal.mediasend.EditorState
++import org.signal.mediasend.R
+ import org.signal.mediasend.SentMediaQuality
+ import org.signal.mediasend.test.TestTags
+ 
+@@ -133,6 +135,23 @@ internal fun MediaEditorToolbarSharedButtons(
+     )
+   }
+ 
++  if (isFullQualityVisible(state, editorState)) {
++    val isFullQuality = state.focusedMedia?.uri in state.fullQualityMediaUris
++
++    MediaEditorToolbarButton(
++      imageVector = SignalIcons.QualityHigh.imageVector,
++      onClick = { onEvent(MediaEditScreenEvents.ToggleFullQuality) },
++      enabled = enabled,
++      contentDescription = stringResource(id = R.string.MediaEditorToolbar__full_quality_button),
++      colors = if (isFullQuality) {
++        IconButtons.iconButtonColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
++      } else {
++        IconButtons.iconButtonColors()
++      },
++      modifier = Modifier.testTag(TestTags.MEDIA_EDITOR_TOOLBAR_FULL_QUALITY_BUTTON)
++    )
++  }
++
+   if (editorState is EditorState.VideoTrim && isMuteVisible(state, editorState)) {
+     MediaEditorToolbarButton(
+       imageVector = if (editorState.videoTrimData.isMuted) SignalIcons.SpeakerSlash.imageVector else SignalIcons.Speaker.imageVector,
+@@ -165,6 +184,14 @@ private fun isQualityVisible(state: MediaEditState, editorState: EditorState): B
+   return !state.isStory && editorState !is EditorState.Document
+ }
+ 
++/**
++ * The full-quality override is a per-item exception to the batch quality, so it only makes sense wherever the batch
++ * quality control itself does.
++ */
++private fun isFullQualityVisible(state: MediaEditState, editorState: EditorState): Boolean {
++  return isQualityVisible(state, editorState)
++}
++
+ private fun isSaveVisible(editorState: EditorState): Boolean {
+   return editorState is EditorState.Image || editorState is EditorState.Gif
+ }
+@@ -186,5 +213,9 @@ internal fun isAddMediaVisible(state: MediaEditState, editorState: EditorState?)
+  * toolbar rather than leave an empty one behind.
+  */
+ internal fun hasSharedToolbarButtons(state: MediaEditState, editorState: EditorState): Boolean {
+-  return isQualityVisible(state, editorState) || isMuteVisible(state, editorState) || isSaveVisible(editorState) || isAddMediaVisible(state, editorState)
++  return isQualityVisible(state, editorState) ||
++    isFullQualityVisible(state, editorState) ||
++    isMuteVisible(state, editorState) ||
++    isSaveVisible(editorState) ||
++    isAddMediaVisible(state, editorState)
+ }
+diff --git a/feature/media-send/src/main/java/org/signal/mediasend/test/TestTags.kt b/feature/media-send/src/main/java/org/signal/mediasend/test/TestTags.kt
+index e97ed38..57e1edd 100644
+--- a/feature/media-send/src/main/java/org/signal/mediasend/test/TestTags.kt
++++ b/feature/media-send/src/main/java/org/signal/mediasend/test/TestTags.kt
+@@ -18,6 +18,7 @@ object TestTags {
+   const val MEDIA_EDITOR_TOOLBAR_SAVE_BUTTON = "media_editor_toolbar_save_button"
+   const val MEDIA_EDITOR_TOOLBAR_ADD_MEDIA_BUTTON = "media_editor_toolbar_add_media_button"
+   const val MEDIA_EDITOR_TOOLBAR_MUTE_BUTTON = "media_editor_toolbar_mute_button"
++  const val MEDIA_EDITOR_TOOLBAR_FULL_QUALITY_BUTTON = "media_editor_toolbar_full_quality_button"
+ 
+   // Media Edit Screen
+ 
+diff --git a/feature/media-send/src/main/res/values/strings.xml b/feature/media-send/src/main/res/values/strings.xml
+index abb0c90..5cf3fb0 100644
+--- a/feature/media-send/src/main/res/values/strings.xml
++++ b/feature/media-send/src/main/res/values/strings.xml
+@@ -56,6 +56,8 @@
+   <string name="QualitySelectorBottomSheetDialog__high">High</string>
+   <!-- Label for our high quality media conversion. This has better quality than standard. -->
+   <string name="QualitySelectorBottomSheetDialog__slower_more_data">Slower, more data</string>
++  <!-- Accessibility label for the media editor toolbar button that marks a single attachment to send at full/original quality, overriding the quality picked for the rest of the batch. -->
++  <string name="MediaEditorToolbar__full_quality_button">Send in full quality</string>
+   <!-- Title heading for our media conversion quality selector. -->
+   <string name="QualitySelectorBottomSheetDialog__media_quality">Media quality</string>
+   <!-- Title of the screen where the user browses their device gallery to pick media to send. -->
+@@ -233,6 +235,8 @@
+   <string name="MediaSendViewModel__signal_needs_the_storage_permission">Signal needs the Storage permission in order to save to external storage, but it has been permanently denied. Please continue to app settings, select \"Permissions\", and enable \"Storage\".</string>
+   <!-- Message shown when the user disables audio on a video -->
+   <string name="MediaSendViewModel__video_will_be_sent_without_audio">Video will be sent without audio</string>
++  <!-- Message shown when the user marks a single attachment to be sent at full/original quality -->
++  <string name="MediaSendViewModel__item_will_be_sent_in_full_quality">This item will be sent in full quality</string>
+ 
+   <!-- The title of a dialog notifying that a user was found matching a scanned QR code. The placeholder is a username. Usernames are always latin characters. -->
+   <string name="UsernameScannedDialog__username_dialog_title">Found %1$s</string>

@@ -1,0 +1,524 @@
+diff --git a/server/etcdserver/caching_kv.go b/server/etcdserver/caching_kv.go
+new file mode 100644
+index 000000000..b42576bff
+--- /dev/null
++++ b/server/etcdserver/caching_kv.go
+@@ -0,0 +1,62 @@
++// Copyright 2025 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package etcdserver
++
++import (
++	"go.etcd.io/etcd/pkg/v3/traceutil"
++	"go.etcd.io/etcd/server/v3/storage/backend"
++	"go.etcd.io/etcd/server/v3/storage/mvcc"
++)
++
++// cachingKV wraps a WatchableKV so that every write transaction reports its
++// changes to a rangeCache before the transaction commits, keeping the cache
++// used by EtcdServer.Range coherent with the store. All other behavior is
++// delegated unchanged to the wrapped KV.
++type cachingKV struct {
++	mvcc.WatchableKV
++	cache *rangeCache
++}
++
++func newCachingKV(kv mvcc.WatchableKV, cache *rangeCache) mvcc.WatchableKV {
++	return &cachingKV{WatchableKV: kv, cache: cache}
++}
++
++func (c *cachingKV) Write(trace *traceutil.Trace) mvcc.TxnWrite {
++	return &cachingTxnWrite{TxnWrite: c.WatchableKV.Write(trace), cache: c.cache}
++}
++
++// Restore replaces the store wholesale (e.g. installing a snapshot), so no
++// previously cached entry can be assumed to still be accurate.
++func (c *cachingKV) Restore(b backend.Backend) error {
++	c.cache.reset()
++	return c.WatchableKV.Restore(b)
++}
++
++// cachingTxnWrite reports this transaction's changes to a rangeCache before
++// they become visible to any reader, so that no concurrent cache lookup can
++// observe a stale entry once this transaction has committed.
++type cachingTxnWrite struct {
++	mvcc.TxnWrite
++	cache *rangeCache
++}
++
++func (tw *cachingTxnWrite) End() {
++	changes := tw.Changes()
++	if len(changes) != 0 {
++		newRev := tw.TxnWrite.Rev() + 1
++		tw.cache.onCommit(newRev, changes)
++	}
++	tw.TxnWrite.End()
++}
+diff --git a/server/etcdserver/range_cache.go b/server/etcdserver/range_cache.go
+new file mode 100644
+index 000000000..2128f5af2
+--- /dev/null
++++ b/server/etcdserver/range_cache.go
+@@ -0,0 +1,192 @@
++// Copyright 2025 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package etcdserver
++
++import (
++	"bytes"
++	"sync"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/api/v3/mvccpb"
++)
++
++// maxRangeCacheEntries bounds how many distinct range queries are kept
++// cached at once, so a workload that issues many distinct one-off range
++// queries cannot grow the cache without limit. Once the cap is hit, new
++// entries simply aren't cached until room frees up; existing entries keep
++// serving hits.
++const maxRangeCacheEntries = 512
++
++// rangeCacheKey identifies a cacheable Range request: every request field
++// that can change the result set, excluding Revision (only current-revision
++// reads, Revision == 0, are cached; a request pinned to a historical
++// revision bypasses the cache entirely) and Serializable/Linearizable
++// (the caller has already resolved the requested consistency guarantee into
++// "read local state now" by the time the cache is consulted, so a cached
++// entry is equally valid for either).
++type rangeCacheKey struct {
++	key, rangeEnd     string
++	limit             int64
++	sortOrder         pb.RangeRequest_SortOrder
++	sortTarget        pb.RangeRequest_SortTarget
++	keysOnly          bool
++	countOnly         bool
++	minModRevision    int64
++	maxModRevision    int64
++	minCreateRevision int64
++	maxCreateRevision int64
++}
++
++func newRangeCacheKey(r *pb.RangeRequest) rangeCacheKey {
++	return rangeCacheKey{
++		key:               string(r.Key),
++		rangeEnd:          string(r.RangeEnd),
++		limit:             r.Limit,
++		sortOrder:         r.SortOrder,
++		sortTarget:        r.SortTarget,
++		keysOnly:          r.KeysOnly,
++		countOnly:         r.CountOnly,
++		minModRevision:    r.MinModRevision,
++		maxModRevision:    r.MaxModRevision,
++		minCreateRevision: r.MinCreateRevision,
++		maxCreateRevision: r.MaxCreateRevision,
++	}
++}
++
++// rangeCacheEntry is a cached response for the range [key, rangeEnd), kept
++// alongside the store revision it is known to still be accurate for.
++type rangeCacheEntry struct {
++	key, rangeEnd []byte
++
++	rev   int64
++	kvs   []*mvccpb.KeyValue
++	more  bool
++	count int64
++}
++
++// overlaps reports whether a write to k could affect this entry's range, per
++// the same [key, rangeEnd) semantics RangeRequest uses (see mkGteRange):
++// an empty RangeEnd means a single-key request, and a RangeEnd of []byte{0}
++// means "from key to the end of the keyspace".
++func (e *rangeCacheEntry) overlaps(k []byte) bool {
++	if bytes.Compare(k, e.key) < 0 {
++		return false
++	}
++	switch {
++	case len(e.rangeEnd) == 0:
++		return bytes.Equal(k, e.key)
++	case len(e.rangeEnd) == 1 && e.rangeEnd[0] == 0:
++		return true
++	default:
++		return bytes.Compare(k, e.rangeEnd) < 0
++	}
++}
++
++// rangeCache caches RangeResponses for repeated, identical current-revision
++// Range requests. It is kept coherent with writes synchronously: every
++// mutating transaction reports its changed keys and new revision to
++// onCommit before the transaction's mutations become visible to any reader
++// (see cachingTxnWrite.End), so a lookup can never observe an entry that is
++// staler than the data a fresh, uncached read would return at that moment.
++type rangeCache struct {
++	mu      sync.Mutex
++	entries map[rangeCacheKey]*rangeCacheEntry
++}
++
++func newRangeCache() *rangeCache {
++	return &rangeCache{entries: make(map[rangeCacheKey]*rangeCacheEntry)}
++}
++
++// get returns a fresh response built from a cached entry, if one exists for
++// this exact request. The returned response owns its own Header so callers
++// may freely mutate it (e.g. to fill in cluster metadata) without racing
++// with concurrent cache users or with onCommit updating the entry.
++func (c *rangeCache) get(r *pb.RangeRequest) (*pb.RangeResponse, bool) {
++	if r.Revision != 0 {
++		return nil, false
++	}
++	c.mu.Lock()
++	e, ok := c.entries[newRangeCacheKey(r)]
++	if !ok {
++		c.mu.Unlock()
++		return nil, false
++	}
++	resp := &pb.RangeResponse{
++		Header: &pb.ResponseHeader{Revision: e.rev},
++		Kvs:    e.kvs,
++		More:   e.more,
++		Count:  e.count,
++	}
++	c.mu.Unlock()
++	return resp, true
++}
++
++// put caches resp for r, unless r pins a historical revision or the cache is
++// already at capacity.
++func (c *rangeCache) put(r *pb.RangeRequest, resp *pb.RangeResponse) {
++	if r.Revision != 0 {
++		return
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if len(c.entries) >= maxRangeCacheEntries {
++		return
++	}
++	c.entries[newRangeCacheKey(r)] = &rangeCacheEntry{
++		key:      append([]byte(nil), r.Key...),
++		rangeEnd: append([]byte(nil), r.RangeEnd...),
++		rev:      resp.Header.Revision,
++		kvs:      resp.Kvs,
++		more:     resp.More,
++		count:    resp.Count,
++	}
++}
++
++// onCommit is called synchronously as part of a write transaction's commit,
++// strictly before its mutations become visible to any reader (see
++// cachingTxnWrite.End). Entries whose range contains a changed key are
++// dropped; every surviving entry's tracked revision is advanced to newRev so
++// it keeps accurately reporting the store's current revision even though
++// its data was left untouched by this write.
++func (c *rangeCache) onCommit(newRev int64, changes []*mvccpb.KeyValue) {
++	if len(changes) == 0 {
++		return
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	for k, e := range c.entries {
++		affected := false
++		for _, kv := range changes {
++			if e.overlaps(kv.Key) {
++				affected = true
++				break
++			}
++		}
++		if affected {
++			delete(c.entries, k)
++		} else {
++			e.rev = newRev
++		}
++	}
++}
++
++// reset drops every cached entry. Used when the underlying store is wholly
++// replaced (e.g. restoring from a snapshot), after which no previously
++// cached entry can be assumed accurate.
++func (c *rangeCache) reset() {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.entries = make(map[rangeCacheKey]*rangeCacheEntry)
++}
+diff --git a/server/etcdserver/range_cache_test.go b/server/etcdserver/range_cache_test.go
+new file mode 100644
+index 000000000..4dafb1435
+--- /dev/null
++++ b/server/etcdserver/range_cache_test.go
+@@ -0,0 +1,144 @@
++// Copyright 2025 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package etcdserver
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/api/v3/mvccpb"
++)
++
++func TestRangeCacheHitOnIdenticalRequest(t *testing.T) {
++	c := newRangeCache()
++	req := &pb.RangeRequest{Key: []byte("foo")}
++	resp := &pb.RangeResponse{
++		Header: &pb.ResponseHeader{Revision: 5},
++		Kvs:    []*mvccpb.KeyValue{{Key: []byte("foo"), Value: []byte("bar")}},
++	}
++
++	_, ok := c.get(req)
++	require.False(t, ok, "expected miss before anything is cached")
++
++	c.put(req, resp)
++
++	got, ok := c.get(req)
++	require.True(t, ok, "expected hit for an identical repeated request")
++	assert.Equal(t, resp.Kvs, got.Kvs)
++	assert.Equal(t, int64(5), got.Header.Revision)
++
++	// The response returned by a hit must be a distinct object so that a
++	// caller mutating its Header (as the v3rpc layer does) cannot race with
++	// another concurrent cache user or with onCommit.
++	assert.NotSame(t, resp.Header, got.Header)
++}
++
++func TestRangeCacheMissOnDifferentParams(t *testing.T) {
++	c := newRangeCache()
++	base := &pb.RangeRequest{Key: []byte("foo")}
++	c.put(base, &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: 1}})
++
++	variants := []*pb.RangeRequest{
++		{Key: []byte("bar")},
++		{Key: []byte("foo"), RangeEnd: []byte("zzz")},
++		{Key: []byte("foo"), Limit: 10},
++		{Key: []byte("foo"), KeysOnly: true},
++		{Key: []byte("foo"), CountOnly: true},
++		{Key: []byte("foo"), MinModRevision: 3},
++		{Key: []byte("foo"), Revision: 1}, // pinned historical revision: always bypassed
++	}
++	for _, r := range variants {
++		_, ok := c.get(r)
++		assert.False(t, ok, "expected miss for varied request %+v", r)
++	}
++}
++
++func TestRangeCacheBypassesPinnedRevision(t *testing.T) {
++	c := newRangeCache()
++	req := &pb.RangeRequest{Key: []byte("foo"), Revision: 42}
++	c.put(req, &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: 42}})
++
++	_, ok := c.get(req)
++	assert.False(t, ok, "requests pinned to a historical revision must never be cached")
++}
++
++func TestRangeCacheInvalidatesOnOverlappingWrite(t *testing.T) {
++	c := newRangeCache()
++	req := &pb.RangeRequest{Key: []byte("a"), RangeEnd: []byte("z")}
++	c.put(req, &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: 1}, Kvs: []*mvccpb.KeyValue{{Key: []byte("m")}}})
++
++	c.onCommit(2, []*mvccpb.KeyValue{{Key: []byte("m")}})
++
++	_, ok := c.get(req)
++	assert.False(t, ok, "a write to a key inside the cached range must invalidate the entry")
++}
++
++func TestRangeCacheSurvivesNonOverlappingWriteAndAdvancesRevision(t *testing.T) {
++	c := newRangeCache()
++	req := &pb.RangeRequest{Key: []byte("a"), RangeEnd: []byte("b")}
++	c.put(req, &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: 1}, Kvs: []*mvccpb.KeyValue{{Key: []byte("a")}}})
++
++	// A write to an unrelated key must not evict the entry, but the store's
++	// revision has still advanced, so the entry must report the new
++	// revision on the next hit -- exactly what an uncached read would
++	// report, since nothing in the cached range changed.
++	c.onCommit(2, []*mvccpb.KeyValue{{Key: []byte("unrelated")}})
++
++	got, ok := c.get(req)
++	require.True(t, ok, "a write outside the cached range must not evict the entry")
++	assert.Equal(t, int64(2), got.Header.Revision)
++}
++
++func TestRangeCacheSingleKeyOverlap(t *testing.T) {
++	e := &rangeCacheEntry{key: []byte("foo")}
++	assert.True(t, e.overlaps([]byte("foo")))
++	assert.False(t, e.overlaps([]byte("foobar")))
++	assert.False(t, e.overlaps([]byte("bar")))
++}
++
++func TestRangeCacheFromKeyOverlap(t *testing.T) {
++	e := &rangeCacheEntry{key: []byte("m"), rangeEnd: []byte{0}}
++	assert.False(t, e.overlaps([]byte("a")))
++	assert.True(t, e.overlaps([]byte("m")))
++	assert.True(t, e.overlaps([]byte("zzzzzz")))
++}
++
++func TestRangeCacheReset(t *testing.T) {
++	c := newRangeCache()
++	req := &pb.RangeRequest{Key: []byte("foo")}
++	c.put(req, &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: 1}})
++
++	c.reset()
++
++	_, ok := c.get(req)
++	assert.False(t, ok, "reset must drop every cached entry")
++}
++
++func TestRangeCacheCapacity(t *testing.T) {
++	c := newRangeCache()
++	for i := range maxRangeCacheEntries {
++		req := &pb.RangeRequest{Key: []byte{byte(i % 256), byte(i / 256)}}
++		c.put(req, &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: 1}})
++	}
++
++	overflow := &pb.RangeRequest{Key: []byte("overflow")}
++	c.put(overflow, &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: 1}})
++
++	_, ok := c.get(overflow)
++	assert.False(t, ok, "the cache must not grow past its capacity")
++}
+diff --git a/server/etcdserver/server.go b/server/etcdserver/server.go
+index ac782a8a4..f5e41f56d 100644
+--- a/server/etcdserver/server.go
++++ b/server/etcdserver/server.go
+@@ -252,6 +252,7 @@ type EtcdServer struct {
+ 	applyWait wait.WaitTime
+ 
+ 	kv         mvcc.WatchableKV
++	rangeCache *rangeCache
+ 	lessor     lease.Lessor
+ 	bemu       sync.RWMutex
+ 	be         backend.Backend
+@@ -367,7 +368,12 @@ func NewServer(cfg config.ServerConfig) (srv *EtcdServer, err error) {
+ 		CompactionBatchLimit:    cfg.CompactionBatchLimit,
+ 		CompactionSleepInterval: cfg.CompactionSleepInterval,
+ 	}
+-	srv.kv = mvcc.New(srv.Logger(), srv.be, srv.lessor, mvccStoreConfig)
++	srv.rangeCache = newRangeCache()
++	srv.kv = newCachingKV(mvcc.New(srv.Logger(), srv.be, srv.lessor, mvccStoreConfig), srv.rangeCache)
++	// mvcc.New wires the lessor's deleter to its own, undecorated store;
++	// repoint it at the caching KV so lease-expiry deletes also invalidate
++	// the range cache.
++	srv.lessor.SetRangeDeleter(func() lease.TxnDelete { return srv.kv.Write(traceutil.TODO()) })
+ 	srv.corruptionChecker = newCorruptionChecker(cfg.Logger, srv, srv.kv.HashStorage())
+ 
+ 	srv.authStore = auth.NewAuthStore(srv.Logger(), schema.NewAuthBackend(srv.Logger(), srv.be), tp, int(cfg.BcryptCost))
+diff --git a/server/etcdserver/v3_server.go b/server/etcdserver/v3_server.go
+index a357705a0..d29fac31d 100644
+--- a/server/etcdserver/v3_server.go
++++ b/server/etcdserver/v3_server.go
+@@ -146,7 +146,16 @@ func (s *EtcdServer) Range(ctx context.Context, r *pb.RangeRequest) (*pb.RangeRe
+ 		return s.authStore.IsRangePermitted(ai, r.Key, r.RangeEnd)
+ 	}
+ 
+-	get := func() { resp, _, err = txn.Range(ctx, s.Logger(), s.KV(), r, true) }
++	get := func() {
++		if cached, ok := s.rangeCache.get(r); ok {
++			resp = cached
++			return
++		}
++		resp, _, err = txn.Range(ctx, s.Logger(), s.KV(), r, true)
++		if err == nil {
++			s.rangeCache.put(r, resp)
++		}
++	}
+ 	if serr := s.doSerialize(ctx, chk, get); serr != nil {
+ 		err = serr
+ 		return nil, err
+diff --git a/tests/integration/v3_kv_test.go b/tests/integration/v3_kv_test.go
+index 7b6b9644e..169cb902b 100644
+--- a/tests/integration/v3_kv_test.go
++++ b/tests/integration/v3_kv_test.go
+@@ -65,3 +65,55 @@ func TestKVWithEmptyValue(t *testing.T) {
+ 	require.NoError(t, err)
+ 	t.Logf("delete keys:%d", respDel.Deleted)
+ }
++
++// TestKVRangeCacheReflectsSubsequentWrite guards against a server-side range
++// cache serving a value that is staler than what an uncached read would
++// return: repeating the exact same Get until it would be served from cache
++// must never hide a Put or Delete that happens afterward, for either a
++// linearizable (the default) or a serializable Get.
++func TestKVRangeCacheReflectsSubsequentWrite(t *testing.T) {
++	integration.BeforeTest(t)
++
++	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 1})
++	defer clus.Terminate(t)
++
++	client := clus.RandClient()
++
++	for _, serializable := range []bool{false, true} {
++		var opts []clientv3.OpOption
++		if serializable {
++			opts = append(opts, clientv3.WithSerializable())
++		}
++
++		_, err := client.Put(t.Context(), "cachekey", "v1")
++		require.NoError(t, err)
++
++		// Repeat the identical read enough times to warm any cache.
++		var lastRev int64
++		for range 5 {
++			resp, err := client.Get(t.Context(), "cachekey", opts...)
++			require.NoError(t, err)
++			require.Len(t, resp.Kvs, 1)
++			require.Equal(t, "v1", string(resp.Kvs[0].Value))
++			require.GreaterOrEqual(t, resp.Header.Revision, lastRev)
++			lastRev = resp.Header.Revision
++		}
++
++		putResp, err := client.Put(t.Context(), "cachekey", "v2")
++		require.NoError(t, err)
++		require.Greater(t, putResp.Header.Revision, lastRev)
++
++		resp, err := client.Get(t.Context(), "cachekey", opts...)
++		require.NoError(t, err)
++		require.Len(t, resp.Kvs, 1)
++		require.Equal(t, "v2", string(resp.Kvs[0].Value), "read after Put must observe the new value, not a cached one")
++		require.GreaterOrEqual(t, resp.Header.Revision, putResp.Header.Revision)
++
++		_, err = client.Delete(t.Context(), "cachekey")
++		require.NoError(t, err)
++
++		resp, err = client.Get(t.Context(), "cachekey", opts...)
++		require.NoError(t, err)
++		require.Empty(t, resp.Kvs, "read after Delete must observe the deletion, not a cached value")
++	}
++}

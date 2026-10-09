@@ -1,0 +1,425 @@
+diff --git a/api/v3rpc/rpctypes/error.go b/api/v3rpc/rpctypes/error.go
+index 781c73b7b..7eb708711 100644
+--- a/api/v3rpc/rpctypes/error.go
++++ b/api/v3rpc/rpctypes/error.go
+@@ -36,6 +36,7 @@ var (
+ 	ErrGRPCLeaseNotFound    = status.Error(codes.NotFound, "etcdserver: requested lease not found")
+ 	ErrGRPCLeaseExist       = status.Error(codes.FailedPrecondition, "etcdserver: lease already exists")
+ 	ErrGRPCLeaseTTLTooLarge = status.Error(codes.OutOfRange, "etcdserver: too large lease TTL")
++	ErrGRPCTooManyLeaseKeys = status.Error(codes.ResourceExhausted, "etcdserver: too many keys attached to lease")
+ 
+ 	ErrGRPCWatchCanceled = status.Error(codes.Canceled, "etcdserver: watch canceled")
+ 
+@@ -113,6 +114,7 @@ var (
+ 		ErrorDesc(ErrGRPCLeaseNotFound):    ErrGRPCLeaseNotFound,
+ 		ErrorDesc(ErrGRPCLeaseExist):       ErrGRPCLeaseExist,
+ 		ErrorDesc(ErrGRPCLeaseTTLTooLarge): ErrGRPCLeaseTTLTooLarge,
++		ErrorDesc(ErrGRPCTooManyLeaseKeys): ErrGRPCTooManyLeaseKeys,
+ 
+ 		ErrorDesc(ErrGRPCMemberExist):            ErrGRPCMemberExist,
+ 		ErrorDesc(ErrGRPCPeerURLExist):           ErrGRPCPeerURLExist,
+@@ -181,6 +183,7 @@ var (
+ 	ErrLeaseNotFound    = Error(ErrGRPCLeaseNotFound)
+ 	ErrLeaseExist       = Error(ErrGRPCLeaseExist)
+ 	ErrLeaseTTLTooLarge = Error(ErrGRPCLeaseTTLTooLarge)
++	ErrTooManyLeaseKeys = Error(ErrGRPCTooManyLeaseKeys)
+ 
+ 	ErrMemberExist            = Error(ErrGRPCMemberExist)
+ 	ErrPeerURLExist           = Error(ErrGRPCPeerURLExist)
+diff --git a/etcdutl/etcdutl/common.go b/etcdutl/etcdutl/common.go
+index e6b09efb7..66d01cfc2 100644
+--- a/etcdutl/etcdutl/common.go
++++ b/etcdutl/etcdutl/common.go
+@@ -94,6 +94,8 @@ func (sl *SimpleLessor) Checkpoint(id lease.LeaseID, remainingTTL int64) error {
+ 
+ func (sl *SimpleLessor) Attach(id lease.LeaseID, items []lease.LeaseItem) error { return nil }
+ 
++func (sl *SimpleLessor) CheckAttachLimit(id lease.LeaseID, item lease.LeaseItem) error { return nil }
++
+ func (sl *SimpleLessor) GetLease(item lease.LeaseItem) lease.LeaseID            { return 0 }
+ func (sl *SimpleLessor) Detach(id lease.LeaseID, items []lease.LeaseItem) error { return nil }
+ 
+diff --git a/server/config/config.go b/server/config/config.go
+index 365d0f2cb..a66ce7bd9 100644
+--- a/server/config/config.go
++++ b/server/config/config.go
+@@ -162,6 +162,10 @@ type ServerConfig struct {
+ 	// LeaseCheckpointInterval time.Duration is the wait duration between lease checkpoints.
+ 	LeaseCheckpointInterval time.Duration
+ 
++	// MaxLeaseKeys is the maximum number of distinct keys that can be
++	// attached to a single lease at a time.
++	MaxLeaseKeys uint
++
+ 	EnableGRPCGateway bool
+ 
+ 	// EnableDistributedTracing enables distributed tracing using OpenTelemetry protocol.
+diff --git a/server/embed/config.go b/server/embed/config.go
+index 34fe9a427..119dbe3f6 100644
+--- a/server/embed/config.go
++++ b/server/embed/config.go
+@@ -60,6 +60,7 @@ const (
+ 	DefaultName                        = "default"
+ 	DefaultMaxWALs                     = 5
+ 	DefaultMaxTxnOps                   = uint(128)
++	DefaultMaxLeaseKeys                = uint(100000)
+ 	DefaultWarningApplyDuration        = 100 * time.Millisecond
+ 	DefaultWarningUnaryRequestDuration = 300 * time.Millisecond
+ 	DefaultMaxRequestBytes             = 1.5 * 1024 * 1024
+@@ -225,6 +226,12 @@ type Config struct {
+ 	QuotaBackendBytes   int64  `json:"quota-backend-bytes"`
+ 	MaxTxnOps           uint   `json:"max-txn-ops"`
+ 	MaxRequestBytes     uint   `json:"max-request-bytes"`
++	// MaxLeaseKeys is the maximum number of distinct keys that can be
++	// attached to a single lease at a time. Once a lease reaches this
++	// limit, a write that would attach a new key to it fails with a
++	// client-facing error; re-attaching a key already on the lease is
++	// unaffected.
++	MaxLeaseKeys uint `json:"max-lease-keys"`
+ 
+ 	// MaxConcurrentStreams specifies the maximum number of concurrent
+ 	// streams that each client can open at a time.
+@@ -504,6 +511,7 @@ func NewConfig() *Config {
+ 
+ 		MaxTxnOps:                   DefaultMaxTxnOps,
+ 		MaxRequestBytes:             DefaultMaxRequestBytes,
++		MaxLeaseKeys:                DefaultMaxLeaseKeys,
+ 		MaxConcurrentStreams:        DefaultMaxConcurrentStreams,
+ 		WarningApplyDuration:        DefaultWarningApplyDuration,
+ 		WarningUnaryRequestDuration: DefaultWarningUnaryRequestDuration,
+@@ -619,6 +627,7 @@ func (cfg *Config) AddFlags(fs *flag.FlagSet) {
+ 	fs.IntVar(&cfg.BackendBatchLimit, "backend-batch-limit", cfg.BackendBatchLimit, "BackendBatchLimit is the maximum operations before commit the backend transaction.")
+ 	fs.UintVar(&cfg.MaxTxnOps, "max-txn-ops", cfg.MaxTxnOps, "Maximum number of operations permitted in a transaction.")
+ 	fs.UintVar(&cfg.MaxRequestBytes, "max-request-bytes", cfg.MaxRequestBytes, "Maximum client request size in bytes the server will accept.")
++	fs.UintVar(&cfg.MaxLeaseKeys, "max-lease-keys", cfg.MaxLeaseKeys, "Maximum number of keys that can be attached to a single lease at a time.")
+ 	fs.DurationVar(&cfg.GRPCKeepAliveMinTime, "grpc-keepalive-min-time", cfg.GRPCKeepAliveMinTime, "Minimum interval duration that a client should wait before pinging server.")
+ 	fs.DurationVar(&cfg.GRPCKeepAliveInterval, "grpc-keepalive-interval", cfg.GRPCKeepAliveInterval, "Frequency duration of server-to-client ping to check if a connection is alive (0 to disable).")
+ 	fs.DurationVar(&cfg.GRPCKeepAliveTimeout, "grpc-keepalive-timeout", cfg.GRPCKeepAliveTimeout, "Additional duration of wait before closing a non-responsive connection (0 to disable).")
+diff --git a/server/embed/etcd.go b/server/embed/etcd.go
+index e32161e16..878d9ab3b 100644
+--- a/server/embed/etcd.go
++++ b/server/embed/etcd.go
+@@ -208,6 +208,7 @@ func StartEtcd(inCfg *Config) (e *Etcd, err error) {
+ 		BackendBatchInterval:              cfg.BackendBatchInterval,
+ 		MaxTxnOps:                         cfg.MaxTxnOps,
+ 		MaxRequestBytes:                   cfg.MaxRequestBytes,
++		MaxLeaseKeys:                      cfg.MaxLeaseKeys,
+ 		MaxConcurrentStreams:              cfg.MaxConcurrentStreams,
+ 		SocketOpts:                        cfg.SocketOpts,
+ 		StrictReconfigCheck:               cfg.StrictReconfigCheck,
+diff --git a/server/etcdmain/help.go b/server/etcdmain/help.go
+index c31c5caac..720766925 100644
+--- a/server/etcdmain/help.go
++++ b/server/etcdmain/help.go
+@@ -89,6 +89,8 @@ Member:
+     Maximum number of operations permitted in a transaction.
+   --max-request-bytes '1572864'
+     Maximum client request size in bytes the server will accept.
++  --max-lease-keys '100000'
++    Maximum number of keys that can be attached to a single lease at a time.
+   --max-concurrent-streams 'math.MaxUint32'
+     Maximum concurrent streams that each client can open at a time.
+   --grpc-keepalive-min-time '5s'
+diff --git a/server/etcdserver/api/v3rpc/util.go b/server/etcdserver/api/v3rpc/util.go
+index 3caeec6ed..103bc1842 100644
+--- a/server/etcdserver/api/v3rpc/util.go
++++ b/server/etcdserver/api/v3rpc/util.go
+@@ -71,6 +71,7 @@ var toGRPCErrorMap = map[error]error{
+ 	lease.ErrLeaseNotFound:    rpctypes.ErrGRPCLeaseNotFound,
+ 	lease.ErrLeaseExists:      rpctypes.ErrGRPCLeaseExist,
+ 	lease.ErrLeaseTTLTooLarge: rpctypes.ErrGRPCLeaseTTLTooLarge,
++	lease.ErrTooManyKeys:      rpctypes.ErrGRPCTooManyLeaseKeys,
+ 
+ 	auth.ErrRootUserNotExist:     rpctypes.ErrGRPCRootUserNotExist,
+ 	auth.ErrRootRoleNotExist:     rpctypes.ErrGRPCRootRoleNotExist,
+diff --git a/server/etcdserver/server.go b/server/etcdserver/server.go
+index edcf29fed..9a0ab37c1 100644
+--- a/server/etcdserver/server.go
++++ b/server/etcdserver/server.go
+@@ -350,6 +350,7 @@ func NewServer(cfg config.ServerConfig) (srv *EtcdServer, err error) {
+ 		CheckpointInterval:         cfg.LeaseCheckpointInterval,
+ 		CheckpointPersist:          cfg.ServerFeatureGate.Enabled(features.LeaseCheckpointPersist),
+ 		ExpiredLeasesRetryInterval: srv.Cfg.ReqTimeout(),
++		MaxLeaseKeys:               int(cfg.MaxLeaseKeys),
+ 	})
+ 
+ 	tp, err := auth.NewTokenProvider(cfg.Logger, cfg.AuthToken,
+diff --git a/server/etcdserver/txn/put.go b/server/etcdserver/txn/put.go
+index ec3ae38c7..2654ee1a1 100644
+--- a/server/etcdserver/txn/put.go
++++ b/server/etcdserver/txn/put.go
+@@ -79,12 +79,12 @@ func checkPut(trace *traceutil.Trace, txnWrite mvcc.ReadView, lessor lease.Lesso
+ 
+ func checkLease(lessor lease.Lessor, p *pb.PutRequest) error {
+ 	leaseID := lease.LeaseID(p.Lease)
+-	if leaseID != lease.NoLease {
+-		if l := lessor.Lookup(leaseID); l == nil {
+-			return lease.ErrLeaseNotFound
+-		}
++	if leaseID == lease.NoLease {
++		return nil
+ 	}
+-	return nil
++	// CheckAttachLimit also reports ErrLeaseNotFound if the lease does not
++	// exist, so a separate Lookup call is unnecessary here.
++	return lessor.CheckAttachLimit(leaseID, lease.LeaseItem{Key: string(p.Key)})
+ }
+ 
+ func checkAndGetPrevKV(trace *traceutil.Trace, txnWrite mvcc.ReadView, p *pb.PutRequest) (prevKV *mvcc.RangeResult, err error) {
+diff --git a/server/etcdserver/txn/txn_test.go b/server/etcdserver/txn/txn_test.go
+index 7740e9e41..14c8a9a71 100644
+--- a/server/etcdserver/txn/txn_test.go
++++ b/server/etcdserver/txn/txn_test.go
+@@ -17,6 +17,7 @@ package txn
+ import (
+ 	"context"
+ 	"crypto/sha256"
++	"errors"
+ 	"io"
+ 	"os"
+ 	"strings"
+@@ -256,6 +257,67 @@ func TestCheckPut(t *testing.T) {
+ 	}
+ }
+ 
++// TestPutLeaseKeyLimit verifies that Put rejects a write that would attach a
++// new key to a lease beyond the lessor's configured maximum, that re-attaching
++// an already-attached key is never rejected, and that the store keeps serving
++// unrelated writes after a rejection.
++func TestPutLeaseKeyLimit(t *testing.T) {
++	lg := zaptest.NewLogger(t)
++	b, _ := betesting.NewDefaultTmpBackend(t)
++	t.Cleanup(func() {
++		betesting.Close(t, b)
++	})
++
++	le := lease.NewLessor(lg, b, nil, lease.LessorConfig{MinLeaseTTL: 1, MaxLeaseKeys: 2})
++	t.Cleanup(le.Stop)
++
++	s := mvcc.NewStore(lg, b, le, mvcc.StoreConfig{})
++	t.Cleanup(func() {
++		s.Close()
++	})
++
++	if _, err := le.Grant(lease.LeaseID(1), 100); err != nil {
++		t.Fatalf("failed to grant lease: %v", err)
++	}
++
++	ctx, cancel := context.WithCancel(t.Context())
++	defer cancel()
++
++	put := func(key string, leaseID int64) error {
++		_, _, err := Put(ctx, lg, le, s, &pb.PutRequest{Key: []byte(key), Value: []byte("v"), Lease: leaseID})
++		return err
++	}
++
++	if err := put("foo", 1); err != nil {
++		t.Fatalf("expected first new key to succeed, got %v", err)
++	}
++	if err := put("bar", 1); err != nil {
++		t.Fatalf("expected second new key to succeed, got %v", err)
++	}
++
++	// lease is now at the configured limit of 2 keys.
++	err := put("baz", 1)
++	if !errors.Is(err, lease.ErrTooManyKeys) {
++		t.Fatalf("expected ErrTooManyKeys, got %v", err)
++	}
++
++	// re-attaching an already-attached key must not be rejected.
++	if err := put("foo", 1); err != nil {
++		t.Fatalf("expected re-attach of existing key to succeed, got %v", err)
++	}
++
++	// the store and lessor must keep working for unrelated writes after the rejection.
++	if err := put("unrelated", 0); err != nil {
++		t.Fatalf("expected unrelated write without a lease to succeed, got %v", err)
++	}
++	if _, err := le.Grant(lease.LeaseID(2), 100); err != nil {
++		t.Fatalf("expected lessor to remain healthy and grant a new lease, got %v", err)
++	}
++	if err := put("other", 2); err != nil {
++		t.Fatalf("expected write under a fresh lease to succeed, got %v", err)
++	}
++}
++
+ func TestCheckRange(t *testing.T) {
+ 	for _, tc := range rangeTestCases {
+ 		t.Run(tc.name, func(t *testing.T) {
+diff --git a/server/lease/lessor.go b/server/lease/lessor.go
+index 73071ca1d..25eea6aa7 100644
+--- a/server/lease/lessor.go
++++ b/server/lease/lessor.go
+@@ -57,10 +57,15 @@ var (
+ 	// the default interval to check if the expired lease is revoked
+ 	defaultExpiredleaseRetryInterval = 3 * time.Second
+ 
++	// default maximum number of keys that can be attached to a single lease;
++	// used whenever LessorConfig.MaxLeaseKeys is left unset (zero).
++	defaultMaxLeaseKeys = 100000
++
+ 	ErrNotPrimary       = errors.New("not a primary lessor")
+ 	ErrLeaseNotFound    = errors.New("lease not found")
+ 	ErrLeaseExists      = errors.New("lease already exists")
+ 	ErrLeaseTTLTooLarge = errors.New("too large lease TTL")
++	ErrTooManyKeys      = errors.New("too many keys attached to lease")
+ )
+ 
+ // TxnDelete is a TxnWrite that only permits deletes. Defined here
+@@ -103,6 +108,14 @@ type Lessor interface {
+ 	// If the lease does not exist, an error will be returned.
+ 	Attach(id LeaseID, items []LeaseItem) error
+ 
++	// CheckAttachLimit reports an error if attaching the given item to the
++	// lease with the given ID would exceed the lessor's configured maximum
++	// number of keys per lease. Re-attaching an item that is already on the
++	// lease never exceeds the limit. It does not attach the item or mutate
++	// any state; callers are expected to check this before starting a write
++	// that will eventually call Attach.
++	CheckAttachLimit(id LeaseID, item LeaseItem) error
++
+ 	// GetLease returns LeaseID for given item.
+ 	// If no lease found, NoLease value will be returned.
+ 	GetLease(item LeaseItem) LeaseID
+@@ -173,6 +186,10 @@ type lessor struct {
+ 	// maximum number of leases to revoke per second
+ 	leaseRevokeRate int
+ 
++	// maxLeaseKeys is the maximum number of distinct keys that can be
++	// attached to a single lease at a time.
++	maxLeaseKeys int
++
+ 	expiredC chan []*Lease
+ 	// stopC is a channel whose closure indicates that the lessor should be stopped.
+ 	stopC chan struct{}
+@@ -201,6 +218,10 @@ type LessorConfig struct {
+ 	CheckpointInterval         time.Duration
+ 	ExpiredLeasesRetryInterval time.Duration
+ 	CheckpointPersist          bool
++	// MaxLeaseKeys is the maximum number of distinct keys that can be
++	// attached to a single lease at a time. If zero, defaultMaxLeaseKeys is
++	// used.
++	MaxLeaseKeys int
+ 
+ 	leaseRevokeRate int
+ }
+@@ -222,6 +243,10 @@ func newLessor(lg *zap.Logger, b backend.Backend, cluster cluster, cfg LessorCon
+ 	if leaseRevokeRate == 0 {
+ 		leaseRevokeRate = defaultLeaseRevokeRate
+ 	}
++	maxLeaseKeys := cfg.MaxLeaseKeys
++	if maxLeaseKeys == 0 {
++		maxLeaseKeys = defaultMaxLeaseKeys
++	}
+ 	l := &lessor{
+ 		leaseMap:                  make(map[LeaseID]*Lease),
+ 		itemMap:                   make(map[LeaseItem]LeaseID),
+@@ -230,6 +255,7 @@ func newLessor(lg *zap.Logger, b backend.Backend, cluster cluster, cfg LessorCon
+ 		b:                         b,
+ 		minLeaseTTL:               cfg.MinLeaseTTL,
+ 		leaseRevokeRate:           leaseRevokeRate,
++		maxLeaseKeys:              maxLeaseKeys,
+ 		checkpointInterval:        checkpointInterval,
+ 		expiredLeaseRetryInterval: expiredLeaseRetryInterval,
+ 		checkpointPersist:         cfg.CheckpointPersist,
+@@ -570,6 +596,26 @@ func (le *lessor) Attach(id LeaseID, items []LeaseItem) error {
+ 	return nil
+ }
+ 
++func (le *lessor) CheckAttachLimit(id LeaseID, item LeaseItem) error {
++	le.mu.RLock()
++	l := le.leaseMap[id]
++	le.mu.RUnlock()
++	if l == nil {
++		return ErrLeaseNotFound
++	}
++
++	l.mu.RLock()
++	defer l.mu.RUnlock()
++	if _, ok := l.itemSet[item]; ok {
++		// already attached; re-attaching does not grow the lease.
++		return nil
++	}
++	if len(l.itemSet) >= le.maxLeaseKeys {
++		return ErrTooManyKeys
++	}
++	return nil
++}
++
+ func (le *lessor) GetLease(item LeaseItem) LeaseID {
+ 	le.mu.RLock()
+ 	id := le.itemMap[item]
+@@ -855,6 +901,13 @@ func (fl *FakeLessor) Checkpoint(id LeaseID, remainingTTL int64) error { return
+ 
+ func (fl *FakeLessor) Attach(id LeaseID, items []LeaseItem) error { return nil }
+ 
++func (fl *FakeLessor) CheckAttachLimit(id LeaseID, item LeaseItem) error {
++	if _, ok := fl.LeaseSet[id]; !ok {
++		return ErrLeaseNotFound
++	}
++	return nil
++}
++
+ func (fl *FakeLessor) GetLease(item LeaseItem) LeaseID            { return 0 }
+ func (fl *FakeLessor) Detach(id LeaseID, items []LeaseItem) error { return nil }
+ 
+diff --git a/server/lease/lessor_test.go b/server/lease/lessor_test.go
+index 3f32f6741..9837c11a2 100644
+--- a/server/lease/lessor_test.go
++++ b/server/lease/lessor_test.go
+@@ -396,6 +396,55 @@ func TestLessorDetach(t *testing.T) {
+ 	}
+ }
+ 
++func TestLessorCheckAttachLimit(t *testing.T) {
++	lg := zap.NewNop()
++	dir, be := NewTestBackend(t)
++	defer os.RemoveAll(dir)
++	defer be.Close()
++
++	le := newLessor(lg, be, clusterLatest(), LessorConfig{MinLeaseTTL: minLeaseTTL, MaxLeaseKeys: 2})
++	defer le.Stop()
++	le.SetRangeDeleter(func() TxnDelete { return newFakeDeleter(be) })
++
++	l, err := le.Grant(1, 100)
++	if err != nil {
++		t.Fatalf("could not grant lease (%v)", err)
++	}
++
++	if err := le.CheckAttachLimit(l.ID, LeaseItem{"foo"}); err != nil {
++		t.Fatalf("expected first new key to be allowed, got %v", err)
++	}
++	if err := le.Attach(l.ID, []LeaseItem{{"foo"}}); err != nil {
++		t.Fatalf("failed to attach item: %v", err)
++	}
++
++	// re-attaching an already-attached key must never be rejected, even at the limit.
++	if err := le.CheckAttachLimit(l.ID, LeaseItem{"foo"}); err != nil {
++		t.Fatalf("re-attaching existing key should be allowed, got %v", err)
++	}
++
++	if err := le.CheckAttachLimit(l.ID, LeaseItem{"bar"}); err != nil {
++		t.Fatalf("expected second new key to be allowed, got %v", err)
++	}
++	if err := le.Attach(l.ID, []LeaseItem{{"bar"}}); err != nil {
++		t.Fatalf("failed to attach item: %v", err)
++	}
++
++	// lease is now at the configured limit of 2 keys; a third new key must be rejected.
++	if err := le.CheckAttachLimit(l.ID, LeaseItem{"baz"}); !errors.Is(err, ErrTooManyKeys) {
++		t.Fatalf("expected ErrTooManyKeys, got %v", err)
++	}
++
++	// re-attaching an existing key is still fine once the lease is at the limit.
++	if err := le.CheckAttachLimit(l.ID, LeaseItem{"foo"}); err != nil {
++		t.Fatalf("re-attaching existing key at limit should be allowed, got %v", err)
++	}
++
++	if err := le.CheckAttachLimit(LeaseID(999), LeaseItem{"foo"}); !errors.Is(err, ErrLeaseNotFound) {
++		t.Fatalf("expected ErrLeaseNotFound for unknown lease, got %v", err)
++	}
++}
++
+ // TestLessorRecover ensures Lessor recovers leases from
+ // persist backend.
+ func TestLessorRecover(t *testing.T) {

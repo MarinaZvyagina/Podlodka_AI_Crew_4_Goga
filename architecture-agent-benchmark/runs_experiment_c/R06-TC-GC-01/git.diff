@@ -1,0 +1,242 @@
+diff --git a/server/etcdserver/api/v3rpc/audit.go b/server/etcdserver/api/v3rpc/audit.go
+new file mode 100644
+index 000000000..ae3e28c30
+--- /dev/null
++++ b/server/etcdserver/api/v3rpc/audit.go
+@@ -0,0 +1,216 @@
++// Copyright 2016 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package v3rpc
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"time"
++
++	"go.uber.org/zap"
++	"google.golang.org/grpc"
++	"google.golang.org/protobuf/proto"
++	"google.golang.org/protobuf/reflect/protoreflect"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/server/v3/etcdserver"
++)
++
++// kvAuditServicePrefix identifies gRPC methods belonging to the key-value
++// service. Gating on the service (rather than on a fixed list of request
++// message types) means every method the KV service exposes today, or ever
++// grows to expose, is audited automatically.
++var kvAuditServicePrefix = "/" + pb.KV_ServiceDesc.ServiceName + "/"
++
++// kvAuditOperationKinds maps well-known KV method names to the audit
++// vocabulary compliance expects (read/write/delete/transaction). Methods not
++// listed here (e.g. a future addition to the KV service) still produce an
++// audit record; they just fall back to their lower-cased method name instead
++// of one of the four canonical kinds.
++var kvAuditOperationKinds = map[string]string{
++	"Range":       "read",
++	"RangeStream": "read",
++	"Put":         "write",
++	"DeleteRange": "delete",
++	"Txn":         "transaction",
++	"Compact":     "compact",
++}
++
++// auditMaxKeyRanges bounds how many key/range entries a single audit record
++// will list, so a pathologically large transaction can't blow up the log
++// line. The count observed is always reported even when the list is capped.
++const auditMaxKeyRanges = 20
++
++// newAuditUnaryInterceptor produces a uniform compliance audit record for
++// every unary key-value request (Range, Put, DeleteRange, Txn, ...): caller
++// identity, operation kind, key/range, duration, and outcome. It only
++// observes the request/response; it never mutates them, so it cannot change
++// functional behavior.
++func newAuditUnaryInterceptor(s *etcdserver.EtcdServer) grpc.UnaryServerInterceptor {
++	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
++		if !strings.HasPrefix(info.FullMethod, kvAuditServicePrefix) {
++			return handler(ctx, req)
++		}
++
++		startTime := time.Now()
++		resp, err := handler(ctx, req)
++		logAuditRecord(s, ctx, info.FullMethod, req, startTime, err)
++		return resp, err
++	}
++}
++
++// newAuditStreamInterceptor mirrors newAuditUnaryInterceptor for streaming
++// key-value requests (currently RangeStream), so streamed reads get the same
++// audit coverage as unary calls.
++func newAuditStreamInterceptor(s *etcdserver.EtcdServer) grpc.StreamServerInterceptor {
++	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
++		if !strings.HasPrefix(info.FullMethod, kvAuditServicePrefix) {
++			return handler(srv, ss)
++		}
++
++		startTime := time.Now()
++		rec := &auditRecordingServerStream{ServerStream: ss}
++		err := handler(srv, rec)
++		logAuditRecord(s, ss.Context(), info.FullMethod, rec.req, startTime, err)
++		return err
++	}
++}
++
++// auditRecordingServerStream transparently observes the first message a
++// streaming handler receives, so it can be included in the audit record,
++// without altering what the handler sees.
++type auditRecordingServerStream struct {
++	grpc.ServerStream
++	req any
++}
++
++func (s *auditRecordingServerStream) RecvMsg(m any) error {
++	err := s.ServerStream.RecvMsg(m)
++	if err == nil && s.req == nil {
++		s.req = m
++	}
++	return err
++}
++
++func logAuditRecord(s *etcdserver.EtcdServer, ctx context.Context, fullMethod string, req any, startTime time.Time, err error) {
++	lg := s.Logger()
++	if lg == nil {
++		return
++	}
++
++	outcome := "success"
++	if err != nil {
++		outcome = "failure"
++	}
++
++	fields := []zap.Field{
++		zap.String("caller", auditCallerIdentity(s, ctx)),
++		zap.String("operation", auditOperationKind(fullMethod)),
++		zap.Duration("duration", time.Since(startTime)),
++		zap.String("outcome", outcome),
++	}
++	if msg, ok := req.(proto.Message); ok {
++		if ranges := collectAuditKeyRanges(msg.ProtoReflect()); len(ranges) > 0 {
++			fields = append(fields, zap.String("key", formatAuditKeyRanges(ranges)))
++		}
++	}
++	if err != nil {
++		fields = append(fields, zap.Error(err))
++	}
++
++	lg.Named("audit").Info("kv audit", fields...)
++}
++
++// auditOperationKind derives the audit "operation kind" from the gRPC method
++// name so new KV methods are classified without editing this function.
++func auditOperationKind(fullMethod string) string {
++	method := strings.TrimPrefix(fullMethod, kvAuditServicePrefix)
++	if kind, ok := kvAuditOperationKinds[method]; ok {
++		return kind
++	}
++	return strings.ToLower(method)
++}
++
++// auditCallerIdentity returns the authenticated username for ctx, or
++// "unauthenticated" when auth is disabled or no identity is present.
++func auditCallerIdentity(s *etcdserver.EtcdServer, ctx context.Context) string {
++	ai, err := s.AuthInfoFromCtx(ctx)
++	if err != nil || ai == nil || ai.Username == "" {
++		return "unauthenticated"
++	}
++	return ai.Username
++}
++
++// auditKeyRange is a single key or key-range touched by a request.
++type auditKeyRange struct {
++	key      []byte
++	rangeEnd []byte
++}
++
++// collectAuditKeyRanges walks a request message's fields looking for
++// "key"/"range_end" pairs, recursing into nested and repeated sub-messages
++// (e.g. TxnRequest.compare/success/failure). Because it works off the proto
++// descriptor rather than a fixed type switch, any new KV request or
++// sub-request message that carries a key is picked up automatically.
++func collectAuditKeyRanges(m protoreflect.Message) []auditKeyRange {
++	fields := m.Descriptor().Fields()
++
++	if keyField := fields.ByName("key"); keyField != nil && keyField.Kind() == protoreflect.BytesKind {
++		kr := auditKeyRange{key: cloneBytes(m.Get(keyField).Bytes())}
++		if rangeEndField := fields.ByName("range_end"); rangeEndField != nil && rangeEndField.Kind() == protoreflect.BytesKind {
++			kr.rangeEnd = cloneBytes(m.Get(rangeEndField).Bytes())
++		}
++		return []auditKeyRange{kr}
++	}
++
++	var ranges []auditKeyRange
++	for i := 0; i < fields.Len() && len(ranges) < auditMaxKeyRanges; i++ {
++		fd := fields.Get(i)
++		if fd.Kind() != protoreflect.MessageKind || fd.IsMap() {
++			continue
++		}
++		if fd.IsList() {
++			list := m.Get(fd).List()
++			for j := 0; j < list.Len() && len(ranges) < auditMaxKeyRanges; j++ {
++				ranges = append(ranges, collectAuditKeyRanges(list.Get(j).Message())...)
++			}
++		} else if m.Has(fd) {
++			ranges = append(ranges, collectAuditKeyRanges(m.Get(fd).Message())...)
++		}
++	}
++	return ranges
++}
++
++func cloneBytes(b []byte) []byte {
++	if b == nil {
++		return nil
++	}
++	out := make([]byte, len(b))
++	copy(out, b)
++	return out
++}
++
++func formatAuditKeyRanges(ranges []auditKeyRange) string {
++	parts := make([]string, 0, len(ranges))
++	for _, r := range ranges {
++		if len(r.rangeEnd) == 0 {
++			parts = append(parts, fmt.Sprintf("%q", r.key))
++		} else {
++			parts = append(parts, fmt.Sprintf("[%q,%q)", r.key, r.rangeEnd))
++		}
++	}
++	return strings.Join(parts, ", ")
++}
+diff --git a/server/etcdserver/api/v3rpc/grpc.go b/server/etcdserver/api/v3rpc/grpc.go
+index 91863e294..76ddd0c46 100644
+--- a/server/etcdserver/api/v3rpc/grpc.go
++++ b/server/etcdserver/api/v3rpc/grpc.go
+@@ -52,6 +52,7 @@ func Server(s *etcdserver.EtcdServer, tls *tls.Config, interceptor grpc.UnarySer
+ 
+ 	chainUnaryInterceptors := []grpc.UnaryServerInterceptor{
+ 		newLogUnaryInterceptor(s),
++		newAuditUnaryInterceptor(s),
+ 		serverMetrics.UnaryServerInterceptor(),
+ 		newUnaryInterceptor(s),
+ 	}
+@@ -61,6 +62,7 @@ func Server(s *etcdserver.EtcdServer, tls *tls.Config, interceptor grpc.UnarySer
+ 
+ 	chainStreamInterceptors := []grpc.StreamServerInterceptor{
+ 		serverMetrics.StreamServerInterceptor(),
++		newAuditStreamInterceptor(s),
+ 		newStreamInterceptor(s),
+ 	}
+ 

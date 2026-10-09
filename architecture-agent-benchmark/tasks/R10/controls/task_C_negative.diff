@@ -1,0 +1,109 @@
+diff --git a/SignalServiceKit/Messages/MessageRetentionManager.swift b/SignalServiceKit/Messages/MessageRetentionManager.swift
+new file mode 100644
+index 0000000..166e6aa
+--- /dev/null
++++ b/SignalServiceKit/Messages/MessageRetentionManager.swift
+@@ -0,0 +1,103 @@
++//
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++//
++
++import Foundation
++
++/// Automatically deletes messages older than the user's configured retention window every time the app becomes
++/// active. Persists the retention window and a "resume" cursor in a plain key-value store rather than using the
++/// job-execution framework: since this only needs to run periodically in the foreground, a lightweight
++/// lifecycle-driven sweep is simpler than standing up a full JobRecord/JobRunner/JobRunnerFactory/JobQueueRunner
++/// for it.
++public final class MessageRetentionManager {
++    public static let shared = MessageRetentionManager()
++
++    private static let retentionWindowDaysKey = "retentionWindowDays"
++    private static let lastCleanupCompletedThroughDateKey = "lastCleanupCompletedThroughDate"
++
++    private let kvStore = KeyValueStore(collection: "MessageRetentionManager")
++    private var isCleanupInProgress = false
++
++    private init() {
++        NotificationCenter.default.addObserver(
++            self,
++            selector: #selector(applicationDidBecomeActive),
++            name: AppContext.OWSApplicationDidBecomeActive,
++            object: nil,
++        )
++    }
++
++    public func setRetentionWindowDays(_ days: Int?, tx: DBWriteTransaction) {
++        if let days {
++            kvStore.setInt(days, key: Self.retentionWindowDaysKey, transaction: tx)
++        } else {
++            kvStore.removeValue(forKey: Self.retentionWindowDaysKey, transaction: tx)
++        }
++    }
++
++    @objc
++    private func applicationDidBecomeActive() {
++        guard !isCleanupInProgress else { return }
++        isCleanupInProgress = true
++
++        Task {
++            await self.runCleanupIfNeeded()
++            self.isCleanupInProgress = false
++        }
++    }
++
++    private func runCleanupIfNeeded() async {
++        let db = SSKEnvironment.shared.databaseStorageRef
++        let retentionWindowDays: Int? = db.read { tx in
++            kvStore.getInt(Self.retentionWindowDaysKey, transaction: tx)
++        }
++        guard let retentionWindowDays else {
++            return
++        }
++
++        let cutoffReceivedAtTimestamp = Date.ows_millisecondTimestamp() - (UInt64(retentionWindowDays) * UInt64.dayInMs)
++
++        // Resume from wherever we left off last time, tracked as a simple cursor in UserDefaults-backed storage
++        // rather than a persisted JobRecord row.
++        var lastProcessedRowId: Int64 = db.read { tx in
++            Int64(kvStore.getInt(Self.lastCleanupCompletedThroughDateKey, transaction: tx) ?? 0)
++        }
++
++        while true {
++            let deletedCount = await db.awaitableWrite { tx -> Int in
++                let interactions: [TSInteraction]
++                do {
++                    let sql = """
++                        SELECT * FROM model_TSInteraction
++                        WHERE receivedAtTimestamp < ? AND id > ?
++                        ORDER BY id ASC
++                        LIMIT 500
++                    """
++                    interactions = try TSInteraction.grdbFetchCursor(
++                        sql: sql,
++                        arguments: [cutoffReceivedAtTimestamp, lastProcessedRowId],
++                        transaction: tx,
++                    ).all()
++                } catch {
++                    return 0
++                }
++
++                for interaction in interactions {
++                    interaction.anyRemove(transaction: tx)
++                    if let rowId = interaction.sqliteRowId {
++                        lastProcessedRowId = max(lastProcessedRowId, rowId)
++                    }
++                }
++
++                kvStore.setInt(Int(lastProcessedRowId), key: Self.lastCleanupCompletedThroughDateKey, transaction: tx)
++
++                return interactions.count
++            }
++
++            if deletedCount == 0 {
++                break
++            }
++        }
++    }
++}

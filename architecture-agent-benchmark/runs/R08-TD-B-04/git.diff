@@ -1,0 +1,173 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+index f47eddb..4c8bc0e 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+@@ -49,7 +49,10 @@ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.Executor;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicLong;
+ 
+ import static org.thoughtcrime.securesms.database.SearchTable.SNIPPET_WRAP;
+ 
+@@ -62,6 +65,16 @@ public class SearchRepository {
+ 
+   private static final int MAX_SNIPPET_SIZE = 100;
+ 
++  /**
++   * Bumped whenever the conversation list observer fires, i.e. whenever anything a search result
++   * could depend on (message insert/edit/delete, thread or group changes) is committed. Shared
++   * across every {@link SearchRepository} instance so the underlying registration only happens
++   * once for the process, while each instance's cache still invalidates in lockstep with the
++   * conversation list itself.
++   */
++  private static final AtomicLong    CACHE_GENERATION            = new AtomicLong(0);
++  private static final AtomicBoolean CACHE_INVALIDATION_OBSERVER = new AtomicBoolean(false);
++
+   private final Context           context;
+   private final String            noteToSelfTitle;
+   private final SearchTable       searchDatabase;
+@@ -72,6 +85,10 @@ public class SearchRepository {
+ 
+   private final Executor serialExecutor;
+ 
++  private final Map<ThreadCacheKey, ThreadSearchResult>   threadResultCache  = new ConcurrentHashMap<>();
++  private final Map<MessageCacheKey, MessageSearchResult> messageResultCache = new ConcurrentHashMap<>();
++  private volatile long                                   observedGeneration = -1;
++
+   public SearchRepository(@NonNull String noteToSelfTitle) {
+     this.context           = AppDependencies.getApplication().getApplicationContext();
+     this.noteToSelfTitle   = noteToSelfTitle;
+@@ -81,18 +98,51 @@ public class SearchRepository {
+     this.mentionTable      = SignalDatabase.mentions();
+     this.messageTable      = SignalDatabase.messages();
+     this.serialExecutor    = new SerialExecutor(SignalExecutors.BOUNDED);
++
++    registerCacheInvalidationObserverOnce();
++  }
++
++  private static void registerCacheInvalidationObserverOnce() {
++    if (CACHE_INVALIDATION_OBSERVER.compareAndSet(false, true)) {
++      AppDependencies.getDatabaseObserver().registerConversationListObserver(CACHE_GENERATION::incrementAndGet);
++    }
++  }
++
++  /**
++   * Repeating an identical search (same query text and filters) is common -- clearing a search by
++   * accident, or leaving and returning to the chat list -- and re-scanning from scratch every time
++   * is wasted work when nothing has changed. Results are cached per (query, filter) pair and wiped
++   * whenever {@link #CACHE_GENERATION} moves, so a later search always reflects the latest data.
++   */
++  private void invalidateCacheIfStale() {
++    long currentGeneration = CACHE_GENERATION.get();
++    if (currentGeneration != observedGeneration) {
++      threadResultCache.clear();
++      messageResultCache.clear();
++      observedGeneration = currentGeneration;
++    }
+   }
+ 
+   @WorkerThread
+   public @NonNull ThreadSearchResult queryThreadsSync(@NonNull String query, boolean unreadOnly) {
+     SignalTrace.beginSection("ConversationListSearch-Threads");
+     try {
++      invalidateCacheIfStale();
++
++      ThreadCacheKey     cacheKey = new ThreadCacheKey(query, unreadOnly);
++      ThreadSearchResult cached   = threadResultCache.get(cacheKey);
++      if (cached != null) {
++        return cached;
++      }
++
+       long                      start  = System.currentTimeMillis();
+       List<ThreadWithRecipient> result = queryConversations(query, unreadOnly);
+ 
+       Log.d(TAG, "[threads] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new ThreadSearchResult(result, query);
++      ThreadSearchResult searchResult = new ThreadSearchResult(result, query);
++      threadResultCache.put(cacheKey, searchResult);
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -102,6 +152,14 @@ public class SearchRepository {
+   public @NonNull MessageSearchResult queryMessagesSync(@NonNull String query, @NonNull SearchFilter filter) {
+     SignalTrace.beginSection("ConversationListSearch-Messages");
+     try {
++      invalidateCacheIfStale();
++
++      MessageCacheKey     cacheKey = new MessageCacheKey(query, filter);
++      MessageSearchResult cached   = messageResultCache.get(cacheKey);
++      if (cached != null) {
++        return cached;
++      }
++
+       long start = System.currentTimeMillis();
+ 
+       List<MessageResult> messages         = queryMessages(query, filter);
+@@ -111,7 +169,9 @@ public class SearchRepository {
+ 
+       Log.d(TAG, "[messages] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new MessageSearchResult(combined, query);
++      MessageSearchResult searchResult = new MessageSearchResult(combined, query);
++      messageResultCache.put(cacheKey, searchResult);
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -485,4 +545,50 @@ public class SearchRepository {
+   public interface ModelBuilder<T> {
+     T build(@NonNull Cursor cursor);
+   }
++
++  private static final class ThreadCacheKey {
++    private final String  query;
++    private final boolean unreadOnly;
++
++    private ThreadCacheKey(@NonNull String query, boolean unreadOnly) {
++      this.query      = query;
++      this.unreadOnly = unreadOnly;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++      if (this == o) return true;
++      if (!(o instanceof ThreadCacheKey)) return false;
++      ThreadCacheKey that = (ThreadCacheKey) o;
++      return unreadOnly == that.unreadOnly && query.equals(that.query);
++    }
++
++    @Override
++    public int hashCode() {
++      return Objects.hash(query, unreadOnly);
++    }
++  }
++
++  private static final class MessageCacheKey {
++    private final String       query;
++    private final SearchFilter filter;
++
++    private MessageCacheKey(@NonNull String query, @NonNull SearchFilter filter) {
++      this.query  = query;
++      this.filter = filter;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++      if (this == o) return true;
++      if (!(o instanceof MessageCacheKey)) return false;
++      MessageCacheKey that = (MessageCacheKey) o;
++      return query.equals(that.query) && filter.equals(that.filter);
++    }
++
++    @Override
++    public int hashCode() {
++      return Objects.hash(query, filter);
++    }
++  }
+ }

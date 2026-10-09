@@ -1,0 +1,613 @@
+diff --git a/api/v3rpc/rpctypes/error.go b/api/v3rpc/rpctypes/error.go
+index 781c73b7b..bb137ce80 100644
+--- a/api/v3rpc/rpctypes/error.go
++++ b/api/v3rpc/rpctypes/error.go
+@@ -36,6 +36,7 @@ var (
+ 	ErrGRPCLeaseNotFound    = status.Error(codes.NotFound, "etcdserver: requested lease not found")
+ 	ErrGRPCLeaseExist       = status.Error(codes.FailedPrecondition, "etcdserver: lease already exists")
+ 	ErrGRPCLeaseTTLTooLarge = status.Error(codes.OutOfRange, "etcdserver: too large lease TTL")
++	ErrGRPCLeaseTooManyKeys = status.Error(codes.ResourceExhausted, "etcdserver: too many keys attached to lease")
+ 
+ 	ErrGRPCWatchCanceled = status.Error(codes.Canceled, "etcdserver: watch canceled")
+ 
+@@ -113,6 +114,7 @@ var (
+ 		ErrorDesc(ErrGRPCLeaseNotFound):    ErrGRPCLeaseNotFound,
+ 		ErrorDesc(ErrGRPCLeaseExist):       ErrGRPCLeaseExist,
+ 		ErrorDesc(ErrGRPCLeaseTTLTooLarge): ErrGRPCLeaseTTLTooLarge,
++		ErrorDesc(ErrGRPCLeaseTooManyKeys): ErrGRPCLeaseTooManyKeys,
+ 
+ 		ErrorDesc(ErrGRPCMemberExist):            ErrGRPCMemberExist,
+ 		ErrorDesc(ErrGRPCPeerURLExist):           ErrGRPCPeerURLExist,
+@@ -181,6 +183,7 @@ var (
+ 	ErrLeaseNotFound    = Error(ErrGRPCLeaseNotFound)
+ 	ErrLeaseExist       = Error(ErrGRPCLeaseExist)
+ 	ErrLeaseTTLTooLarge = Error(ErrGRPCLeaseTTLTooLarge)
++	ErrLeaseTooManyKeys = Error(ErrGRPCLeaseTooManyKeys)
+ 
+ 	ErrMemberExist            = Error(ErrGRPCMemberExist)
+ 	ErrPeerURLExist           = Error(ErrGRPCPeerURLExist)
+diff --git a/server/config/config.go b/server/config/config.go
+index 365d0f2cb..6a124eb42 100644
+--- a/server/config/config.go
++++ b/server/config/config.go
+@@ -123,6 +123,10 @@ type ServerConfig struct {
+ 	QuotaBackendBytes       int64
+ 	MaxTxnOps               uint
+ 
++	// MaxLeaseKeys is the maximum number of keys that can be attached to a
++	// single lease at a time. 0 means no limit.
++	MaxLeaseKeys uint
++
+ 	// MaxRequestBytes is the maximum request size to send over raft.
+ 	MaxRequestBytes uint
+ 
+diff --git a/server/embed/config.go b/server/embed/config.go
+index 34fe9a427..f9781d47f 100644
+--- a/server/embed/config.go
++++ b/server/embed/config.go
+@@ -60,6 +60,7 @@ const (
+ 	DefaultName                        = "default"
+ 	DefaultMaxWALs                     = 5
+ 	DefaultMaxTxnOps                   = uint(128)
++	DefaultMaxLeaseKeys                = uint(100000)
+ 	DefaultWarningApplyDuration        = 100 * time.Millisecond
+ 	DefaultWarningUnaryRequestDuration = 300 * time.Millisecond
+ 	DefaultMaxRequestBytes             = 1.5 * 1024 * 1024
+@@ -226,6 +227,10 @@ type Config struct {
+ 	MaxTxnOps           uint   `json:"max-txn-ops"`
+ 	MaxRequestBytes     uint   `json:"max-request-bytes"`
+ 
++	// MaxLeaseKeys is the maximum number of keys that can be attached to a
++	// single lease at a time. 0 means no limit.
++	MaxLeaseKeys uint `json:"max-lease-keys"`
++
+ 	// MaxConcurrentStreams specifies the maximum number of concurrent
+ 	// streams that each client can open at a time.
+ 	MaxConcurrentStreams uint32 `json:"max-concurrent-streams"`
+@@ -503,6 +508,7 @@ func NewConfig() *Config {
+ 		SnapshotCatchUpEntries: etcdserver.DefaultSnapshotCatchUpEntries,
+ 
+ 		MaxTxnOps:                   DefaultMaxTxnOps,
++		MaxLeaseKeys:                DefaultMaxLeaseKeys,
+ 		MaxRequestBytes:             DefaultMaxRequestBytes,
+ 		MaxConcurrentStreams:        DefaultMaxConcurrentStreams,
+ 		WarningApplyDuration:        DefaultWarningApplyDuration,
+@@ -618,6 +624,7 @@ func (cfg *Config) AddFlags(fs *flag.FlagSet) {
+ 	fs.DurationVar(&cfg.BackendBatchInterval, "backend-batch-interval", cfg.BackendBatchInterval, "BackendBatchInterval is the maximum time before commit the backend transaction.")
+ 	fs.IntVar(&cfg.BackendBatchLimit, "backend-batch-limit", cfg.BackendBatchLimit, "BackendBatchLimit is the maximum operations before commit the backend transaction.")
+ 	fs.UintVar(&cfg.MaxTxnOps, "max-txn-ops", cfg.MaxTxnOps, "Maximum number of operations permitted in a transaction.")
++	fs.UintVar(&cfg.MaxLeaseKeys, "max-lease-keys", cfg.MaxLeaseKeys, "Maximum number of keys that can be attached to a single lease at a time. 0 means no limit.")
+ 	fs.UintVar(&cfg.MaxRequestBytes, "max-request-bytes", cfg.MaxRequestBytes, "Maximum client request size in bytes the server will accept.")
+ 	fs.DurationVar(&cfg.GRPCKeepAliveMinTime, "grpc-keepalive-min-time", cfg.GRPCKeepAliveMinTime, "Minimum interval duration that a client should wait before pinging server.")
+ 	fs.DurationVar(&cfg.GRPCKeepAliveInterval, "grpc-keepalive-interval", cfg.GRPCKeepAliveInterval, "Frequency duration of server-to-client ping to check if a connection is alive (0 to disable).")
+diff --git a/server/embed/etcd.go b/server/embed/etcd.go
+index e32161e16..06d43a875 100644
+--- a/server/embed/etcd.go
++++ b/server/embed/etcd.go
+@@ -207,6 +207,7 @@ func StartEtcd(inCfg *Config) (e *Etcd, err error) {
+ 		BackendFreelistType:               backendFreelistType,
+ 		BackendBatchInterval:              cfg.BackendBatchInterval,
+ 		MaxTxnOps:                         cfg.MaxTxnOps,
++		MaxLeaseKeys:                      cfg.MaxLeaseKeys,
+ 		MaxRequestBytes:                   cfg.MaxRequestBytes,
+ 		MaxConcurrentStreams:              cfg.MaxConcurrentStreams,
+ 		SocketOpts:                        cfg.SocketOpts,
+diff --git a/server/etcdmain/help.go b/server/etcdmain/help.go
+index c31c5caac..e220db9a3 100644
+--- a/server/etcdmain/help.go
++++ b/server/etcdmain/help.go
+@@ -87,6 +87,8 @@ Member:
+     BackendBatchLimit is the maximum operations before commit the backend transaction.
+   --max-txn-ops '128'
+     Maximum number of operations permitted in a transaction.
++  --max-lease-keys '100000'
++    Maximum number of keys that can be attached to a single lease at a time. 0 means no limit.
+   --max-request-bytes '1572864'
+     Maximum client request size in bytes the server will accept.
+   --max-concurrent-streams 'math.MaxUint32'
+diff --git a/server/etcdserver/api/v3rpc/util.go b/server/etcdserver/api/v3rpc/util.go
+index 3caeec6ed..4524562e7 100644
+--- a/server/etcdserver/api/v3rpc/util.go
++++ b/server/etcdserver/api/v3rpc/util.go
+@@ -71,6 +71,7 @@ var toGRPCErrorMap = map[error]error{
+ 	lease.ErrLeaseNotFound:    rpctypes.ErrGRPCLeaseNotFound,
+ 	lease.ErrLeaseExists:      rpctypes.ErrGRPCLeaseExist,
+ 	lease.ErrLeaseTTLTooLarge: rpctypes.ErrGRPCLeaseTTLTooLarge,
++	lease.ErrTooManyKeys:      rpctypes.ErrGRPCLeaseTooManyKeys,
+ 
+ 	auth.ErrRootUserNotExist:     rpctypes.ErrGRPCRootUserNotExist,
+ 	auth.ErrRootRoleNotExist:     rpctypes.ErrGRPCRootRoleNotExist,
+diff --git a/server/etcdserver/api/v3rpc/validationfuzz_test.go b/server/etcdserver/api/v3rpc/validationfuzz_test.go
+index 61b234980..b0cdf50c0 100644
+--- a/server/etcdserver/api/v3rpc/validationfuzz_test.go
++++ b/server/etcdserver/api/v3rpc/validationfuzz_test.go
+@@ -175,7 +175,7 @@ func execTransaction(t *testing.T, req *pb.RequestOp) {
+ 		Success: []*pb.RequestOp{req},
+ 	}
+ 
+-	_, _, err := txn.Txn(ctx, zaptest.NewLogger(t), request, false, s, &lease.FakeLessor{}, false)
++	_, _, err := txn.Txn(ctx, zaptest.NewLogger(t), request, false, s, &lease.FakeLessor{}, false, 0)
+ 	if err != nil {
+ 		t.Skipf("Application erroring. %s", err.Error())
+ 	}
+diff --git a/server/etcdserver/apply/backend.go b/server/etcdserver/apply/backend.go
+index 35a22f6f5..2083441a2 100644
+--- a/server/etcdserver/apply/backend.go
++++ b/server/etcdserver/apply/backend.go
+@@ -48,7 +48,7 @@ func (a *applierV3backend) Apply(r *InternalRaftRequestWrapper, shouldApplyV3 me
+ }
+ 
+ func (a *applierV3backend) Put(p *pb.PutRequest) (resp *pb.PutResponse, trace *traceutil.Trace, err error) {
+-	return mvcctxn.Put(context.TODO(), a.options.Logger, a.options.Lessor, a.options.KV, p)
++	return mvcctxn.Put(context.TODO(), a.options.Logger, a.options.Lessor, a.options.KV, p, a.options.MaxLeaseKeys)
+ }
+ 
+ func (a *applierV3backend) DeleteRange(dr *pb.DeleteRangeRequest) (*pb.DeleteRangeResponse, *traceutil.Trace, error) {
+@@ -60,7 +60,7 @@ func (a *applierV3backend) Range(r *pb.RangeRequest) (*pb.RangeResponse, *traceu
+ }
+ 
+ func (a *applierV3backend) Txn(rt *pb.TxnRequest, skipRangeExecution bool) (*pb.TxnResponse, *traceutil.Trace, error) {
+-	return mvcctxn.Txn(context.TODO(), a.options.Logger, rt, a.options.TxnModeWriteWithSharedBuffer, a.options.KV, a.options.Lessor, skipRangeExecution)
++	return mvcctxn.Txn(context.TODO(), a.options.Logger, rt, a.options.TxnModeWriteWithSharedBuffer, a.options.KV, a.options.Lessor, skipRangeExecution, a.options.MaxLeaseKeys)
+ }
+ 
+ func (a *applierV3backend) Compaction(compaction *pb.CompactionRequest) (*pb.CompactionResponse, <-chan struct{}, *traceutil.Trace, error) {
+diff --git a/server/etcdserver/apply/interface.go b/server/etcdserver/apply/interface.go
+index 00ba221ed..580230205 100644
+--- a/server/etcdserver/apply/interface.go
++++ b/server/etcdserver/apply/interface.go
+@@ -98,6 +98,7 @@ type ApplierOptions struct {
+ 	Backend                      backend.Backend
+ 	QuotaBackendBytesCfg         int64
+ 	WarningApplyDuration         time.Duration
++	MaxLeaseKeys                 int
+ }
+ 
+ type SnapshotServer interface {
+diff --git a/server/etcdserver/server.go b/server/etcdserver/server.go
+index ac782a8a4..7ac62f907 100644
+--- a/server/etcdserver/server.go
++++ b/server/etcdserver/server.go
+@@ -1153,6 +1153,7 @@ func (s *EtcdServer) NewUberApplier() apply.UberApplier {
+ 		Backend:                      s.be,
+ 		QuotaBackendBytesCfg:         s.Cfg.QuotaBackendBytes,
+ 		WarningApplyDuration:         s.Cfg.WarningApplyDuration,
++		MaxLeaseKeys:                 int(s.Cfg.MaxLeaseKeys),
+ 	}
+ 	return apply.NewUberApplier(opts)
+ }
+diff --git a/server/etcdserver/txn/lease_limit.go b/server/etcdserver/txn/lease_limit.go
+new file mode 100644
+index 000000000..365b34f27
+--- /dev/null
++++ b/server/etcdserver/txn/lease_limit.go
+@@ -0,0 +1,72 @@
++// Copyright 2025 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package txn
++
++import "go.etcd.io/etcd/server/v3/lease"
++
++// leaseKeyLimiter enforces the configured maximum number of keys that may be
++// attached to a single lease. It is used while checking a request (Put or
++// Txn) before any mutation is applied, so that a request that would push a
++// lease over the limit is rejected in full instead of being applied
++// partially.
++//
++// A single leaseKeyLimiter is shared across all the operations of one
++// top-level request, so that a Txn attaching several new keys to the same
++// lease is validated against the cumulative effect of all of its puts.
++type leaseKeyLimiter struct {
++	maxKeys int
++	// pending tracks, per lease, the keys that earlier operations in this
++	// same request would newly attach to that lease.
++	pending map[lease.LeaseID]map[string]struct{}
++}
++
++func newLeaseKeyLimiter(maxKeys int) *leaseKeyLimiter {
++	return &leaseKeyLimiter{maxKeys: maxKeys}
++}
++
++// checkAttach reports whether attaching key to leaseID (whose current state
++// is l) is permitted under the configured limit. Re-attaching a key that is
++// already on the lease never counts against the limit.
++func (lk *leaseKeyLimiter) checkAttach(lessor lease.Lessor, leaseID lease.LeaseID, l *lease.Lease, key string) error {
++	if lk == nil || lk.maxKeys <= 0 {
++		return nil
++	}
++
++	if lessor.GetLease(lease.LeaseItem{Key: key}) == leaseID {
++		// key is already attached to this lease; re-attaching it does not
++		// grow the lease's key count.
++		return nil
++	}
++
++	pending := lk.pending[leaseID]
++	if _, ok := pending[key]; ok {
++		// already accounted for by an earlier operation in this request.
++		return nil
++	}
++
++	if l.ItemCount()+len(pending) >= lk.maxKeys {
++		return lease.ErrTooManyKeys
++	}
++
++	if pending == nil {
++		pending = make(map[string]struct{})
++		if lk.pending == nil {
++			lk.pending = make(map[lease.LeaseID]map[string]struct{})
++		}
++		lk.pending[leaseID] = pending
++	}
++	pending[key] = struct{}{}
++	return nil
++}
+diff --git a/server/etcdserver/txn/lease_limit_test.go b/server/etcdserver/txn/lease_limit_test.go
+new file mode 100644
+index 000000000..1fb20ba70
+--- /dev/null
++++ b/server/etcdserver/txn/lease_limit_test.go
+@@ -0,0 +1,163 @@
++// Copyright 2025 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package txn
++
++import (
++	"context"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"go.uber.org/zap/zaptest"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/server/v3/lease"
++	betesting "go.etcd.io/etcd/server/v3/storage/backend/testing"
++	"go.etcd.io/etcd/server/v3/storage/mvcc"
++)
++
++func setupWithRealLessor(t *testing.T) (mvcc.KV, lease.Lessor) {
++	t.Helper()
++	b, _ := betesting.NewDefaultTmpBackend(t)
++	t.Cleanup(func() { betesting.Close(t, b) })
++
++	lessor := lease.NewLessor(zaptest.NewLogger(t), b, nil, lease.LessorConfig{MinLeaseTTL: 1})
++	t.Cleanup(lessor.Stop)
++
++	s := mvcc.NewStore(zaptest.NewLogger(t), b, lessor, mvcc.StoreConfig{})
++	t.Cleanup(func() { s.Close() })
++
++	_, err := lessor.Grant(lease.LeaseID(1), 100)
++	require.NoError(t, err)
++
++	return s, lessor
++}
++
++func assertKeyAbsent(t *testing.T, kv mvcc.KV, key string) {
++	t.Helper()
++	rr, err := kv.Range(context.Background(), []byte(key), nil, mvcc.RangeOptions{})
++	require.NoError(t, err)
++	assert.Empty(t, rr.KVs, "expected key %q to not have been written", key)
++}
++
++func TestPutRejectsKeyOverLeaseLimit(t *testing.T) {
++	kv, lessor := setupWithRealLessor(t)
++	ctx := t.Context()
++	lg := zaptest.NewLogger(t)
++
++	_, _, err := Put(ctx, lg, lessor, kv, &pb.PutRequest{Key: []byte("a"), Lease: 1}, 2)
++	require.NoError(t, err)
++	_, _, err = Put(ctx, lg, lessor, kv, &pb.PutRequest{Key: []byte("b"), Lease: 1}, 2)
++	require.NoError(t, err)
++
++	// lease 1 now has 2 keys attached, at the configured limit of 2.
++	_, _, err = Put(ctx, lg, lessor, kv, &pb.PutRequest{Key: []byte("c"), Lease: 1}, 2)
++	require.ErrorIs(t, err, lease.ErrTooManyKeys)
++
++	// the rejected write must not have been applied.
++	assertKeyAbsent(t, kv, "c")
++	assert.Equal(t, 2, lessor.Lookup(1).ItemCount())
++}
++
++func TestPutReattachDoesNotCountAgainstLimit(t *testing.T) {
++	kv, lessor := setupWithRealLessor(t)
++	ctx := t.Context()
++	lg := zaptest.NewLogger(t)
++
++	_, _, err := Put(ctx, lg, lessor, kv, &pb.PutRequest{Key: []byte("a"), Lease: 1}, 1)
++	require.NoError(t, err)
++
++	// lease is now at its limit of 1 key; re-attaching the same key must
++	// still be permitted since it does not grow the lease.
++	_, _, err = Put(ctx, lg, lessor, kv, &pb.PutRequest{Key: []byte("a"), Lease: 1}, 1)
++	require.NoError(t, err)
++	assert.Equal(t, 1, lessor.Lookup(1).ItemCount())
++
++	// a genuinely new key is still rejected.
++	_, _, err = Put(ctx, lg, lessor, kv, &pb.PutRequest{Key: []byte("b"), Lease: 1}, 1)
++	require.ErrorIs(t, err, lease.ErrTooManyKeys)
++	assertKeyAbsent(t, kv, "b")
++}
++
++func TestPutWithoutLimitConfiguredAlwaysSucceeds(t *testing.T) {
++	kv, lessor := setupWithRealLessor(t)
++	ctx := t.Context()
++	lg := zaptest.NewLogger(t)
++
++	for _, k := range []string{"a", "b", "c", "d"} {
++		_, _, err := Put(ctx, lg, lessor, kv, &pb.PutRequest{Key: []byte(k), Lease: 1}, 0)
++		require.NoError(t, err)
++	}
++	assert.Equal(t, 4, lessor.Lookup(1).ItemCount())
++}
++
++func TestTxnRejectsWhenCumulativeNewKeysExceedLimit(t *testing.T) {
++	kv, lessor := setupWithRealLessor(t)
++	ctx := t.Context()
++	lg := zaptest.NewLogger(t)
++
++	txn := &pb.TxnRequest{
++		Success: []*pb.RequestOp{
++			{Request: &pb.RequestOp_RequestPut{RequestPut: &pb.PutRequest{Key: []byte("a"), Lease: 1}}},
++			{Request: &pb.RequestOp_RequestPut{RequestPut: &pb.PutRequest{Key: []byte("b"), Lease: 1}}},
++			{Request: &pb.RequestOp_RequestPut{RequestPut: &pb.PutRequest{Key: []byte("c"), Lease: 1}}},
++		},
++	}
++
++	_, _, err := Txn(ctx, lg, txn, false, kv, lessor, false, 2)
++	require.ErrorIs(t, err, lease.ErrTooManyKeys)
++
++	// none of the puts in the rejected txn should have been applied.
++	assertKeyAbsent(t, kv, "a")
++	assertKeyAbsent(t, kv, "b")
++	assertKeyAbsent(t, kv, "c")
++	assert.Equal(t, 0, lessor.Lookup(1).ItemCount())
++}
++
++func TestTxnAtExactLimitSucceeds(t *testing.T) {
++	kv, lessor := setupWithRealLessor(t)
++	ctx := t.Context()
++	lg := zaptest.NewLogger(t)
++
++	txn := &pb.TxnRequest{
++		Success: []*pb.RequestOp{
++			{Request: &pb.RequestOp_RequestPut{RequestPut: &pb.PutRequest{Key: []byte("a"), Lease: 1}}},
++			{Request: &pb.RequestOp_RequestPut{RequestPut: &pb.PutRequest{Key: []byte("b"), Lease: 1}}},
++		},
++	}
++
++	_, _, err := Txn(ctx, lg, txn, false, kv, lessor, false, 2)
++	require.NoError(t, err)
++	assert.Equal(t, 2, lessor.Lookup(1).ItemCount())
++}
++
++func TestTxnReattachWithinTxnCountsOnce(t *testing.T) {
++	kv, lessor := setupWithRealLessor(t)
++	ctx := t.Context()
++	lg := zaptest.NewLogger(t)
++
++	// two ops attaching the same new key to the same lease in one txn must
++	// only count as a single new key against the limit.
++	txn := &pb.TxnRequest{
++		Success: []*pb.RequestOp{
++			{Request: &pb.RequestOp_RequestPut{RequestPut: &pb.PutRequest{Key: []byte("a"), Lease: 1}}},
++			{Request: &pb.RequestOp_RequestPut{RequestPut: &pb.PutRequest{Key: []byte("a"), Lease: 1}}},
++		},
++	}
++
++	_, _, err := Txn(ctx, lg, txn, false, kv, lessor, false, 1)
++	require.NoError(t, err)
++	assert.Equal(t, 1, lessor.Lookup(1).ItemCount())
++}
+diff --git a/server/etcdserver/txn/put.go b/server/etcdserver/txn/put.go
+index ec3ae38c7..10ae0f501 100644
+--- a/server/etcdserver/txn/put.go
++++ b/server/etcdserver/txn/put.go
+@@ -27,12 +27,12 @@ import (
+ 	"go.etcd.io/etcd/server/v3/storage/mvcc"
+ )
+ 
+-func Put(ctx context.Context, lg *zap.Logger, lessor lease.Lessor, kv mvcc.KV, p *pb.PutRequest) (resp *pb.PutResponse, trace *traceutil.Trace, err error) {
++func Put(ctx context.Context, lg *zap.Logger, lessor lease.Lessor, kv mvcc.KV, p *pb.PutRequest, maxLeaseKeys int) (resp *pb.PutResponse, trace *traceutil.Trace, err error) {
+ 	ctx, trace = traceutil.EnsureTrace(ctx, lg, "put",
+ 		traceutil.Field{Key: "key", Value: string(p.Key)},
+ 		traceutil.Field{Key: "req_size", Value: proto.Size(p)},
+ 	)
+-	err = checkLease(lessor, p)
++	err = checkLease(lessor, newLeaseKeyLimiter(maxLeaseKeys), p)
+ 	if err != nil {
+ 		return nil, trace, err
+ 	}
+@@ -68,8 +68,8 @@ func put(ctx context.Context, txnWrite mvcc.TxnWrite, p *pb.PutRequest, prevKV *
+ 	return resp
+ }
+ 
+-func checkPut(trace *traceutil.Trace, txnWrite mvcc.ReadView, lessor lease.Lessor, p *pb.PutRequest) error {
+-	err := checkLease(lessor, p)
++func checkPut(trace *traceutil.Trace, txnWrite mvcc.ReadView, lessor lease.Lessor, lk *leaseKeyLimiter, p *pb.PutRequest) error {
++	err := checkLease(lessor, lk, p)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -77,12 +77,16 @@ func checkPut(trace *traceutil.Trace, txnWrite mvcc.ReadView, lessor lease.Lesso
+ 	return err
+ }
+ 
+-func checkLease(lessor lease.Lessor, p *pb.PutRequest) error {
++func checkLease(lessor lease.Lessor, lk *leaseKeyLimiter, p *pb.PutRequest) error {
+ 	leaseID := lease.LeaseID(p.Lease)
+ 	if leaseID != lease.NoLease {
+-		if l := lessor.Lookup(leaseID); l == nil {
++		l := lessor.Lookup(leaseID)
++		if l == nil {
+ 			return lease.ErrLeaseNotFound
+ 		}
++		if err := lk.checkAttach(lessor, leaseID, l, string(p.Key)); err != nil {
++			return err
++		}
+ 	}
+ 	return nil
+ }
+diff --git a/server/etcdserver/txn/txn.go b/server/etcdserver/txn/txn.go
+index 693c04289..9423bd8ba 100644
+--- a/server/etcdserver/txn/txn.go
++++ b/server/etcdserver/txn/txn.go
+@@ -29,7 +29,7 @@ import (
+ 	"go.etcd.io/etcd/server/v3/storage/mvcc"
+ )
+ 
+-func Txn(ctx context.Context, lg *zap.Logger, rt *pb.TxnRequest, txnModeWriteWithSharedBuffer bool, kv mvcc.KV, lessor lease.Lessor, skipRangeExecution bool) (txnResp *pb.TxnResponse, trace *traceutil.Trace, err error) {
++func Txn(ctx context.Context, lg *zap.Logger, rt *pb.TxnRequest, txnModeWriteWithSharedBuffer bool, kv mvcc.KV, lessor lease.Lessor, skipRangeExecution bool, maxLeaseKeys int) (txnResp *pb.TxnResponse, trace *traceutil.Trace, err error) {
+ 	ctx, trace = traceutil.EnsureTrace(ctx, lg, "transaction")
+ 	isWrite := !IsTxnReadonly(rt)
+ 	// When the transaction contains write operations, we use ReadTx instead of
+@@ -51,7 +51,7 @@ func Txn(ctx context.Context, lg *zap.Logger, rt *pb.TxnRequest, txnModeWriteWit
+ 	if isWrite {
+ 		trace.AddField(traceutil.Field{Key: "read_only", Value: false})
+ 	}
+-	_, err = checkTxn(trace, txnRead, rt, lessor, txnPath)
++	_, err = checkTxn(trace, txnRead, rt, lessor, txnPath, newLeaseKeyLimiter(maxLeaseKeys))
+ 	if err != nil {
+ 		txnRead.End()
+ 		return nil, nil, err
+@@ -198,7 +198,7 @@ func executeTxn(ctx context.Context, lg *zap.Logger, txnWrite mvcc.TxnWrite, rt
+ 	return txns, nil
+ }
+ 
+-func checkTxn(trace *traceutil.Trace, rv mvcc.ReadView, rt *pb.TxnRequest, lessor lease.Lessor, txnPath []bool) (int, error) {
++func checkTxn(trace *traceutil.Trace, rv mvcc.ReadView, rt *pb.TxnRequest, lessor lease.Lessor, txnPath []bool, lk *leaseKeyLimiter) (int, error) {
+ 	txnCount := 0
+ 	reqs := rt.Success
+ 	if !txnPath[0] {
+@@ -211,10 +211,10 @@ func checkTxn(trace *traceutil.Trace, rv mvcc.ReadView, rt *pb.TxnRequest, lesso
+ 		case *pb.RequestOp_RequestRange:
+ 			err = checkRange(rv, tv.RequestRange)
+ 		case *pb.RequestOp_RequestPut:
+-			err = checkPut(trace, rv, lessor, tv.RequestPut)
++			err = checkPut(trace, rv, lessor, lk, tv.RequestPut)
+ 		case *pb.RequestOp_RequestDeleteRange:
+ 		case *pb.RequestOp_RequestTxn:
+-			txns, err = checkTxn(trace, rv, tv.RequestTxn, lessor, txnPath[1:])
++			txns, err = checkTxn(trace, rv, tv.RequestTxn, lessor, txnPath[1:], lk)
+ 			txnCount += txns + 1
+ 			txnPath = txnPath[txns+1:]
+ 		default:
+diff --git a/server/etcdserver/txn/txn_test.go b/server/etcdserver/txn/txn_test.go
+index 7740e9e41..366ca9d81 100644
+--- a/server/etcdserver/txn/txn_test.go
++++ b/server/etcdserver/txn/txn_test.go
+@@ -223,7 +223,7 @@ func TestCheckTxn(t *testing.T) {
+ 
+ 			ctx, cancel := context.WithCancel(t.Context())
+ 			defer cancel()
+-			_, _, err := Txn(ctx, zaptest.NewLogger(t), tc.txn, false, s, lessor, false)
++			_, _, err := Txn(ctx, zaptest.NewLogger(t), tc.txn, false, s, lessor, false, 0)
+ 
+ 			gotErr := ""
+ 			if err != nil {
+@@ -243,7 +243,7 @@ func TestCheckPut(t *testing.T) {
+ 
+ 			ctx, cancel := context.WithCancel(t.Context())
+ 			defer cancel()
+-			_, _, err := Put(ctx, zaptest.NewLogger(t), lessor, s, tc.op.GetRequestPut())
++			_, _, err := Put(ctx, zaptest.NewLogger(t), lessor, s, tc.op.GetRequestPut(), 0)
+ 
+ 			gotErr := ""
+ 			if err != nil {
+@@ -350,9 +350,9 @@ func TestSkippedRangeExecutionResponseHeaderRevision(t *testing.T) {
+ 			normalKV, normalLessor := setup(t, testSetup{})
+ 			skippedKV, skippedLessor := setup(t, testSetup{})
+ 
+-			normalResp, _, err := Txn(ctx, lg, tt.txn, false, normalKV, normalLessor, false)
++			normalResp, _, err := Txn(ctx, lg, tt.txn, false, normalKV, normalLessor, false, 0)
+ 			require.NoError(t, err)
+-			skippedResp, _, err := Txn(ctx, lg, tt.txn, false, skippedKV, skippedLessor, true)
++			skippedResp, _, err := Txn(ctx, lg, tt.txn, false, skippedKV, skippedLessor, true, 0)
+ 			require.NoError(t, err)
+ 
+ 			var normalRangeHeader, skippedRangeHeader *pb.ResponseHeader
+@@ -398,7 +398,7 @@ func TestReadonlyTxnError(t *testing.T) {
+ 		},
+ 	}
+ 
+-	_, _, err := Txn(ctx, zaptest.NewLogger(t), txn, false, s, &lease.FakeLessor{}, false)
++	_, _, err := Txn(ctx, zaptest.NewLogger(t), txn, false, s, &lease.FakeLessor{}, false, 0)
+ 	if err == nil || !strings.Contains(err.Error(), "applyTxn: failed Range: rangeKeys: context cancelled: context canceled") {
+ 		t.Fatalf("Expected context canceled error, got %v", err)
+ 	}
+@@ -441,7 +441,7 @@ func TestWriteTxnPanicWithoutApply(t *testing.T) {
+ 	// we verify the following properties below:
+ 	// 1. server panics after a write txn aply fails (invariant: server should never try to move on from a failed write)
+ 	// 2. no writes from the txn are applied to the backend (invariant: failed write should have no side-effect on DB state besides panic)
+-	assert.Panicsf(t, func() { Txn(ctx, zaptest.NewLogger(t), txn, false, s, &lease.FakeLessor{}, false) }, "Expected panic in Txn with writes")
++	assert.Panicsf(t, func() { Txn(ctx, zaptest.NewLogger(t), txn, false, s, &lease.FakeLessor{}, false, 0) }, "Expected panic in Txn with writes")
+ 	dbHashAfter, err := computeFileHash(bePath)
+ 	require.NoErrorf(t, err, "failed to compute DB file hash after txn")
+ 	require.Equalf(t, dbHashBefore, dbHashAfter, "mismatch in DB hash before and after failed write txn")
+diff --git a/server/etcdserver/v3_server.go b/server/etcdserver/v3_server.go
+index a357705a0..faf5d38d2 100644
+--- a/server/etcdserver/v3_server.go
++++ b/server/etcdserver/v3_server.go
+@@ -363,7 +363,7 @@ func (s *EtcdServer) Txn(ctx context.Context, r *pb.TxnRequest) (*pb.TxnResponse
+ 		}(time.Now())
+ 
+ 		get := func() {
+-			resp, _, err = txn.Txn(ctx, s.Logger(), r, s.Cfg.ServerFeatureGate.Enabled(features.TxnModeWriteWithSharedBuffer), s.KV(), s.lessor, false)
++			resp, _, err = txn.Txn(ctx, s.Logger(), r, s.Cfg.ServerFeatureGate.Enabled(features.TxnModeWriteWithSharedBuffer), s.KV(), s.lessor, false, int(s.Cfg.MaxLeaseKeys))
+ 		}
+ 		if serr := s.doSerialize(ctx, chk, get); serr != nil {
+ 			return nil, serr
+diff --git a/server/lease/lease.go b/server/lease/lease.go
+index 8f194c980..12011654d 100644
+--- a/server/lease/lease.go
++++ b/server/lease/lease.go
+@@ -102,6 +102,13 @@ func (l *Lease) Demoted() bool {
+ 	return l.expiry == forever
+ }
+ 
++// ItemCount returns the number of keys currently attached to the lease.
++func (l *Lease) ItemCount() int {
++	l.mu.RLock()
++	defer l.mu.RUnlock()
++	return len(l.itemSet)
++}
++
+ // Keys returns all the keys attached to the lease.
+ func (l *Lease) Keys() []string {
+ 	l.mu.RLock()
+diff --git a/server/lease/lessor.go b/server/lease/lessor.go
+index 67472eca5..4af4a34bf 100644
+--- a/server/lease/lessor.go
++++ b/server/lease/lessor.go
+@@ -61,6 +61,7 @@ var (
+ 	ErrLeaseNotFound    = errors.New("lease not found")
+ 	ErrLeaseExists      = errors.New("lease already exists")
+ 	ErrLeaseTTLTooLarge = errors.New("too large lease TTL")
++	ErrTooManyKeys      = errors.New("too many keys attached to lease")
+ )
+ 
+ // TxnDelete is a TxnWrite that only permits deletes. Defined here

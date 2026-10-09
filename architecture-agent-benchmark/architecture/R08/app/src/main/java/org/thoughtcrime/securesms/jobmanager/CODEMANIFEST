@@ -1,0 +1,245 @@
+Annotations: |
+  This cell is a fully generic, domain-agnostic background job execution framework: nothing in
+  it knows what a "job" actually does. New units of background work plug in by subclassing `Job`
+  (or its coroutine-friendly variant `CoroutineJob`) and registering a matching Job.Factory
+  with the `JobManager` at startup — this factory-keyed registration is the framework's
+  extension point. Persisted job state survives process death; `JsonJobData` is the serialization
+  format for a job's saved input.
+
+---
+
+"Job(parameters: Parameters)":
+  location: Job.java
+  annotations: |
+    Base class for a single unit of persisted background work. Concrete subclasses live outside
+    this cell, throughout the app, one per kind of background task.
+
+    `parameters`: this job instance's Parameters (queue, retry policy, constraint keys, etc).
+
+    A concrete subclass must implement getFactoryKey, run, and onFailure below, and must
+    have a corresponding Factory registered with the `JobManager` under that same factory key
+    so the framework can reconstruct the job after a process restart.
+  methods:
+    "getId() -> id:String": |
+      Stable identifier for this specific job instance, assigned at creation time.
+    "getParameters() -> parameters:Parameters": |
+      This job's Parameters.
+    "getRunAttempt() -> attempt:Int": |
+      How many times this job has been attempted so far, including the current attempt.
+    "isCanceled() -> canceled:Boolean": |
+      Whether this job has been marked canceled; a well-behaved run() implementation should
+      check this and exit early when true.
+    "getFactoryKey() -> key:String": |
+      The key that identifies which registered Factory can reconstruct this kind of job from
+      persisted data. Must be unique across every concrete `Job` subclass in the app and must
+      match the key under which that subclass's Factory is registered.
+    "run() -> result:Result": |
+      Performs the job's actual work. Invoked on a background thread by the framework, possibly
+      more than once across process restarts if a prior attempt did not complete.
+    "onFailure()": |
+      Invoked once, on the thread that determined final failure, when this job will not be
+      attempted again (either after run() returned a non-retryable Result or after
+      exhausting Parameters's max attempts).
+
+"Job::CoroutineJob(parameters: Parameters)":
+  location: CoroutineJob.kt
+  annotations: |
+    A `Job` whose real work is expressed as a suspend function rather than a blocking call.
+
+    `parameters`: forwarded to `Job`.
+
+    Implements run by blocking the calling thread on doRun via runBlocking; subclasses
+    implement doRun instead of run.
+  methods:
+    "doRun() -> result:Result": |
+      The job's actual work, expressed as a suspend function. Runs on the coroutine Default
+      dispatcher by default.
+
+"Job.Factory<T>()":
+  location: Job.java
+  annotations: |
+    The extension-point contract: one implementation per concrete `Job` subclass, registered
+    with the `JobManager`'s Configuration.Builder.setJobFactories under the same string key
+    the corresponding `Job` subclass reports from getFactoryKey, so the framework can
+    reconstruct that job type from persisted data after a process restart.
+  methods:
+    "create(parameters: Parameters, serializedData: ByteArray) -> job:T": |
+      Reconstructs a job instance of type `T` from previously-persisted state.
+
+      `parameters`: the job's persisted Parameters.
+      `serializedData`: the job's persisted input, previously produced by that job type and
+      typically read back via `JsonJobData`.
+
+"Job.Result()":
+  location: Job.java
+  annotations: |
+    Outcome of a single run() attempt. Constructed only via its own static factories, never
+    directly.
+  methods:
+    "isSuccess() -> success:Boolean": |
+      True if this result represents successful completion.
+    "isRetry() -> retry:Boolean": |
+      True if this result requests another attempt after a backoff interval.
+    "isFailure() -> failure:Boolean": |
+      True if this result represents final, non-retryable failure.
+
+"Job.Parameters()":
+  location: Job.java
+  annotations: |
+    Immutable configuration for a `Job` instance: its queue, retry/backoff policy, required
+    constraint keys, and persisted input payload. Built via its own nested Builder, not
+    constructed directly.
+  properties:
+    "queue -> String": |
+      The name of the serial execution queue this job belongs to, or an unset value if the job
+      may run concurrently with others.
+    "constraintKeys -> List<String>": |
+      Factory keys of the `Constraint`s that must all be met before this job is eligible to run.
+    "inputData -> ByteArray": |
+      The job's persisted input payload, typically produced and later read back via
+      `JsonJobData`.
+
+"JobManager(application: Application, configuration: Configuration)":
+  location: JobManager.java
+  annotations: |
+    The framework's public entry point: accepts new jobs, persists and schedules them subject to
+    their `Constraint`s and queue semantics, and exposes their lifecycle state to listeners.
+
+    `application`: the app's `Application` instance.
+    `configuration`: registered Job.Factory/Constraint.Factory maps, `ConstraintObserver`s,
+    and runner-pool sizing, assembled via Configuration.Builder.
+  methods:
+    "add(job: Job)": |
+      Persists and enqueues `job` for execution as soon as its constraints and queue allow.
+    "addAll(jobs: List<Job>)": |
+      Same as add, for a batch of independent jobs.
+    "startChain(job: Job) -> chain:Chain": |
+      Begins a `Chain`: a sequence of jobs where each subsequent job only becomes eligible once
+      every job before it in the chain has completed successfully.
+    "cancel(id: String)": |
+      Marks the job with the given `id` as canceled; a running job observes this via
+      Job.isCanceled.
+    "cancelAllInQueue(queue: String)": |
+      Cancels every not-yet-completed job currently in the named queue.
+    "runSynchronously(job: Job, timeout: Long) -> state:JobState": |
+      Adds `job` and blocks the calling thread until it reaches a terminal state or `timeout`
+      milliseconds elapse, whichever comes first.
+    "addListener(id: String, listener: JobListener)": |
+      Registers `listener` to be notified of state changes for the single job identified by
+      `id`.
+    "getFirstMatchingJobState(filter: JobFilter) -> state:JobState": |
+      The current state of the first pending/running/completed job (subject to the tracker's
+      bounded history) matching `filter`, or none if no match is currently tracked.
+    "flush()": |
+      Blocks the calling thread until every currently-enqueued job has finished running.
+    "isQueueEmpty(queueKey: String) -> empty:Boolean": |
+      Whether the named queue currently has no pending or running jobs.
+
+"Constraint()":
+  location: Constraint.java
+  annotations: |
+    A condition (e.g. "network is available", "device is charging") that must hold before a job
+    requiring it becomes eligible to run. Implementations plug into the framework the same way
+    `Job` implementations do: one Constraint.Factory registered per factory key.
+  methods:
+    "isMet() -> met:Boolean": |
+      Whether this constraint currently holds.
+    "getFactoryKey() -> key:String": |
+      The key Job.Parameters.constraintKeys entries reference to require this constraint, and
+      under which this constraint's Factory must be registered.
+
+"Constraint.Factory<T>()":
+  location: Constraint.java
+  annotations: |
+    Extension-point contract for constructing a registered `Constraint` implementation, mirroring
+    Job.Factory.
+  methods:
+    "create() -> constraint:T": |
+      Constructs a new instance of the registered constraint type.
+
+"ConstraintObserver()":
+  location: ConstraintObserver.java
+  annotations: |
+    Watches for a `Constraint` transitioning from unmet to met (e.g. network becoming available)
+    and notifies the framework so it can re-evaluate blocked jobs, rather than requiring the
+    framework to poll.
+  methods:
+    "register(notifier: Notifier)": |
+      Registers the callback the framework uses to learn when this observer's associated
+      constraint has just become met.
+
+      `notifier`: invoked with a human-readable reason string each time the watched condition
+      newly holds.
+
+"Scheduler()":
+  location: Scheduler.java
+  annotations: |
+    Requests that the operating system wake the process at a future time so pending jobs can be
+    re-evaluated, even if the app is not otherwise running.
+  methods:
+    "schedule(delay: Long, constraints: List<Constraint>)": |
+      Requests a future wake-up.
+
+      `delay`: minimum milliseconds to wait before the wake-up.
+      `constraints`: constraints the OS scheduler itself should also wait on, where supported.
+
+"JobTracker()":
+  location: JobTracker.java
+  annotations: |
+    In-memory, bounded record of recent job states, and the pub/sub mechanism `JobManager`
+    exposes to listeners. State is not persisted — a fresh process starts with an empty tracker.
+  methods:
+    "addListener(filter: JobFilter, listener: JobListener)": |
+      Registers `listener` for state-change notifications on any job matching `filter`. Must
+      eventually be paired with removeListener to avoid leaking the listener.
+    "removeListener(listener: JobListener)": |
+      Unsubscribes `listener` from all future notifications.
+    "getFirstMatchingJobState(filter: JobFilter) -> state:JobState": |
+      Current tracked state of the first job matching `filter`, if any is still within the
+      bounded in-memory history.
+    "onStateChange(job: Job, state: JobState)": |
+      Records a new state for `job` and notifies every listener whose filter matches it.
+    "haveAnyFailed(jobIds: List<String>) -> failed:Boolean": |
+      Whether any job id in `jobIds` is tracked with a FAILURE state.
+
+"JsonJobData()":
+  location: JsonJobData.java
+  annotations: |
+    Typed, JSON-backed key/value payload used as the persisted inputData for a `Job`. A job
+    writes its input via Builder, serializes it into Job.Parameters.inputData, and reads it
+    back the same way after a process restart.
+  methods:
+    "hasString(key: String) -> present:Boolean": |
+      Whether a string value is present for `key`.
+    "getString(key: String) -> value:String": |
+      The string value stored under `key`.
+    "getInt(key: String) -> value:Int": |
+      The int value stored under `key`.
+    "getBoolean(key: String) -> value:Boolean": |
+      The boolean value stored under `key`.
+    "serialize() -> bytes:ByteArray": |
+      Serializes the current key/value contents to bytes suitable for Job.Parameters.inputData.
+
+"JsonJobData.Builder()":
+  location: JsonJobData.java
+  annotations: |
+    Accumulates key/value pairs before producing an immutable `JsonJobData`.
+  methods:
+    "putString(key: String, value: String) -> builder:Builder": |
+      Stores a string value under `key`.
+    "putInt(key: String, value: Int) -> builder:Builder": |
+      Stores an int value under `key`.
+    "putBoolean(key: String, value: Boolean) -> builder:Builder": |
+      Stores a boolean value under `key`.
+    "build() -> data:JsonJobData": |
+      Produces the immutable `JsonJobData` from the accumulated key/value pairs.
+
+---
+
+Author: Goga
+CreatedAt: 26/08/26
+Description: |
+  Documents the generic background-job execution framework and its two designed extension
+  points (Job.Factory keyed by `Job.getFactoryKey`, Constraint.Factory keyed by
+  `Constraint.getFactoryKey`) through which every concrete background task and eligibility
+  condition elsewhere in the app plugs in. A leaf cell: depends on nothing else documented here.

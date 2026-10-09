@@ -1,0 +1,256 @@
+diff --git a/docs/configuration.md b/docs/configuration.md
+index 229258b..2d7b81c 100644
+--- a/docs/configuration.md
++++ b/docs/configuration.md
+@@ -215,6 +215,7 @@ Mandatory parameters are marked as **Required**, which means that they are requi
+ | `order_time_in_force` | Configure time in force for entry and exit orders. [More information below](#understand-order_time_in_force). [Strategy Override](#parameters-in-the-strategy). <br> **Datatype:** Dict
+ | `position_adjustment_enable` | Enables the strategy to use position adjustments (additional buys or sells). [More information here](strategy-callbacks.md#adjust-trade-position). <br> [Strategy Override](#parameters-in-the-strategy). <br>*Defaults to `false`.*<br> **Datatype:** Boolean
+ | `max_entry_position_adjustment` | Maximum additional order(s) for each open trade on top of the first entry Order. Set it to `-1` for unlimited additional orders. [More information here](strategy-callbacks.md#adjust-trade-position). <br> [Strategy Override](#parameters-in-the-strategy). <br>*Defaults to `-1`.*<br> **Datatype:** Positive Integer or -1
++| `max_currency_exposure` | Maximum share of tradable capital that may be committed to open trades sharing the same quote/settlement currency at the same time. [More information below](#configuring-amount-per-trade). <br> [Strategy Override](#parameters-in-the-strategy). <br>*Defaults to `None` (disabled).*<br> **Datatype:** Float between `0.0` and `1.0`
+ | | **Exchange**
+ | `exchange.name` | **Required.** Name of the exchange class to use. <br> **Datatype:** String
+ | `exchange.api_key` | API key to use for the exchange. Only required when you are in production mode.<br>**Keep it in secret, do not disclose publicly.** <br> **Datatype:** String
+@@ -309,6 +310,7 @@ Values set in the configuration file always overwrite values set in the strategy
+ * `ignore_buying_expired_candle_after`
+ * `position_adjustment_enable`
+ * `max_entry_position_adjustment`
++* `max_currency_exposure`
+ 
+ ### Configuring amount per trade
+ 
+@@ -379,6 +381,20 @@ Adjusting `available_capital` requires reloading the configuration to take effec
+ !!! Warning "Incompatible with `tradable_balance_ratio`"
+     Setting this option will replace any configuration of `tradable_balance_ratio`.
+ 
++#### Currency exposure cap
++
++If you trade several pairs that are all priced against, or settled in, the same underlying currency - for example a handful of BTC-settled futures, or several coins that are all quoted in the same stablecoin - a large adverse move in that one currency can hit several of your open trades at the same time, even though each trade looked fine in isolation.
++
++`max_currency_exposure` lets you cap this concentration risk. It's a ratio (between `0.0` and `1.0`) of your total tradable capital ([respecting `tradable_balance_ratio` / `available_capital`](#tradable-balance)) that may be committed, in total, to simultaneously open trades sharing the same quote/settlement currency.
++
++```json
++"max_currency_exposure": 0.5
++```
++
++With the above, no more than 50% of your tradable capital may be committed at once to open trades sharing a given quote currency. When opening (or adding to, via [position adjustments](strategy-callbacks.md#adjust-trade-position)) a trade would push the combined stake for that currency above the configured share, the stake amount is reduced to fit under the limit, or the trade is skipped entirely if no room is left. This is enforced identically in live/dry-run and in backtesting, the same way other entry-sizing adjustments are, and the reason is logged just like other stake-amount adjustments (e.g. "Stake amount for pair ... is too big").
++
++This setting can also be set in the strategy, see [Strategy Override](#parameters-in-the-strategy). By default, this cap is disabled.
++
+ #### Amend last stake amount
+ 
+ Assuming we have the tradable balance of 1000 USDT, `stake_amount=400`, and `max_open_trades=3`.
+diff --git a/freqtrade/config_schema/config_schema.py b/freqtrade/config_schema/config_schema.py
+index 2036a3f..743c087 100644
+--- a/freqtrade/config_schema/config_schema.py
++++ b/freqtrade/config_schema/config_schema.py
+@@ -879,6 +879,15 @@ CONF_SCHEMA = {
+             "type": ["integer", "number"],
+             "minimum": -1,
+         },
++        "max_currency_exposure": {
++            "description": (
++                "Maximum share of tradable capital that may be committed to open trades "
++                f"sharing the same quote currency at the same time. {__IN_STRATEGY}"
++            ),
++            "type": "number",
++            "minimum": 0.0,
++            "maximum": 1.0,
++        },
+         "add_config_files": {
+             "description": "Additional configuration files to load.",
+             "type": "array",
+diff --git a/freqtrade/resolvers/strategy_resolver.py b/freqtrade/resolvers/strategy_resolver.py
+index bdcf954..e37ee65 100644
+--- a/freqtrade/resolvers/strategy_resolver.py
++++ b/freqtrade/resolvers/strategy_resolver.py
+@@ -79,6 +79,7 @@ class StrategyResolver(IResolver):
+             ("ignore_buying_expired_candle_after", 0),
+             ("position_adjustment_enable", False),
+             ("max_entry_position_adjustment", -1),
++            ("max_currency_exposure", None),
+             ("max_open_trades", float("inf")),
+         ]
+         for attribute, default in attributes:
+diff --git a/freqtrade/strategy/interface.py b/freqtrade/strategy/interface.py
+index 2a5d9ef..fc9d226 100644
+--- a/freqtrade/strategy/interface.py
++++ b/freqtrade/strategy/interface.py
+@@ -118,6 +118,10 @@ class IStrategy(ABC, HyperStrategyMixin):
+     position_adjustment_enable: bool = False
+     max_entry_position_adjustment: int = -1
+ 
++    # Maximum share of tradable capital that may be committed to open trades sharing
++    # the same quote/settlement currency at the same time. None disables the check.
++    max_currency_exposure: float | None = None
++
+     # Number of seconds after which the candle will no longer result in a buy on expired candles
+     ignore_buying_expired_candle_after: int = 0
+ 
+diff --git a/freqtrade/wallets.py b/freqtrade/wallets.py
+index e644d82..913b8bb 100644
+--- a/freqtrade/wallets.py
++++ b/freqtrade/wallets.py
+@@ -407,6 +407,47 @@ class Wallets:
+ 
+         return self._check_available_stake_amount(stake_amount, available_amount)
+ 
++    def _get_currency_exposure_stake(self, currency: str) -> float:
++        """
++        Sum of stake_amount currently committed to open trades sharing the given
++        quote/settlement currency.
++        """
++        return sum(
++            trade.stake_amount
++            for trade in Trade.get_open_trades()
++            if trade.safe_quote_currency == currency
++        )
++
++    def _apply_currency_exposure_cap(
++        self, pair: str, stake_amount: float, max_currency_exposure: float
++    ) -> float:
++        """
++        Limit stake_amount so that the combined stake of all currently open trades sharing
++        the pair's quote/settlement currency (including this proposed stake) does not exceed
++        the configured share of total tradable capital.
++        :return: (possibly reduced) stake_amount, or 0 if the cap is already exhausted.
++        """
++        quote_currency = self._exchange.get_pair_quote_currency(pair)
++        currency_cap = self.get_total_stake_amount() * max_currency_exposure
++        currency_exposure = self._get_currency_exposure_stake(quote_currency)
++        allowed_increment = currency_cap - currency_exposure
++
++        if allowed_increment <= 0:
++            self._local_log(
++                f"Stake amount for pair {pair} skipped, {quote_currency} exposure "
++                f"({currency_exposure:.8f}) is already at or above the configured "
++                f"exposure cap ({currency_cap:.8f})."
++            )
++            return 0
++        if stake_amount > allowed_increment:
++            self._local_log(
++                f"Stake amount for pair {pair} is too big for the remaining {quote_currency} "
++                f"exposure allowance ({stake_amount:.8f} > {allowed_increment:.8f}), "
++                f"adjusting to {allowed_increment:.8f}."
++            )
++            stake_amount = allowed_increment
++        return stake_amount
++
+     def validate_stake_amount(
+         self,
+         pair: str,
+@@ -456,6 +497,21 @@ class Wallets:
+                 f"({stake_amount} > {max_allowed_stake}), adjusting to {max_allowed_stake}."
+             )
+             stake_amount = max_allowed_stake
++
++        if (max_currency_exposure := self._config.get("max_currency_exposure")) is not None:
++            stake_amount = self._apply_currency_exposure_cap(
++                pair, stake_amount, max_currency_exposure
++            )
++            if not stake_amount:
++                return 0
++            if min_stake_amount is not None and stake_amount < min_stake_amount:
++                self._local_log(
++                    f"Stake amount for pair {pair} ({stake_amount:.8f}) is below the minimum "
++                    f"tradable amount ({min_stake_amount:.8f}) after applying the currency "
++                    "exposure cap, ignoring trade."
++                )
++                return 0
++
+         return stake_amount
+ 
+     def _local_log(self, msg: str, level: Literal["info", "warning", "debug"] = "info") -> None:
+diff --git a/tests/test_wallets.py b/tests/test_wallets.py
+index 9c0c018..3698e63 100644
+--- a/tests/test_wallets.py
++++ b/tests/test_wallets.py
+@@ -218,6 +218,89 @@ def test_validate_stake_amount(
+     assert res == expected
+ 
+ 
++def test_get_currency_exposure_stake(mocker, default_conf, fee):
++    freqtrade = get_patched_freqtradebot(mocker, default_conf)
++    open_trades = [
++        Trade(
++            pair="BTC/USDT",
++            stake_amount=50.0,
++            amount=1.0,
++            open_rate=50.0,
++            is_open=True,
++            fee_open=fee.return_value,
++        ),
++        Trade(
++            pair="ETH/USDT",
++            stake_amount=30.0,
++            amount=1.0,
++            open_rate=30.0,
++            is_open=True,
++            fee_open=fee.return_value,
++        ),
++        Trade(
++            pair="ETH/BTC",
++            stake_amount=10.0,
++            amount=1.0,
++            open_rate=10.0,
++            is_open=True,
++            fee_open=fee.return_value,
++        ),
++    ]
++    mocker.patch("freqtrade.persistence.models.Trade.get_open_trades", return_value=open_trades)
++
++    assert freqtrade.wallets._get_currency_exposure_stake("USDT") == 80.0
++    assert freqtrade.wallets._get_currency_exposure_stake("BTC") == 10.0
++    assert freqtrade.wallets._get_currency_exposure_stake("ETH") == 0.0
++
++
++@pytest.mark.parametrize(
++    "stake_amount,total_stake,currency_exposure,min_stake,expected",
++    [
++        (100, 1000, 0, 11, 100),  # Well within the 50% cap (500)
++        (100, 1000, 480, 11, 20),  # Only 20 left under the cap - resized down
++        (100, 1000, 500, 11, 0),  # Cap already exhausted - trade skipped
++        (100, 1000, 495, 11, 0),  # Resized amount (5) below min_stake - trade skipped
++        (100, 1000, 495, None, 5),  # Same, but no min_stake set - keep the resized amount
++    ],
++)
++def test_validate_stake_amount_currency_exposure_cap(
++    mocker,
++    default_conf,
++    stake_amount,
++    total_stake,
++    currency_exposure,
++    min_stake,
++    expected,
++):
++    default_conf["max_currency_exposure"] = 0.5
++    freqtrade = get_patched_freqtradebot(mocker, default_conf)
++
++    mocker.patch("freqtrade.wallets.Wallets.get_available_stake_amount", return_value=stake_amount)
++    mocker.patch("freqtrade.wallets.Wallets.get_total_stake_amount", return_value=total_stake)
++    mocker.patch(
++        "freqtrade.wallets.Wallets._get_currency_exposure_stake",
++        return_value=currency_exposure,
++    )
++
++    res = freqtrade.wallets.validate_stake_amount("XRP/USDT", stake_amount, min_stake, 10000, None)
++    assert res == expected
++
++
++def test_validate_stake_amount_currency_exposure_cap_disabled(mocker, default_conf):
++    # max_currency_exposure is unset - the cap must not interfere with normal sizing.
++    freqtrade = get_patched_freqtradebot(mocker, default_conf)
++
++    mocker.patch("freqtrade.wallets.Wallets.get_available_stake_amount", return_value=1000)
++    mocker.patch("freqtrade.wallets.Wallets.get_total_stake_amount", return_value=1000)
++    mocker.patch(
++        "freqtrade.wallets.Wallets._get_currency_exposure_stake",
++        return_value=999,  # Would exhaust any cap, but should be irrelevant here.
++    )
++
++    res = freqtrade.wallets.validate_stake_amount("XRP/USDT", 100, 11, 10000, None)
++    assert res == 100
++
++
+ @pytest.mark.parametrize(
+     "available_capital,closed_profit,open_stakes,free,expected",
+     [

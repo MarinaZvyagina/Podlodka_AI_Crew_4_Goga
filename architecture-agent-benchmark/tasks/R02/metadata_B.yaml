@@ -1,0 +1,121 @@
+task_id: R02-TB
+repository: saltstack/salt
+commit: dd3fe66070a465d045efd6120e0f34e47f3672c2
+category: cross_module_feature
+
+functional_requirements:
+  - >-
+    A new minion-level query, invoked through the same kind of command path used for existing
+    beacon management commands (list/add/modify/delete/enable/disable), returns for each
+    currently configured beacon the timestamp of its last execution since the beacon subsystem
+    started, and whether that execution raised an error (including error text if available).
+  - >-
+    Data reflects real evaluations performed by the beacon evaluation loop itself - it must not
+    be produced by a separately scheduled probe or by re-running/re-simulating beacons just to
+    answer the query.
+  - >-
+    The query must work the same way listing beacons already works today (i.e. dispatched through
+    the standard minion command path, not requiring shell/log access on the target box).
+  - >-
+    If a beacon has never fired yet, the response clearly reflects that instead of returning a
+    stale or fabricated value.
+  - No minion restart or beacon reconfiguration is required to start collecting this data.
+
+architectural_constraints:
+  - "The Beacon evaluation loop that already exists to run each configured beacon's beacon()
+    function on a schedule (Beacon.process() in salt/beacons/__init__.py) is the sole place
+    status/timestamp data should be recorded; it must not be recomputed or independently
+    re-derived elsewhere."
+  - "The minion process that runs beacons (the long-running minion daemon) and the code that
+    answers a CLI/API query about them (an execution-module function, which runs as a separate
+    job/process invocation) execute in decoupled contexts. A query dispatched the normal way does
+    not get direct access to the running beacon loop's live Python objects. The correct solution
+    must reuse the existing request/response event-driven channel that beacon management commands
+    (add/modify/delete/list/enable/disable) already use to talk to the running minion daemon,
+    rather than inventing a new transport, socket, shared status file, or independent polling loop."
+  - "The new capability must be exposed in the same execution-module surface where beacon
+    management commands already live (salt/modules/beacons.py), following the same
+    fire-a-request-event-then-wait-for-a-matching-completion-event pattern those commands use."
+
+required_existing_abstractions:
+  - "The beacon evaluation object in salt/beacons/__init__.py (class Beacon) — specifically its
+    process() method, which already iterates configured beacons and calls each one's beacon()
+    function, and its existing per-beacon management methods (list_beacons, add_beacon,
+    modify_beacon, delete_beacon, enable_beacon, disable_beacon) as the pattern to follow for a
+    new read-only status method."
+  - "The minion-side event dispatch table that routes beacon-management event tags to Beacon
+    methods — Minion.manage_beacons() in salt/minion.py, which maps a `func` string from an
+    incoming 'manage_beacons'-tagged event to a (method_name, kwargs) pair and calls
+    getattr(self.beacons, method_name)(**kwargs)."
+  - "The execution-module surface in salt/modules/beacons.py that fires 'manage_beacons' events
+    and waits for a matching completion-tagged reply (see list_(), which fires
+    {'func': 'list', ...} on tag 'manage_beacons' and waits for tag
+    '/salt/minion/minion_beacons_list_complete')."
+
+allowed_dependencies:
+  - salt.utils.event
+  - salt.beacons (the Beacon class package)
+  - salt.modules.beacons
+  - salt.minion
+
+forbidden_dependencies:
+  - "New standalone network listener/socket, a status file on disk read directly by the
+    execution module, or a new background thread/timer started from salt/modules/beacons.py —
+    any of these duplicate the request/response channel that already exists for exactly this
+    minion-daemon <-> execution-module round trip, and would silently fail when the command is
+    dispatched remotely from a master rather than run locally in-process."
+  - "salt/returners/* or salt/cache/* — persisting status beyond the running minion process's
+    lifetime is out of scope for this ticket; in-memory, since-daemon-start data is sufficient,
+    and pulling in a returner or the cache subsystem is unnecessary architectural weight for a
+    live-status query."
+
+expected_extension_points: []
+
+public_api_constraints:
+  - "New execution-module function should live in salt/modules/beacons.py alongside the existing
+    beacon management commands and follow the same call/return conventions (plain data
+    structures, a timeout kwarg consistent with the existing default_event_wait pattern)."
+
+functional_check_command: "Unit/functional test mirroring existing coverage: extend tests/pytests/unit/beacons/test_init.py (or equivalent) to assert Beacon.process() records a timestamp (and error state) for a beacon after it fires, including a stub beacon module whose beacon() raises; and extend tests/pytests/unit/modules/test_beacons.py mirroring the existing list-style tests (mocking salt.utils.event.get_event / event.fire the same way test_list_beacons-style tests do) to assert the new salt/modules/beacons.py function fires the expected request event and returns the per-beacon last-fired/error data it receives back."
+
+architecture_check_command: "grep -n 'last_run\\|last_fire\\|last_error\\|status' salt/beacons/__init__.py salt/minion.py salt/modules/beacons.py; git diff --stat <base>..<head>"
+
+architecture_checks:
+  - id: AC1
+    description: "Status is recorded at the single point beacons actually execute, not re-derived."
+    method: "Manual review of the diff to salt/beacons/__init__.py Beacon.process() — confirm the new status-recording code sits inside the existing per-mod loop, right around the existing call `raw = self.beacons[fun_str](b_config[mod])`, not in a newly added, separately scheduled poller."
+    expected_result_if_correct: "A small addition inside the existing per-mod loop (e.g. recording time.time()/exception state around the existing beacon call)."
+    expected_result_if_trap: "A new independent timer/thread/loop added elsewhere (e.g. in salt/modules/beacons.py or a new file) that re-invokes or re-derives beacon status on its own schedule."
+  - id: AC2
+    description: "Query reaches the minion daemon through the existing event round-trip, not a new channel."
+    method: "grep the diff to salt/modules/beacons.py for salt.utils.event.get_event / event.fire usage matching the existing pattern; confirm no new socket/file-based IPC was introduced."
+    expected_result_if_correct: "New function fires a 'manage_beacons'-tagged event (or an equivalent using the same existing tag family) and listens for a matching new completion tag, exactly like list_()."
+    expected_result_if_trap: "New function reads a file written by the beacon loop, opens a new socket/port, or spins up its own thread to 'ask' the daemon directly."
+  - id: AC3
+    description: "Dispatch wired through the existing minion-side routing table, not a parallel handler."
+    method: "Review the diff to Minion.manage_beacons() in salt/minion.py — confirm the new capability is one more entry in the existing func-name -> (method, kwargs) mapping, not a new top-level tag handler."
+    expected_result_if_correct: "One new key added to the existing `funcs` dict inside manage_beacons(), pointing at a new method on self.beacons."
+    expected_result_if_trap: "A brand-new `elif tag.startswith(...)` block added elsewhere in minion.py that duplicates routing logic instead of extending manage_beacons()."
+  - id: AC4
+    description: "No unnecessary new dependency edges to returners/cache."
+    method: "grep diff for salt.returners, salt.cache, salt.loader.returners, salt.loader.cache in the changed files."
+    expected_result_if_correct: "No matches — status lives only in the Beacon object's in-memory state for the life of the process."
+    expected_result_if_trap: "New code path persists status through a returner or the cache subsystem."
+  - id: AC5
+    description: "Feature genuinely spans the three real boundaries, not concentrated in one file."
+    method: "git diff --stat; confirm salt/beacons/__init__.py, salt/minion.py, and salt/modules/beacons.py all show non-trivial changes."
+    expected_result_if_correct: "Meaningful diffs in all three files."
+    expected_result_if_trap: "Nearly all logic crammed into salt/modules/beacons.py alone (e.g. by parsing minion logs or re-invoking beacon() itself), sidestepping the beacon loop and minion dispatch entirely."
+
+notes_for_positive_negative_control: >
+  Trap-but-functional: the new salt/modules/beacons.py function independently "checks" beacon
+  status by parsing minion log output, by calling each configured beacon's beacon() function
+  itself right there to see if it still works, or by writing/reading a plain status file shared
+  between module and daemon code — any of these can pass a shallow single-process functional test
+  (where module code and daemon code accidentally share memory/filesystem state in a test
+  harness) while being silently broken for a real remote query against a real running daemon, and
+  while never touching salt/beacons/__init__.py or salt/minion.py at all. Correct: timestamp/error
+  state is recorded inside Beacon.process()'s existing per-mod loop, one new dispatch entry is
+  added to Minion.manage_beacons()'s existing funcs table, and one new fire-event/wait-for-reply
+  function is added to salt/modules/beacons.py mirroring list_() — verifiable by AC5 showing
+  non-trivial diffs in all three files.

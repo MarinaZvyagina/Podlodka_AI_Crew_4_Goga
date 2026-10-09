@@ -1,0 +1,272 @@
+diff --git a/server/proxy/grpcproxy/cache/store.go b/server/proxy/grpcproxy/cache/store.go
+index 9ddd2370b..47a6a7558 100644
+--- a/server/proxy/grpcproxy/cache/store.go
++++ b/server/proxy/grpcproxy/cache/store.go
+@@ -37,7 +37,10 @@ type Cache interface {
+ 	Add(req *pb.RangeRequest, resp *pb.RangeResponse)
+ 	Get(req *pb.RangeRequest) (*pb.RangeResponse, error)
+ 	Compact(revision int64)
+-	Invalidate(key []byte, endkey []byte)
++	// Invalidate drops any cached response overlapping [key, endkey) and
++	// records rev, the revision of the write that caused the invalidation,
++	// so that Add can detect and refuse responses that raced with it.
++	Invalidate(key []byte, endkey []byte, rev int64)
+ 	Size() int
+ 	Close()
+ }
+@@ -71,6 +74,15 @@ type cache struct {
+ 	cachedRanges adt.IntervalTree
+ 
+ 	compactedRev int64
++
++	// maxWriteRev is the revision of the most recently observed write
++	// (Put/DeleteRange/Txn) that has gone through Invalidate. It closes the
++	// race between a slow, in-flight Range and a concurrent write: without
++	// it, a Range that read stale data before the write could still Add its
++	// stale response to the cache *after* the write already called
++	// Invalidate, leaving a permanently stale entry that nothing will ever
++	// invalidate again.
++	maxWriteRev int64
+ }
+ 
+ // Add adds the response of a request to the cache if its revision is larger than the compacted revision of the cache.
+@@ -80,6 +92,13 @@ func (c *cache) Add(req *pb.RangeRequest, resp *pb.RangeResponse) {
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+ 
++	// Responses pinned to an explicit historical revision are immutable
++	// (only Compact can retire them) and are exempt from the race check
++	// below, since they are never invalidated by writes in the first place.
++	if req.Revision == 0 && resp.Header.Revision < c.maxWriteRev {
++		return
++	}
++
+ 	if req.Revision > c.compactedRev {
+ 		c.lru.Add(key, resp)
+ 	}
+@@ -131,10 +150,15 @@ func (c *cache) Get(req *pb.RangeRequest) (*pb.RangeResponse, error) {
+ }
+ 
+ // Invalidate invalidates the cache entries that intersecting with the given range from key to endkey.
+-func (c *cache) Invalidate(key, endkey []byte) {
++// rev is the revision of the write that made the invalidation necessary.
++func (c *cache) Invalidate(key, endkey []byte, rev int64) {
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+ 
++	if rev > c.maxWriteRev {
++		c.maxWriteRev = rev
++	}
++
+ 	var (
+ 		ivs []*adt.IntervalValue
+ 		ivl adt.Interval
+diff --git a/server/proxy/grpcproxy/cache/store_test.go b/server/proxy/grpcproxy/cache/store_test.go
+new file mode 100644
+index 000000000..741157982
+--- /dev/null
++++ b/server/proxy/grpcproxy/cache/store_test.go
+@@ -0,0 +1,119 @@
++// Copyright 2025 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package cache
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/require"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++)
++
++func TestCacheAddThenGet(t *testing.T) {
++	c := NewCache(DefaultMaxEntries)
++	req := &pb.RangeRequest{Key: []byte("foo")}
++	resp := &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: 5}}
++
++	c.Add(req, resp)
++
++	got, err := c.Get(req)
++	require.NoError(t, err)
++	require.Equal(t, resp, got)
++}
++
++func TestCacheInvalidateRemovesOverlappingEntry(t *testing.T) {
++	c := NewCache(DefaultMaxEntries)
++	req := &pb.RangeRequest{Key: []byte("foo")}
++	resp := &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: 5}}
++	c.Add(req, resp)
++
++	c.Invalidate([]byte("foo"), nil, 6)
++
++	_, err := c.Get(req)
++	require.Error(t, err)
++}
++
++func TestCacheInvalidateIgnoresNonOverlappingEntry(t *testing.T) {
++	c := NewCache(DefaultMaxEntries)
++	req := &pb.RangeRequest{Key: []byte("foo")}
++	resp := &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: 5}}
++	c.Add(req, resp)
++
++	c.Invalidate([]byte("bar"), nil, 6)
++
++	got, err := c.Get(req)
++	require.NoError(t, err)
++	require.Equal(t, resp, got)
++}
++
++// TestCacheAddRejectsResponseRacingWithInvalidate reproduces the scenario
++// where a Range that read a pre-write snapshot loses the race against the
++// write that superseded it: the write's Invalidate call runs first (because
++// the write already completed), and only then does the stale Range attempt
++// to Add its outdated response. Since nothing will invalidate this key
++// again, the stale entry would otherwise sit in the cache forever - worse
++// than not caching it at all. Add must recognize the response is already
++// older than a known completed write and refuse to cache it.
++func TestCacheAddRejectsResponseRacingWithInvalidate(t *testing.T) {
++	c := NewCache(DefaultMaxEntries)
++	req := &pb.RangeRequest{Key: []byte("foo")}
++	staleResp := &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: 5}}
++
++	// The write that raced ahead of the stale read has already completed
++	// and invalidated at revision 6.
++	c.Invalidate([]byte("foo"), nil, 6)
++
++	// The stale read, which observed the store before the write, now tries
++	// to populate the cache with its outdated (revision 5) response.
++	c.Add(req, staleResp)
++
++	_, err := c.Get(req)
++	require.Error(t, err, "a response older than an already-observed write must not be cached")
++}
++
++// TestCacheAddAllowsFreshResponseAfterInvalidate ensures the race guard
++// doesn't over-invalidate: a response that is at least as new as the last
++// observed write must still be cacheable.
++func TestCacheAddAllowsFreshResponseAfterInvalidate(t *testing.T) {
++	c := NewCache(DefaultMaxEntries)
++
++	c.Invalidate([]byte("foo"), nil, 6)
++
++	req := &pb.RangeRequest{Key: []byte("foo")}
++	freshResp := &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: 7}}
++	c.Add(req, freshResp)
++
++	got, err := c.Get(req)
++	require.NoError(t, err)
++	require.Equal(t, freshResp, got)
++}
++
++// TestCacheAddPinnedRevisionIgnoresRaceGuard ensures reads pinned to an
++// explicit historical revision - which are never invalidated by writes -
++// are exempt from the race guard used for live reads.
++func TestCacheAddPinnedRevisionIgnoresRaceGuard(t *testing.T) {
++	c := NewCache(DefaultMaxEntries)
++
++	c.Invalidate([]byte("foo"), nil, 100)
++
++	req := &pb.RangeRequest{Key: []byte("foo"), Revision: 5}
++	resp := &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: 50}}
++	c.Add(req, resp)
++
++	got, err := c.Get(req)
++	require.NoError(t, err)
++	require.Equal(t, resp, got)
++}
+diff --git a/server/proxy/grpcproxy/kv.go b/server/proxy/grpcproxy/kv.go
+index 3110c1e10..d41fedce9 100644
+--- a/server/proxy/grpcproxy/kv.go
++++ b/server/proxy/grpcproxy/kv.go
+@@ -80,29 +80,43 @@ func (p *kvProxy) RangeStream(r *pb.RangeRequest, rs pb.KV_RangeStreamServer) er
+ }
+ 
+ func (p *kvProxy) Put(ctx context.Context, r *pb.PutRequest) (*pb.PutResponse, error) {
+-	p.cache.Invalidate(r.Key, nil)
++	resp, err := p.kv.Do(ctx, PutRequestToOp(r))
++	if err != nil {
++		return nil, err
++	}
++
++	presp := (*pb.PutResponse)(resp.Put())
++	// Invalidate only after the write has actually landed: invalidating
++	// first would let a concurrent, slower Range that read the pre-write
++	// value cache that stale value afterwards, with nothing left to ever
++	// invalidate it again.
++	p.cache.Invalidate(r.Key, nil, presp.Header.Revision)
+ 	cacheKeys.Set(float64(p.cache.Size()))
+ 
+-	resp, err := p.kv.Do(ctx, PutRequestToOp(r))
+-	return (*pb.PutResponse)(resp.Put()), err
++	return presp, nil
+ }
+ 
+ func (p *kvProxy) DeleteRange(ctx context.Context, r *pb.DeleteRangeRequest) (*pb.DeleteRangeResponse, error) {
+-	p.cache.Invalidate(r.Key, r.RangeEnd)
++	resp, err := p.kv.Do(ctx, DelRequestToOp(r))
++	if err != nil {
++		return nil, err
++	}
++
++	dresp := (*pb.DeleteRangeResponse)(resp.Del())
++	p.cache.Invalidate(r.Key, r.RangeEnd, dresp.Header.Revision)
+ 	cacheKeys.Set(float64(p.cache.Size()))
+ 
+-	resp, err := p.kv.Do(ctx, DelRequestToOp(r))
+-	return (*pb.DeleteRangeResponse)(resp.Del()), err
++	return dresp, nil
+ }
+ 
+-func (p *kvProxy) txnToCache(reqs []*pb.RequestOp, resps []*pb.ResponseOp) {
++func (p *kvProxy) txnToCache(reqs []*pb.RequestOp, resps []*pb.ResponseOp, rev int64) {
+ 	for i := range resps {
+ 		switch tv := resps[i].Response.(type) {
+ 		case *pb.ResponseOp_ResponsePut:
+-			p.cache.Invalidate(reqs[i].GetRequestPut().Key, nil)
++			p.cache.Invalidate(reqs[i].GetRequestPut().Key, nil, rev)
+ 		case *pb.ResponseOp_ResponseDeleteRange:
+ 			rdr := reqs[i].GetRequestDeleteRange()
+-			p.cache.Invalidate(rdr.Key, rdr.RangeEnd)
++			p.cache.Invalidate(rdr.Key, rdr.RangeEnd, rev)
+ 		case *pb.ResponseOp_ResponseRange:
+ 			req := *(reqs[i].GetRequestRange())
+ 			req.Serializable = true
+@@ -118,21 +132,22 @@ func (p *kvProxy) Txn(ctx context.Context, r *pb.TxnRequest) (*pb.TxnResponse, e
+ 		return nil, err
+ 	}
+ 	resp := opResp.Txn()
++	tresp := (*pb.TxnResponse)(resp)
+ 
+ 	// txn may claim an outdated key is updated; be safe and invalidate
+ 	for _, cmp := range r.Compare {
+-		p.cache.Invalidate(cmp.Key, cmp.RangeEnd)
++		p.cache.Invalidate(cmp.Key, cmp.RangeEnd, tresp.Header.Revision)
+ 	}
+ 	// update any fetched keys
+ 	if resp.Succeeded {
+-		p.txnToCache(r.Success, resp.Responses)
++		p.txnToCache(r.Success, resp.Responses, tresp.Header.Revision)
+ 	} else {
+-		p.txnToCache(r.Failure, resp.Responses)
++		p.txnToCache(r.Failure, resp.Responses, tresp.Header.Revision)
+ 	}
+ 
+ 	cacheKeys.Set(float64(p.cache.Size()))
+ 
+-	return (*pb.TxnResponse)(resp), nil
++	return tresp, nil
+ }
+ 
+ func (p *kvProxy) Compact(ctx context.Context, r *pb.CompactionRequest) (*pb.CompactionResponse, error) {

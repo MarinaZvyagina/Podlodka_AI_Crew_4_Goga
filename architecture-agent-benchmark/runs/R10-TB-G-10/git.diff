@@ -1,0 +1,421 @@
+diff --git a/Signal/ConversationView/ConversationSearch.swift b/Signal/ConversationView/ConversationSearch.swift
+index bb0e7b0..28cc71d 100644
+--- a/Signal/ConversationView/ConversationSearch.swift
++++ b/Signal/ConversationView/ConversationSearch.swift
+@@ -28,6 +28,20 @@ public class ConversationSearchController: NSObject {
+ 
+     public static let kMinimumSearchTextLength: UInt = 2
+ 
++    /// Index into `searchBar.scopeButtonTitles` for each filter. Order must match
++    /// the titles assigned in `init`.
++    private enum ScopeIndex: Int {
++        case all = 0
++        case attachments = 1
++
++        var filter: ConversationSearchFilter {
++            switch self {
++            case .all: return .none
++            case .attachments: return .attachments
++            }
++        }
++    }
++
+     public let uiSearchController = UISearchController(searchResultsController: nil)
+ 
+     public weak var delegate: ConversationSearchControllerDelegate?
+@@ -37,6 +51,7 @@ public class ConversationSearchController: NSObject {
+     public let resultsBar: SearchResultsBar = SearchResultsBar(frame: .zero)
+ 
+     private var lastSearchText: String?
++    private var lastSearchFilter: ConversationSearchFilter?
+     private var currentSearchTask: Task<Void, Never>?
+ 
+     // MARK: Initializer
+@@ -48,14 +63,25 @@ public class ConversationSearchController: NSObject {
+         resultsBar.resultsBarDelegate = self
+         uiSearchController.delegate = self
+         uiSearchController.searchResultsUpdater = self
++        searchBar.delegate = self
+ 
+         uiSearchController.hidesNavigationBarDuringPresentation = true
+         uiSearchController.obscuresBackgroundDuringPresentation = false
++
++        searchBar.scopeButtonTitles = [
++            OWSLocalizedString("CONVERSATION_SEARCH_SCOPE_ALL", comment: "Title for the search scope button that searches all messages in a conversation, the default in-conversation search scope."),
++            OWSLocalizedString("CONVERSATION_SEARCH_SCOPE_ATTACHMENTS", comment: "Title for the search scope button that narrows in-conversation search to messages with a photo, video, voice message, or file attachment."),
++        ]
++        searchBar.showsScopeBar = true
+     }
+ 
+     var searchBar: UISearchBar {
+         return uiSearchController.searchBar
+     }
++
++    private var currentFilter: ConversationSearchFilter {
++        (ScopeIndex(rawValue: searchBar.selectedScopeButtonIndex) ?? .all).filter
++    }
+ }
+ 
+ extension ConversationSearchController: UISearchControllerDelegate {
+@@ -75,20 +101,26 @@ extension ConversationSearchController: UISearchResultsUpdating {
+ 
+     public func updateSearchResults(for searchController: UISearchController) {
+         let searchText = FullTextSearchIndexer.normalizeText((searchController.searchBar.text ?? "").stripped)
++        let filter = currentFilter
+ 
+-        guard searchText.count >= ConversationSearchController.kMinimumSearchTextLength else {
++        // The attachments filter can browse every media message with no text typed;
++        // plain text search still requires a minimum query length.
++        let meetsMinimumLength = searchText.count >= ConversationSearchController.kMinimumSearchTextLength
++        guard meetsMinimumLength || filter == .attachments else {
+             self.resultsBar.updateResults(resultSet: nil)
+             self.delegate?.conversationSearchController(self, didUpdateSearchResults: nil)
+             self.lastSearchText = nil
++            self.lastSearchFilter = nil
+             self.currentSearchTask?.cancel()
+             return
+         }
+ 
+-        guard lastSearchText != searchText else {
++        guard lastSearchText != searchText || lastSearchFilter != filter else {
+             // Skip redundant search.
+             return
+         }
+         lastSearchText = searchText
++        lastSearchFilter = filter
+ 
+         self.currentSearchTask?.cancel()
+         self.currentSearchTask = Task {
+@@ -98,6 +130,7 @@ extension ConversationSearchController: UISearchResultsUpdating {
+                     searchText: searchText,
+                     threadUniqueId: thread.uniqueId,
+                     isGroupThread: thread is TSGroupThread,
++                    filter: filter,
+                 )
+                 if Task.isCancelled {
+                     throw CancellationError()
+@@ -116,6 +149,7 @@ extension ConversationSearchController: UISearchResultsUpdating {
+         searchText: String,
+         threadUniqueId: String,
+         isGroupThread: Bool,
++        filter: ConversationSearchFilter,
+     ) async throws(CancellationError) -> ConversationScreenSearchResultSet {
+         let databaseStorage = SSKEnvironment.shared.databaseStorageRef
+         return try databaseStorage.read { tx throws(CancellationError) in
+@@ -123,12 +157,19 @@ extension ConversationSearchController: UISearchResultsUpdating {
+                 threadUniqueId: threadUniqueId,
+                 isGroupThread: isGroupThread,
+                 searchText: searchText,
++                filter: filter,
+                 transaction: tx,
+             )
+         }
+     }
+ }
+ 
++extension ConversationSearchController: UISearchBarDelegate {
++    public func searchBar(_ searchBar: UISearchBar, selectedScopeButtonIndexDidChange selectedScope: Int) {
++        updateSearchResults(for: uiSearchController)
++    }
++}
++
+ extension ConversationSearchController: SearchResultsBarDelegate {
+     func searchResultsBar(
+         _ searchResultsBar: SearchResultsBar,
+diff --git a/Signal/translations/en.lproj/Localizable.strings b/Signal/translations/en.lproj/Localizable.strings
+index c811732..6669d15 100644
+--- a/Signal/translations/en.lproj/Localizable.strings
++++ b/Signal/translations/en.lproj/Localizable.strings
+@@ -2578,6 +2578,12 @@
+ /* keyboard toolbar label when no messages match the search string */
+ "CONVERSATION_SEARCH_NO_RESULTS" = "No matches";
+ 
++/* Title for the search scope button that narrows in-conversation search to messages with a photo, video, voice message, or file attachment. */
++"CONVERSATION_SEARCH_SCOPE_ATTACHMENTS" = "Media";
++
++/* Title for the search scope button that searches all messages in a conversation, the default in-conversation search scope. */
++"CONVERSATION_SEARCH_SCOPE_ALL" = "All";
++
+ /* title for conversation settings screen */
+ "CONVERSATION_SETTINGS" = "Chat Settings";
+ 
+diff --git a/SignalServiceKit/Messages/Interactions/AttachmentSearchFinder.swift b/SignalServiceKit/Messages/Interactions/AttachmentSearchFinder.swift
+new file mode 100644
+index 0000000..56c2114
+--- /dev/null
++++ b/SignalServiceKit/Messages/Interactions/AttachmentSearchFinder.swift
+@@ -0,0 +1,59 @@
++//
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++//
++
++import Foundation
++import GRDB
++
++// MARK: -
++
++/// Finds messages in a thread that own a "real" attachment: a photo, video,
++/// voice message, or generic file the user shared, as opposed to a link
++/// preview thumbnail, sticker, contact avatar, or quoted-reply attachment.
++///
++/// Backed by `MessageAttachmentReference`, which is written in the same
++/// write transaction as the owning message (see `AttachmentManagerImpl`), so
++/// results always reflect the current state of the world without requiring a
++/// separate reindex step, unlike the full text search index.
++public class AttachmentSearchFinder {
++
++    public class func messagesWithAttachments(
++        inThreadUniqueId threadUniqueId: String,
++        maxResults: Int,
++        tx: DBReadTransaction,
++    ) -> [TSMessage] {
++        typealias RecordType = AttachmentReference.MessageAttachmentReferenceRecord
++
++        let sql = """
++        SELECT DISTINCT interaction.*
++        FROM \(InteractionRecord.databaseTableName) AS interaction
++        INNER JOIN \(RecordType.databaseTableName) AS attachmentRef
++            ON attachmentRef.\(RecordType.CodingKeys.ownerRowId.rawValue) = interaction.\(interactionColumn: .id)
++        WHERE interaction.\(interactionColumn: .threadUniqueId) = ?
++            AND attachmentRef.\(RecordType.CodingKeys.ownerType.rawValue) = ?
++            AND attachmentRef.\(RecordType.CodingKeys.isViewOnce.rawValue) IS 0
++            AND attachmentRef.\(RecordType.CodingKeys.ownerIsPastEditRevision.rawValue) IS 0
++        ORDER BY interaction.\(interactionColumn: .id) DESC
++        LIMIT ?
++        """
++
++        let arguments: StatementArguments = [
++            threadUniqueId,
++            RecordType.OwnerType.bodyAttachment.rawValue,
++            maxResults,
++        ]
++
++        let cursor = TSMessage.grdbFetchCursor(sql: sql, arguments: arguments, transaction: tx)
++
++        var messages = [TSMessage]()
++        do {
++            while let message = try cursor.next() as? TSMessage {
++                messages.append(message)
++            }
++        } catch {
++            owsFailDebug("unexpected error \(error)")
++        }
++        return messages
++    }
++}
+diff --git a/SignalServiceKit/tests/Messages/Interactions/AttachmentSearchFinderTest.swift b/SignalServiceKit/tests/Messages/Interactions/AttachmentSearchFinderTest.swift
+new file mode 100644
+index 0000000..706117b
+--- /dev/null
++++ b/SignalServiceKit/tests/Messages/Interactions/AttachmentSearchFinderTest.swift
+@@ -0,0 +1,129 @@
++//
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++//
++
++import GRDB
++import LibSignalClient
++import XCTest
++@testable import SignalServiceKit
++
++import typealias SignalServiceKit.Attachment
++
++class AttachmentSearchFinderTest: SSKBaseTest {
++    private var attachmentStore: AttachmentStore!
++    private var db: InMemoryDB!
++
++    private var thread: TSContactThread!
++    private var otherThread: TSContactThread!
++
++    override func setUp() {
++        super.setUp()
++
++        attachmentStore = AttachmentStore()
++        db = InMemoryDB()
++
++        thread = TSContactThread(contactUUID: Aci.randomForTesting().serviceIdUppercaseString, contactPhoneNumber: nil)
++        otherThread = TSContactThread(contactUUID: Aci.randomForTesting().serviceIdUppercaseString, contactPhoneNumber: nil)
++
++        db.write { tx in
++            try! thread.insert(tx.database)
++            try! otherThread.insert(tx.database)
++        }
++    }
++
++    func testOnlyReturnsMessagesWithAttachmentsInThatThread() {
++        let messageWithAttachment = insertMessage(in: thread)
++        insertAttachment(messageRowId: messageWithAttachment.sqliteRowId!, threadRowId: thread.sqliteRowId!)
++
++        // A text-only message in the same thread shouldn't show up.
++        insertMessage(in: thread)
++
++        // A message with an attachment in a *different* thread shouldn't show up either.
++        let otherThreadMessage = insertMessage(in: otherThread)
++        insertAttachment(messageRowId: otherThreadMessage.sqliteRowId!, threadRowId: otherThread.sqliteRowId!)
++
++        let results = db.read { tx in
++            AttachmentSearchFinder.messagesWithAttachments(
++                inThreadUniqueId: thread.uniqueId,
++                maxResults: 500,
++                tx: tx,
++            )
++        }
++
++        XCTAssertEqual(results.map(\.uniqueId), [messageWithAttachment.uniqueId])
++    }
++
++    func testExcludesViewOnceAndPastEditRevisions() {
++        let viewOnceMessage = insertMessage(in: thread)
++        insertAttachment(messageRowId: viewOnceMessage.sqliteRowId!, threadRowId: thread.sqliteRowId!, isViewOnce: true)
++
++        let editedMessage = insertMessage(in: thread)
++        insertAttachment(messageRowId: editedMessage.sqliteRowId!, threadRowId: thread.sqliteRowId!, isPastEditRevision: true)
++
++        let results = db.read { tx in
++            AttachmentSearchFinder.messagesWithAttachments(
++                inThreadUniqueId: thread.uniqueId,
++                maxResults: 500,
++                tx: tx,
++            )
++        }
++
++        XCTAssertTrue(results.isEmpty)
++    }
++
++    func testReflectsAttachmentAddedAfterMessageInsertion() {
++        let message = insertMessage(in: thread)
++
++        var results = db.read { tx in
++            AttachmentSearchFinder.messagesWithAttachments(inThreadUniqueId: thread.uniqueId, maxResults: 500, tx: tx)
++        }
++        XCTAssertTrue(results.isEmpty)
++
++        insertAttachment(messageRowId: message.sqliteRowId!, threadRowId: thread.sqliteRowId!)
++
++        results = db.read { tx in
++            AttachmentSearchFinder.messagesWithAttachments(inThreadUniqueId: thread.uniqueId, maxResults: 500, tx: tx)
++        }
++        XCTAssertEqual(results.map(\.uniqueId), [message.uniqueId])
++    }
++
++    // MARK: - Helpers
++
++    @discardableResult
++    private func insertMessage(in thread: TSContactThread) -> TSOutgoingMessage {
++        return db.write { tx in
++            let message = TSOutgoingMessage(
++                outgoingMessageWith: .withDefaultValues(thread: thread, messageBody: nil),
++                recipientAddressStates: [:],
++            )
++            try! message.asRecord().insert(tx.database)
++            return message
++        }
++    }
++
++    @discardableResult
++    private func insertAttachment(
++        messageRowId: Int64,
++        threadRowId: Int64,
++        isViewOnce: Bool = false,
++        isPastEditRevision: Bool = false,
++    ) -> Attachment {
++        return db.write { tx in
++            var attachmentRecord = Attachment.Record.mockPointer()
++            let referenceParams = AttachmentReference.ConstructionParams.mockMessageBodyAttachmentReference(
++                attachmentRecord: attachmentRecord,
++                messageRowId: messageRowId,
++                threadRowId: threadRowId,
++                isViewOnce: isViewOnce,
++                isPastEditRevision: isPastEditRevision,
++            )
++
++            return try! attachmentStore.insert(
++                &attachmentRecord,
++                reference: referenceParams,
++                tx: tx,
++            )
++        }
++    }
++}
+diff --git a/SignalUI/Search/FullTextSearcher.swift b/SignalUI/Search/FullTextSearcher.swift
+index 1bf2114..249f9c2 100644
+--- a/SignalUI/Search/FullTextSearcher.swift
++++ b/SignalUI/Search/FullTextSearcher.swift
+@@ -211,6 +211,16 @@ public struct MessageSearchResult: Comparable {
+ 
+ // MARK: -
+ 
++/// Narrows `FullTextSearcher.searchWithinConversation` results to a subset of messages.
++public enum ConversationSearchFilter: Equatable {
++    /// No filtering; every text match is a result, as today.
++    case none
++    /// Only messages with a photo, video, voice message, or file attachment are results.
++    case attachments
++}
++
++// MARK: -
++
+ public class ConversationScreenSearchResultSet: CustomStringConvertible {
+     public let searchText: String
+     public let messages: [MessageSearchResult]
+@@ -643,6 +653,7 @@ public class FullTextSearcher {
+         threadUniqueId: String,
+         isGroupThread: Bool,
+         searchText: String,
++        filter: ConversationSearchFilter = .none,
+         maxResults: Int = kDefaultMaxResults,
+         transaction: DBReadTransaction,
+     ) throws(CancellationError) -> ConversationScreenSearchResultSet {
+@@ -654,6 +665,32 @@ public class FullTextSearcher {
+             messages[message.sortId] = searchResult
+         }
+ 
++        // When filtering to attachments, every result (whether matched by text or, with
++        // an empty query, just by browsing) must also own a photo/video/voice/file
++        // attachment. `MessageAttachmentReference` is written in the same transaction as
++        // the message itself, so this is always current -- no separate reindex needed.
++        var attachmentMessageIds: Set<String>?
++        if filter == .attachments {
++            let attachmentMessages = AttachmentSearchFinder.messagesWithAttachments(
++                inThreadUniqueId: threadUniqueId,
++                maxResults: maxResults,
++                tx: transaction,
++            )
++            guard !searchText.isEmpty else {
++                // No text typed yet: just browse every message with an attachment.
++                attachmentMessages.forEach { appendMessage($0) }
++                return ConversationScreenSearchResultSet(searchText: searchText, messages: messages.values.sorted(by: >))
++            }
++            attachmentMessageIds = Set(attachmentMessages.map(\.uniqueId))
++        }
++
++        func appendMessageIfMatchesFilter(_ message: TSMessage) {
++            if let attachmentMessageIds, !attachmentMessageIds.contains(message.uniqueId) {
++                return
++            }
++            appendMessage(message)
++        }
++
+         FullTextSearchIndexer.search(
+             for: searchText,
+             maxResults: maxResults,
+@@ -664,7 +701,7 @@ public class FullTextSearcher {
+                 return
+             }
+             if message.uniqueThreadId == threadUniqueId {
+-                appendMessage(message)
++                appendMessageIfMatchesFilter(message)
+             }
+         }
+ 
+@@ -692,7 +729,7 @@ public class FullTextSearcher {
+                     continue
+                 }
+                 let messagesMentioningAccount = MentionFinder.messagesMentioning(aci: aci, in: threadUniqueId, tx: transaction)
+-                messagesMentioningAccount.forEach { appendMessage($0) }
++                messagesMentioningAccount.forEach { appendMessageIfMatchesFilter($0) }
+             }
+         }
+ 

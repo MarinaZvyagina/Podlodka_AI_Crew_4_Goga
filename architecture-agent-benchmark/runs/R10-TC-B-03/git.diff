@@ -1,0 +1,894 @@
+diff --git a/Signal/AppLaunch/AppDelegate.swift b/Signal/AppLaunch/AppDelegate.swift
+index 378f95a..dc33331 100644
+--- a/Signal/AppLaunch/AppDelegate.swift
++++ b/Signal/AppLaunch/AppDelegate.swift
+@@ -537,6 +537,19 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
+             operation: { try await messageSendLog.cleanUpExpiredEntries() },
+         )
+ 
++        let messageRetentionManager = SSKEnvironment.shared.messageRetentionManagerRef
++        cron.schedulePeriodically(
++            uniqueKey: .cleanUpExpiredMessages,
++            approximateInterval: .day,
++            mustBeRegistered: true,
++            mustBeConnected: false,
++            operation: {
++                await dependenciesBridge.db.awaitableWrite { tx in
++                    messageRetentionManager.sweepAllThreads(tx: tx)
++                }
++            },
++        )
++
+         var orphanedDataCleanerFailureCount = 0
+         cron.schedulePeriodically(
+             uniqueKey: .cleanUpOrphanedData,
+diff --git a/Signal/src/ViewControllers/AppSettings/ChatsSettingsViewController.swift b/Signal/src/ViewControllers/AppSettings/ChatsSettingsViewController.swift
+index 32fac8f..c48cf42 100644
+--- a/Signal/src/ViewControllers/AppSettings/ChatsSettingsViewController.swift
++++ b/Signal/src/ViewControllers/AppSettings/ChatsSettingsViewController.swift
+@@ -24,6 +24,13 @@ class ChatsSettingsViewController: OWSTableViewController2 {
+         )
+     }
+ 
++    override func viewWillAppear(_ animated: Bool) {
++        super.viewWillAppear(animated)
++        // Refresh in case the message retention setting changed on the
++        // pushed picker screen.
++        updateTableContents()
++    }
++
+     @objc
+     private func updateTableContents() {
+         let contents = OWSTableContents()
+@@ -102,6 +109,27 @@ class ChatsSettingsViewController: OWSTableViewController2 {
+         )
+         contents.add(keepMutedChatsArchived)
+ 
++        let messageRetentionSection = OWSTableSection()
++        messageRetentionSection.add(.disclosureItem(
++            withText: OWSLocalizedString(
++                "SETTINGS_MESSAGE_RETENTION_TITLE",
++                comment: "Title for setting that automatically deletes old messages after a chosen amount of time.",
++            ),
++            accessoryText: MessageRetentionSettingsViewController.currentValueShortLabel(),
++            actionBlock: { [weak self] in
++                guard let self else { return }
++                self.navigationController?.pushViewController(
++                    MessageRetentionSettingsViewController(),
++                    animated: true,
++                )
++            },
++        ))
++        messageRetentionSection.footerTitle = OWSLocalizedString(
++            "SETTINGS_MESSAGE_RETENTION_FOOTER",
++            comment: "Footer explaining the automatic message deletion setting.",
++        )
++        contents.add(messageRetentionSection)
++
+         let clearHistorySection = OWSTableSection()
+         clearHistorySection.add(.item(
+             name: OWSLocalizedString("SETTINGS_CLEAR_HISTORY", comment: ""),
+diff --git a/Signal/src/ViewControllers/AppSettings/MessageRetentionSettingsViewController.swift b/Signal/src/ViewControllers/AppSettings/MessageRetentionSettingsViewController.swift
+new file mode 100644
+index 0000000..1c40a44
+--- /dev/null
++++ b/Signal/src/ViewControllers/AppSettings/MessageRetentionSettingsViewController.swift
+@@ -0,0 +1,139 @@
++//
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++//
++
++import SignalServiceKit
++import SignalUI
++
++/// Lets the user choose how long to keep message history before it's
++/// automatically deleted, across all of their chats.
++///
++/// Choosing a window (including choosing one for the first time) applies
++/// retroactively: existing history older than the new window is enqueued for
++/// deletion immediately, not just history received going forward. The actual
++/// deletion happens off the main thread in small batches (see
++/// ``MessageRetentionCleanupJobQueue``), so choosing a short window against a
++/// large history won't freeze the UI, and picking up again automatically if
++/// interrupted.
++class MessageRetentionSettingsViewController: OWSTableViewController2 {
++    /// `nil` represents "keep forever" (retention disabled).
++    private static let options: [UInt32?] = [nil, 30, 90, 365]
++
++    private var currentRetentionPeriodDays: UInt32?
++
++    override func viewDidLoad() {
++        super.viewDidLoad()
++
++        title = OWSLocalizedString(
++            "SETTINGS_MESSAGE_RETENTION_TITLE",
++            comment: "Title for setting that automatically deletes old messages after a chosen amount of time.",
++        )
++
++        currentRetentionPeriodDays = SSKEnvironment.shared.databaseStorageRef.read { tx in
++            SSKEnvironment.shared.messageRetentionManagerRef.retentionPeriodDays(tx: tx)
++        }
++
++        updateTableContents()
++    }
++
++    private func updateTableContents() {
++        let section = OWSTableSection()
++        section.footerTitle = OWSLocalizedString(
++            "SETTINGS_MESSAGE_RETENTION_FOOTER",
++            comment: "Footer explaining the automatic message deletion setting.",
++        )
++
++        for option in Self.options {
++            section.add(OWSTableItem(
++                text: Self.label(forRetentionPeriodDays: option),
++                actionBlock: { [weak self] in
++                    self?.didSelect(retentionPeriodDays: option)
++                },
++                accessoryType: option == currentRetentionPeriodDays ? .checkmark : .none,
++            ))
++        }
++
++        let contents = OWSTableContents()
++        contents.add(section)
++        self.contents = contents
++    }
++
++    private func didSelect(retentionPeriodDays: UInt32?) {
++        guard retentionPeriodDays != currentRetentionPeriodDays else { return }
++
++        // Choosing a shorter (or newly-enabled) window is destructive, since it
++        // immediately deletes existing history outside the new window. Confirm
++        // before applying, the same way other destructive chat settings do.
++        guard retentionPeriodDays != nil else {
++            apply(retentionPeriodDays: nil)
++            return
++        }
++
++        OWSActionSheets.showConfirmationAlert(
++            title: OWSLocalizedString(
++                "SETTINGS_MESSAGE_RETENTION_CONFIRM_TITLE",
++                comment: "Title of alert before enabling/changing automatic message deletion.",
++            ),
++            message: OWSLocalizedString(
++                "SETTINGS_MESSAGE_RETENTION_CONFIRM_MESSAGE",
++                comment: "Message of alert before enabling/changing automatic message deletion, warning that it applies to existing history.",
++            ),
++            proceedTitle: OWSLocalizedString(
++                "SETTINGS_MESSAGE_RETENTION_CONFIRM_BUTTON",
++                comment: "Confirmation button for enabling/changing automatic message deletion.",
++            ),
++            proceedStyle: .destructive,
++        ) { [weak self] _ in
++            self?.apply(retentionPeriodDays: retentionPeriodDays)
++        }
++    }
++
++    private func apply(retentionPeriodDays: UInt32?) {
++        SSKEnvironment.shared.databaseStorageRef.write { tx in
++            SSKEnvironment.shared.messageRetentionManagerRef.setRetentionPeriodDays(retentionPeriodDays, tx: tx)
++        }
++        currentRetentionPeriodDays = retentionPeriodDays
++        updateTableContents()
++    }
++
++    private static func label(forRetentionPeriodDays days: UInt32?) -> String {
++        guard let days else {
++            return OWSLocalizedString(
++                "SETTINGS_MESSAGE_RETENTION_OPTION_FOREVER",
++                comment: "Option to keep message history forever (disables automatic deletion).",
++            )
++        }
++        switch days {
++        case 30:
++            return OWSLocalizedString(
++                "SETTINGS_MESSAGE_RETENTION_OPTION_30_DAYS",
++                comment: "Option to keep message history for 30 days.",
++            )
++        case 90:
++            return OWSLocalizedString(
++                "SETTINGS_MESSAGE_RETENTION_OPTION_90_DAYS",
++                comment: "Option to keep message history for 90 days.",
++            )
++        case 365:
++            return OWSLocalizedString(
++                "SETTINGS_MESSAGE_RETENTION_OPTION_1_YEAR",
++                comment: "Option to keep message history for 1 year.",
++            )
++        default:
++            return String(format: OWSLocalizedString(
++                "SETTINGS_MESSAGE_RETENTION_OPTION_N_DAYS_FORMAT",
++                comment: "Option to keep message history for a number of days. Embeds {{ the number of days }}.",
++            ), days)
++        }
++    }
++
++    /// A short label describing the current setting, suitable for use as the
++    /// accessory text on the settings row that pushes this screen.
++    static func currentValueShortLabel() -> String {
++        let retentionPeriodDays = SSKEnvironment.shared.databaseStorageRef.read { tx in
++            SSKEnvironment.shared.messageRetentionManagerRef.retentionPeriodDays(tx: tx)
++        }
++        return label(forRetentionPeriodDays: retentionPeriodDays)
++    }
++}
+diff --git a/Signal/translations/en.lproj/Localizable.strings b/Signal/translations/en.lproj/Localizable.strings
+index c811732..2f14596 100644
+--- a/Signal/translations/en.lproj/Localizable.strings
++++ b/Signal/translations/en.lproj/Localizable.strings
+@@ -8791,6 +8791,36 @@
+ /* No comment provided by engineer. */
+ "SETTINGS_CLEAR_HISTORY" = "Clear Chat History";
+ 
++/* Title for setting that automatically deletes old messages after a chosen amount of time. */
++"SETTINGS_MESSAGE_RETENTION_TITLE" = "Keep Messages";
++
++/* Footer explaining the automatic message deletion setting. */
++"SETTINGS_MESSAGE_RETENTION_FOOTER" = "Automatically delete messages older than the chosen amount of time from all of your chats. This applies to existing messages as well as new ones.";
++
++/* Title of alert before enabling/changing automatic message deletion. */
++"SETTINGS_MESSAGE_RETENTION_CONFIRM_TITLE" = "Delete Older Messages?";
++
++/* Message of alert before enabling/changing automatic message deletion, warning that it applies to existing history. */
++"SETTINGS_MESSAGE_RETENTION_CONFIRM_MESSAGE" = "This will delete existing messages older than the selected time from all of your chats. This can't be undone.";
++
++/* Confirmation button for enabling/changing automatic message deletion. */
++"SETTINGS_MESSAGE_RETENTION_CONFIRM_BUTTON" = "Delete";
++
++/* Option to keep message history forever (disables automatic deletion). */
++"SETTINGS_MESSAGE_RETENTION_OPTION_FOREVER" = "Forever";
++
++/* Option to keep message history for 30 days. */
++"SETTINGS_MESSAGE_RETENTION_OPTION_30_DAYS" = "30 Days";
++
++/* Option to keep message history for 90 days. */
++"SETTINGS_MESSAGE_RETENTION_OPTION_90_DAYS" = "90 Days";
++
++/* Option to keep message history for 1 year. */
++"SETTINGS_MESSAGE_RETENTION_OPTION_1_YEAR" = "1 Year";
++
++/* Option to keep message history for a number of days. Embeds {{ the number of days }}. */
++"SETTINGS_MESSAGE_RETENTION_OPTION_N_DAYS_FORMAT" = "%d Days";
++
+ /* Label for the 'data' section of the app settings. */
+ "SETTINGS_DATA" = "Data Usage";
+ 
+diff --git a/SignalServiceKit/Environment/AppSetup.swift b/SignalServiceKit/Environment/AppSetup.swift
+index 5d89a51..4a12923 100644
+--- a/SignalServiceKit/Environment/AppSetup.swift
++++ b/SignalServiceKit/Environment/AppSetup.swift
+@@ -971,6 +971,17 @@ extension AppSetup.GlobalsContinuation {
+             threadStore: threadStore,
+             tsAccountManager: tsAccountManager,
+         )
++        let messageRetentionCleanupJobQueue = MessageRetentionCleanupJobQueue(
++            db: db,
++            interactionDeleteManager: interactionDeleteManager,
++            threadStore: threadStore,
++        )
++        let messageRetentionManager = MessageRetentionManagerImpl(
++            dateProvider: dateProvider,
++            messageRetentionCleanupJobQueue: messageRetentionCleanupJobQueue,
++            threadStore: threadStore,
++        )
++
+         let deleteForMeIncomingSyncMessageManager = DeleteForMeIncomingSyncMessageManagerImpl(
+             addressableMessageFinder: deleteForMeAddressableMessageFinder,
+             attachmentManager: attachmentManager,
+@@ -2040,6 +2051,8 @@ extension AppSetup.GlobalsContinuation {
+             localUserLeaveGroupJobQueue: localUserLeaveGroupJobQueue,
+             callRecordDeleteAllJobQueue: callRecordDeleteAllJobQueue,
+             bulkDeleteInteractionJobQueue: bulkDeleteInteractionJobQueue,
++            messageRetentionCleanupJobQueue: messageRetentionCleanupJobQueue,
++            messageRetentionManager: messageRetentionManager,
+             donationReceiptCredentialRedemptionJobQueue: donationReceiptCredentialRedemptionJobQueue,
+             preferences: preferences,
+             proximityMonitoringManager: proximityMonitoringManager,
+@@ -2244,6 +2257,7 @@ extension AppSetup.FinalContinuation {
+             sskEnvironment.localUserLeaveGroupJobQueueRef.start(appContext: appContext)
+             sskEnvironment.callRecordDeleteAllJobQueueRef.start(appContext: appContext)
+             sskEnvironment.bulkDeleteInteractionJobQueueRef.start(appContext: appContext)
++            sskEnvironment.messageRetentionCleanupJobQueueRef.start(appContext: appContext)
+             sskEnvironment.donationReceiptCredentialRedemptionJobQueue.start(appContext: appContext)
+             sskEnvironment.smJobQueuesRef.incomingContactSyncJobQueue.start(appContext: appContext)
+             sskEnvironment.smJobQueuesRef.sendGiftBadgeJobQueue.start(appContext: appContext)
+diff --git a/SignalServiceKit/Environment/SSKEnvironment.swift b/SignalServiceKit/Environment/SSKEnvironment.swift
+index 5a46090..0147cd5 100644
+--- a/SignalServiceKit/Environment/SSKEnvironment.swift
++++ b/SignalServiceKit/Environment/SSKEnvironment.swift
+@@ -91,6 +91,8 @@ public class SSKEnvironment: NSObject {
+     public let localUserLeaveGroupJobQueueRef: LocalUserLeaveGroupJobQueue
+     public let callRecordDeleteAllJobQueueRef: CallRecordDeleteAllJobQueue
+     public let bulkDeleteInteractionJobQueueRef: BulkDeleteInteractionJobQueue
++    public let messageRetentionCleanupJobQueueRef: MessageRetentionCleanupJobQueue
++    public let messageRetentionManagerRef: MessageRetentionManager
+     let donationReceiptCredentialRedemptionJobQueue: DonationReceiptCredentialRedemptionJobQueue
+ 
+     private let appExpiryRef: AppExpiry
+@@ -148,6 +150,8 @@ public class SSKEnvironment: NSObject {
+         localUserLeaveGroupJobQueue: LocalUserLeaveGroupJobQueue,
+         callRecordDeleteAllJobQueue: CallRecordDeleteAllJobQueue,
+         bulkDeleteInteractionJobQueue: BulkDeleteInteractionJobQueue,
++        messageRetentionCleanupJobQueue: MessageRetentionCleanupJobQueue,
++        messageRetentionManager: MessageRetentionManager,
+         donationReceiptCredentialRedemptionJobQueue: DonationReceiptCredentialRedemptionJobQueue,
+         preferences: Preferences,
+         proximityMonitoringManager: OWSProximityMonitoringManager,
+@@ -205,6 +209,8 @@ public class SSKEnvironment: NSObject {
+         self.localUserLeaveGroupJobQueueRef = localUserLeaveGroupJobQueue
+         self.callRecordDeleteAllJobQueueRef = callRecordDeleteAllJobQueue
+         self.bulkDeleteInteractionJobQueueRef = bulkDeleteInteractionJobQueue
++        self.messageRetentionCleanupJobQueueRef = messageRetentionCleanupJobQueue
++        self.messageRetentionManagerRef = messageRetentionManager
+         self.donationReceiptCredentialRedemptionJobQueue = donationReceiptCredentialRedemptionJobQueue
+         self.preferencesRef = preferences
+         self.proximityMonitoringManagerRef = proximityMonitoringManager
+diff --git a/SignalServiceKit/Jobs/Cron.swift b/SignalServiceKit/Jobs/Cron.swift
+index 3b1411c..e9b79db 100644
+--- a/SignalServiceKit/Jobs/Cron.swift
++++ b/SignalServiceKit/Jobs/Cron.swift
+@@ -68,6 +68,7 @@ public class Cron {
+         case cleanUpCallingAssets
+         case cleanUpMessageSendLog
+         case cleanUpOrphanedAttachments
++        case cleanUpExpiredMessages
+         case cleanUpOrphanedData
+         case cleanUpViewOnceMessages
+         case fetchCallingAssets
+diff --git a/SignalServiceKit/Jobs/JobRecords/JobRecord+Columns.swift b/SignalServiceKit/Jobs/JobRecords/JobRecord+Columns.swift
+index ad8b622..87c38a9 100644
+--- a/SignalServiceKit/Jobs/JobRecords/JobRecord+Columns.swift
++++ b/SignalServiceKit/Jobs/JobRecords/JobRecord+Columns.swift
+@@ -116,5 +116,10 @@ extension JobRecord {
+         // MARK: BackupReceiptCredentialRedemptionJobRecord
+ 
+         case BRCRJR_state = "BRCRJR_state"
++
++        // MARK: MessageRetentionCleanupJobRecord
++
++        case MRCJR_threadUniqueId = "MRCJR_threadUniqueId"
++        case MRCJR_cutoffTimestampMs = "MRCJR_cutoffTimestampMs"
+     }
+ }
+diff --git a/SignalServiceKit/Jobs/JobRecords/JobRecord.swift b/SignalServiceKit/Jobs/JobRecords/JobRecord.swift
+index af2f0d5..aaab953 100644
+--- a/SignalServiceKit/Jobs/JobRecords/JobRecord.swift
++++ b/SignalServiceKit/Jobs/JobRecords/JobRecord.swift
+@@ -26,6 +26,8 @@ extension JobRecord.JobRecordType {
+             return "CallRecordDeleteAll"
+         case .bulkDeleteInteractionJobRecord:
+             return "BulkDeleteInteraction"
++        case .messageRetentionCleanupJobRecord:
++            return "MessageRetentionCleanup"
+         }
+     }
+ }
+@@ -118,6 +120,7 @@ public class JobRecord: SDSCodableModel, InheritableRecord {
+         case sessionReset = 52
+         case callRecordDeleteAll = 100
+         case bulkDeleteInteractionJobRecord = 101
++        case messageRetentionCleanupJobRecord = 102
+     }
+ 
+     static func concreteType(forRecordType recordType: UInt) -> (any InheritableRecord.Type)? {
+@@ -133,6 +136,7 @@ public class JobRecord: SDSCodableModel, InheritableRecord {
+         case .sessionReset: return SessionResetJobRecord.self
+         case .callRecordDeleteAll: return CallRecordDeleteAllJobRecord.self
+         case .bulkDeleteInteractionJobRecord: return BulkDeleteInteractionJobRecord.self
++        case .messageRetentionCleanupJobRecord: return MessageRetentionCleanupJobRecord.self
+         }
+     }
+ }
+diff --git a/SignalServiceKit/Jobs/JobRecords/MessageRetentionCleanupJobRecord.swift b/SignalServiceKit/Jobs/JobRecords/MessageRetentionCleanupJobRecord.swift
+new file mode 100644
+index 0000000..be45941
+--- /dev/null
++++ b/SignalServiceKit/Jobs/JobRecords/MessageRetentionCleanupJobRecord.swift
+@@ -0,0 +1,52 @@
++//
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++//
++
++/// Deletes interactions in a single thread that were received before a fixed
++/// cutoff, as part of enforcing a user-configured message retention window.
++///
++/// The cutoff is captured once, when the job is created, so that a job which
++/// is interrupted (app termination, being backgrounded, network loss, etc.)
++/// and resumed later makes forward progress against a stable target rather
++/// than a constantly-moving "now minus retention period" value.
++final class MessageRetentionCleanupJobRecord: JobRecord {
++    override class var jobRecordType: JobRecord.JobRecordType { .messageRetentionCleanupJobRecord }
++
++    /// The unique ID of the thread within which to delete old interactions.
++    let threadUniqueId: String
++    /// Interactions received strictly before this timestamp (milliseconds
++    /// since epoch) should be deleted.
++    let cutoffTimestampMs: UInt64
++
++    init(
++        threadUniqueId: String,
++        cutoffTimestampMs: UInt64,
++        failureCount: UInt = 0,
++        status: Status = .ready,
++    ) {
++        self.threadUniqueId = threadUniqueId
++        self.cutoffTimestampMs = cutoffTimestampMs
++
++        super.init(
++            failureCount: failureCount,
++            status: status,
++        )
++    }
++
++    required init(inheritableDecoder decoder: any Decoder) throws {
++        let container = try decoder.container(keyedBy: CodingKeys.self)
++
++        threadUniqueId = try container.decode(String.self, forKey: .MRCJR_threadUniqueId)
++        cutoffTimestampMs = try container.decode(UInt64.self, forKey: .MRCJR_cutoffTimestampMs)
++
++        try super.init(inheritableDecoder: decoder)
++    }
++
++    override func encode(to encoder: any Encoder) throws {
++        try super.encode(to: encoder)
++        var container = encoder.container(keyedBy: CodingKeys.self)
++        try container.encode(threadUniqueId, forKey: .MRCJR_threadUniqueId)
++        try container.encode(cutoffTimestampMs, forKey: .MRCJR_cutoffTimestampMs)
++    }
++}
+diff --git a/SignalServiceKit/Jobs/MessageRetentionCleanupJobQueue.swift b/SignalServiceKit/Jobs/MessageRetentionCleanupJobQueue.swift
+new file mode 100644
+index 0000000..1bda3fe
+--- /dev/null
++++ b/SignalServiceKit/Jobs/MessageRetentionCleanupJobQueue.swift
+@@ -0,0 +1,278 @@
++//
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++//
++
++import GRDB
++
++/// Enforces a user-configured message retention window by deleting
++/// interactions older than a cutoff, one thread at a time.
++///
++/// Each thread's cleanup is tracked with its own durable ``JobRecord``, so:
++/// - Work is batched (via ``TimeGatedBatch``) and performed off the main
++///   thread, so large histories don't freeze or slow down the UI.
++/// - If the app is terminated, backgrounded, or loses network mid-cleanup,
++///   the persisted job record is picked back up the next time the job queue
++///   starts (see ``start(appContext:)``), and cleanup resumes by re-querying
++///   for interactions still older than the cutoff — no separate progress
++///   cursor is needed, so there's nothing that can be left in an
++///   inconsistent state.
++/// - Each batch deletes and updates the thread's cached "last interaction"
++///   state within a single transaction, so a conversation's preview and
++///   unread count are correct as soon as that transaction commits, without
++///   waiting for the whole job (or an app relaunch).
++public final class MessageRetentionCleanupJobQueue {
++    private let jobRunnerFactory: MessageRetentionCleanupJobRunnerFactory
++    private let jobQueueRunner: JobQueueRunner<
++        JobRecordFinderImpl<MessageRetentionCleanupJobRecord>,
++        MessageRetentionCleanupJobRunnerFactory,
++    >
++    private let db: any DB
++    private var jobSerializer = CompletionSerializer()
++
++    init(
++        db: any DB,
++        interactionDeleteManager: InteractionDeleteManager,
++        threadStore: ThreadStore,
++    ) {
++        self.db = db
++        self.jobRunnerFactory = MessageRetentionCleanupJobRunnerFactory(
++            db: db,
++            interactionDeleteManager: interactionDeleteManager,
++            threadStore: threadStore,
++        )
++        self.jobQueueRunner = JobQueueRunner(
++            canExecuteJobsConcurrently: false,
++            db: db,
++            jobFinder: JobRecordFinderImpl(db: db),
++            jobRunnerFactory: self.jobRunnerFactory,
++        )
++    }
++
++    func start(appContext: AppContext) {
++        jobQueueRunner.start(shouldRestartExistingJobs: appContext.isMainApp)
++    }
++
++    /// Enqueues a cleanup job for the given thread unless one is already
++    /// pending. Safe to call redundantly (e.g., from a periodic sweep) since
++    /// an already-pending job will, once it runs, delete everything older
++    /// than its (earlier, and therefore more conservative) cutoff.
++    func addJob(
++        threadUniqueId: String,
++        cutoffTimestampMs: UInt64,
++        tx: DBWriteTransaction,
++    ) {
++        guard !hasPendingJob(threadUniqueId: threadUniqueId, tx: tx) else {
++            return
++        }
++
++        let jobRecord = MessageRetentionCleanupJobRecord(
++            threadUniqueId: threadUniqueId,
++            cutoffTimestampMs: cutoffTimestampMs,
++        )
++
++        jobRecord.anyInsert(transaction: tx)
++
++        jobSerializer.addOrderedSyncCompletion(tx: tx) {
++            self.jobQueueRunner.addPersistedJob(jobRecord)
++        }
++    }
++
++    private func hasPendingJob(threadUniqueId: String, tx: DBReadTransaction) -> Bool {
++        // Only jobs that are still runnable (i.e., not permanently failed or
++        // obsolete) count as "pending"; a stalled job shouldn't block this
++        // thread from ever being swept again.
++        let sql = """
++        SELECT 1
++        FROM \(MessageRetentionCleanupJobRecord.databaseTableName)
++        WHERE \(MessageRetentionCleanupJobRecord.columnName(.label)) = ?
++        AND \(MessageRetentionCleanupJobRecord.columnName(.MRCJR_threadUniqueId)) = ?
++        AND \(MessageRetentionCleanupJobRecord.columnName(.status)) IN (?, ?)
++        LIMIT 1
++        """
++        return failIfThrows {
++            return try Bool.fetchOne(
++                tx.database,
++                sql: sql,
++                arguments: [
++                    MessageRetentionCleanupJobRecord.jobRecordType.jobRecordLabel,
++                    threadUniqueId,
++                    JobRecord.Status.ready.rawValue,
++                    JobRecord.Status.running.rawValue,
++                ],
++            ) ?? false
++        }
++    }
++}
++
++// MARK: -
++
++private class MessageRetentionCleanupJobRunner: JobRunner {
++    typealias JobRecordType = MessageRetentionCleanupJobRecord
++
++    private enum Constants {
++        static let maxRetries: UInt = 110
++        static let deletionBatchSize: Int = 500
++    }
++
++    private let db: any DB
++    private let interactionDeleteManager: InteractionDeleteManager
++    private let threadStore: ThreadStore
++
++    private let logger = PrefixedLogger(prefix: "[MessageRetention]")
++
++    init(
++        db: any DB,
++        interactionDeleteManager: InteractionDeleteManager,
++        threadStore: ThreadStore,
++    ) {
++        self.db = db
++        self.interactionDeleteManager = interactionDeleteManager
++        self.threadStore = threadStore
++    }
++
++    func runJobAttempt(
++        _ jobRecord: MessageRetentionCleanupJobRecord,
++    ) async -> JobAttemptResult<Void> {
++        return await JobAttemptResult.executeBlockWithDefaultErrorHandler(
++            jobRecord: jobRecord,
++            retryLimit: Constants.maxRetries,
++            db: db,
++            block: {
++                try await _runJobAttempt(jobRecord)
++            },
++        )
++    }
++
++    func didFinishJob(_ jobRecordId: JobRecord.RowId, result: JobResult<Void>) async {
++        switch result.ranSuccessfullyOrError {
++        case .success:
++            break
++        case .failure(let failure):
++            logger.error("Failed to perform message retention cleanup! \(failure)")
++        }
++    }
++
++    private func _runJobAttempt(
++        _ jobRecord: MessageRetentionCleanupJobRecord,
++    ) async throws {
++        let threadUniqueId = jobRecord.threadUniqueId
++        let cutoffTimestampMs = jobRecord.cutoffTimestampMs
++
++        logger.info("Attempting to clean up interactions older than retention cutoff in thread \(threadUniqueId).")
++
++        guard let anchorRowId = db.read(block: { (tx: DBReadTransaction) in
++            InteractionFinder(threadUniqueId: threadUniqueId).rowId(olderThan: cutoffTimestampMs, tx: tx)
++        }) else {
++            // Nothing in this thread is older than the cutoff (anymore).
++            await db.awaitableWrite { tx in jobRecord.anyRemove(transaction: tx) }
++            return
++        }
++
++        var deletedCount = 0
++        await TimeGatedBatch.processAll(db: db) { tx -> TimeGatedBatch.ProcessBatchResult in
++            let batchDeletedCount = self.deleteSomeInteractions(
++                threadUniqueId: threadUniqueId,
++                anchorMessageRowId: anchorRowId,
++                tx: tx,
++            )
++            deletedCount += batchDeletedCount
++            return batchDeletedCount == 0 ? .done(()) : .more
++        }
++
++        logger.info("Deleted \(deletedCount) messages older than retention cutoff in thread \(threadUniqueId).")
++
++        await db.awaitableWrite { tx in
++            jobRecord.anyRemove(transaction: tx)
++        }
++    }
++
++    /// Delete a batch of interactions.
++    /// - Returns
++    /// The number of interactions deleted. A return value of 0 indicates that
++    /// there are no more interactions to delete.
++    private func deleteSomeInteractions(
++        threadUniqueId: String,
++        anchorMessageRowId: Int64,
++        tx: DBWriteTransaction,
++    ) -> Int {
++        let interactionsToDelete: [TSInteraction]
++        do {
++            interactionsToDelete = try InteractionFinder(
++                threadUniqueId: threadUniqueId,
++            ).fetchAllInteractions(
++                rowIdFilter: .atOrBefore(anchorMessageRowId),
++                limit: Constants.deletionBatchSize,
++                tx: tx,
++            )
++        } catch {
++            owsFailDebug("Failed to get interactions to delete!")
++            return 0
++        }
++
++        if interactionsToDelete.isEmpty { return 0 }
++
++        for interaction in interactionsToDelete {
++            interactionDeleteManager.delete(
++                interaction,
++                sideEffects: .custom(
++                    associatedCallDelete: .localDeleteOnly,
++                    updateThreadOnInteractionDelete: .doNotUpdate,
++                ),
++                tx: tx,
++            )
++        }
++
++        /// Above, we're skipping a per-interaction thread update that would
++        /// otherwise set various "last visible" properties on the thread. To
++        /// compensate, we'll do a single thread update at the end of each
++        /// transaction (note that because we're in a `TimeGatedBatch`, we don't
++        /// know how many interactions will be deleted in a single transaction).
++        /// This ensures the conversation's preview and unread count are
++        /// correct as soon as this transaction commits.
++        tx.addFinalizationBlock(key: "MessageRetentionCleanupJobQueue") { tx in
++            if
++                let thread = self.threadStore.fetchThread(
++                    uniqueId: threadUniqueId,
++                    tx: tx,
++                )
++            {
++                thread.updateOnInteractionsRemoved(
++                    needsToUpdateLastInteractionRowId: true,
++                    needsToUpdateLastVisibleSortId: true,
++                    tx: tx,
++                )
++            }
++        }
++
++        return interactionsToDelete.count
++    }
++}
++
++// MARK: -
++
++private class MessageRetentionCleanupJobRunnerFactory: JobRunnerFactory {
++    typealias JobRunnerType = MessageRetentionCleanupJobRunner
++
++    private let db: any DB
++    private let interactionDeleteManager: InteractionDeleteManager
++    private let threadStore: ThreadStore
++
++    init(
++        db: any DB,
++        interactionDeleteManager: InteractionDeleteManager,
++        threadStore: ThreadStore,
++    ) {
++        self.db = db
++        self.interactionDeleteManager = interactionDeleteManager
++        self.threadStore = threadStore
++    }
++
++    func buildRunner() -> MessageRetentionCleanupJobRunner {
++        return MessageRetentionCleanupJobRunner(
++            db: db,
++            interactionDeleteManager: interactionDeleteManager,
++            threadStore: threadStore,
++        )
++    }
++}
+diff --git a/SignalServiceKit/Messages/MessageRetentionManager.swift b/SignalServiceKit/Messages/MessageRetentionManager.swift
+new file mode 100644
+index 0000000..b2ee7f4
+--- /dev/null
++++ b/SignalServiceKit/Messages/MessageRetentionManager.swift
+@@ -0,0 +1,100 @@
++//
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++//
++
++/// Manages the user-configurable "keep messages for N days" retention
++/// setting, and enforces it by enqueuing durable, batched cleanup jobs (see
++/// ``MessageRetentionCleanupJobQueue``) rather than deleting anything
++/// directly.
++///
++/// Changing the retention window (including turning it on for the first
++/// time) immediately sweeps *all* existing threads, so the new window is
++/// applied retroactively to existing history rather than only to messages
++/// going forward.
++public protocol MessageRetentionManager {
++    /// The number of days of message history to keep, or `nil` if messages
++    /// are kept indefinitely (the default).
++    func retentionPeriodDays(tx: DBReadTransaction) -> UInt32?
++
++    /// Updates the retention window and immediately enqueues cleanup of
++    /// every thread's history older than the new cutoff. Pass `nil` to keep
++    /// history indefinitely going forward; this does not undelete anything
++    /// that was already removed.
++    func setRetentionPeriodDays(_ retentionPeriodDays: UInt32?, tx: DBWriteTransaction)
++
++    /// Re-enqueues cleanup for every thread using the currently-configured
++    /// retention window. A no-op if no window is configured. Cheap to call
++    /// redundantly: threads with nothing older than the cutoff, or with an
++    /// already-pending cleanup job, are skipped.
++    ///
++    /// Intended to be invoked periodically (e.g., from a daily Cron job) so
++    /// that messages continue to be trimmed as they age, not just at the
++    /// moment the setting is changed.
++    func sweepAllThreads(tx: DBWriteTransaction)
++}
++
++public class MessageRetentionManagerImpl: MessageRetentionManager {
++    private enum Constants {
++        static let retentionPeriodDaysKey = "retentionPeriodDays"
++    }
++
++    private static let keyValueStore = KeyValueStore(collection: "MessageRetentionManager")
++
++    private let dateProvider: DateProvider
++    private let messageRetentionCleanupJobQueue: MessageRetentionCleanupJobQueue
++    private let threadStore: ThreadStore
++
++    init(
++        dateProvider: @escaping DateProvider,
++        messageRetentionCleanupJobQueue: MessageRetentionCleanupJobQueue,
++        threadStore: ThreadStore,
++    ) {
++        self.dateProvider = dateProvider
++        self.messageRetentionCleanupJobQueue = messageRetentionCleanupJobQueue
++        self.threadStore = threadStore
++    }
++
++    public func retentionPeriodDays(tx: DBReadTransaction) -> UInt32? {
++        Self.keyValueStore.getUInt32(Constants.retentionPeriodDaysKey, transaction: tx)
++    }
++
++    public func setRetentionPeriodDays(_ retentionPeriodDays: UInt32?, tx: DBWriteTransaction) {
++        if let retentionPeriodDays {
++            Self.keyValueStore.setUInt32(retentionPeriodDays, key: Constants.retentionPeriodDaysKey, transaction: tx)
++        } else {
++            Self.keyValueStore.removeValue(forKey: Constants.retentionPeriodDaysKey, transaction: tx)
++        }
++
++        sweepAllThreads(tx: tx)
++    }
++
++    public func sweepAllThreads(tx: DBWriteTransaction) {
++        guard let cutoffTimestampMs = self.cutoffTimestampMs(tx: tx) else {
++            return
++        }
++
++        do {
++            try threadStore.enumerateNonStoryThreads(tx: tx) { thread in
++                self.messageRetentionCleanupJobQueue.addJob(
++                    threadUniqueId: thread.uniqueId,
++                    cutoffTimestampMs: cutoffTimestampMs,
++                    tx: tx,
++                )
++                return true
++            }
++        } catch {
++            owsFailDebug("Unexpected error enumerating threads for retention cleanup: \(error)")
++        }
++    }
++
++    private func cutoffTimestampMs(tx: DBReadTransaction) -> UInt64? {
++        guard let retentionPeriodDays = retentionPeriodDays(tx: tx) else {
++            return nil
++        }
++
++        let nowMs = dateProvider().ows_millisecondsSince1970
++        let retentionPeriodMs = UInt64(retentionPeriodDays) * .dayInMs
++        return retentionPeriodMs < nowMs ? nowMs - retentionPeriodMs : 0
++    }
++}
+diff --git a/SignalServiceKit/Storage/Database/GRDBSchemaMigrator.swift b/SignalServiceKit/Storage/Database/GRDBSchemaMigrator.swift
+index 2785f85..e9d3e10 100644
+--- a/SignalServiceKit/Storage/Database/GRDBSchemaMigrator.swift
++++ b/SignalServiceKit/Storage/Database/GRDBSchemaMigrator.swift
+@@ -352,6 +352,7 @@ public class GRDBSchemaMigrator {
+         case addGroup
+         case removeInteractionAttachmentIdsIndex
+         case rebuildInteractionTimestampIndex
++        case addMessageRetentionCleanupJobRecord
+ 
+         // NOTE: Every time we add a migration id, consider
+         // incrementing grdbSchemaVersionLatest.
+@@ -5495,6 +5496,15 @@ public class GRDBSchemaMigrator {
+             return .success(())
+         }
+ 
++        migrator.registerMigration(.addMessageRetentionCleanupJobRecord) { tx in
++            try tx.database.alter(table: "model_SSKJobRecord") { table in
++                table.add(column: "MRCJR_threadUniqueId", .text)
++                table.add(column: "MRCJR_cutoffTimestampMs", .integer)
++            }
++
++            return .success(())
++        }
++
+         // MARK: - Schema Migration Insertion Point
+     }
+ 
+diff --git a/SignalServiceKit/Storage/Database/Records/InteractionFinder.swift b/SignalServiceKit/Storage/Database/Records/InteractionFinder.swift
+index 10ddd2a..7136b6e 100644
+--- a/SignalServiceKit/Storage/Database/Records/InteractionFinder.swift
++++ b/SignalServiceKit/Storage/Database/Records/InteractionFinder.swift
+@@ -1347,6 +1347,31 @@ public class InteractionFinder: NSObject {
+ 
+         return mostRecentRowId
+     }
++
++    /// The SQLite row ID of the most-recently inserted interaction covered by
++    /// this finder whose `receivedAtTimestamp` is strictly before
++    /// `cutoffTimestampMs`, or `nil` if there is no such interaction.
++    ///
++    /// Used to compute a stable anchor for batch-deleting interactions older
++    /// than a given cutoff (e.g., for message retention cleanup).
++    func rowId(olderThan cutoffTimestampMs: UInt64, tx: DBReadTransaction) -> Int64? {
++        let sql = """
++        SELECT \(interactionColumn: .id)
++        FROM \(InteractionRecord.databaseTableName)
++        INDEXED BY index_interactions_on_threadUniqueId_and_id
++        WHERE \(interactionColumn: .threadUniqueId) = ?
++        AND \(interactionColumn: .receivedAtTimestamp) < ?
++        ORDER BY \(interactionColumn: .id) DESC
++        LIMIT 1
++        """
++        return failIfThrows {
++            try Int64.fetchOne(
++                tx.database,
++                sql: sql,
++                arguments: [threadUniqueId, cutoffTimestampMs],
++            )
++        }
++    }
+ }
+ 
+ private extension TSInteractionCursor {

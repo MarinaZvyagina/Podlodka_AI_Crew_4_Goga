@@ -1,0 +1,645 @@
+diff --git a/docs/arch/maintenance-mode.md b/docs/arch/maintenance-mode.md
+new file mode 100644
+index 0000000..638554b
+--- /dev/null
++++ b/docs/arch/maintenance-mode.md
+@@ -0,0 +1,197 @@
++# Architecture Plan: maintenance-mode
++
++Plan file: `docs/arch/maintenance-mode.md`
++
++> **Correction applied during materialization (goga-apply):** the new cell was
++> originally planned at `packages/common/maintenance`. `MaintenanceModeGuard` needs
++> `Reflector`, which lives in `packages/core/services` (`@nestjs/core`). Since
++> `@nestjs/common` has no dependency on `@nestjs/core` (verified via
++> `packages/common/package.json` — no such dependency — versus `@nestjs/core`'s
++> `package.json`, which lists `@nestjs/common` as a `peerDependency`), placing the
++> cell in `common` would create a reverse package dependency. The cell was moved to
++> `packages/core/maintenance` instead; all Imports/content below are otherwise
++> unchanged (`packages/core` can freely depend on `packages/common/exceptions`, the
++> same way `packages/core/router` already does). This is reflected in the actual
++> `packages/core/maintenance/CODEMANIFEST` and `packages/common/exceptions/CODEMANIFEST`
++> on disk, which are the authoritative artifacts; a couple of backtick-reference
++> lint fixes applied directly to those files (removing unresolvable `` `CanActivate` ``
++> and `` `Maintenance()` `` backtick links, per `goga lint`) are not re-transcribed
++> below for brevity.
++
++## Topic
++maintenance-mode — a runtime-toggleable gate that rejects marked route/WS-message
++handlers before their logic runs, using the framework's existing guard extension
++point so one mechanism covers both HTTP and WebSocket transports.
++
++## Implementation Order
++
++1. **`packages/common/exceptions`** (modify, additive only) — no dependencies of its
++   own; document the already-implemented-but-undocumented `ServiceUnavailableException`
++   type. Goes first because `packages/core/maintenance` imports from it.
++2. **`packages/core/maintenance`** (create new) — depends on
++   `packages/common/exceptions` (`ServiceUnavailableException`). Goes second.
++
++No other cells are touched. `packages/core/guards` is depended upon conceptually
++(the new `MaintenanceModeGuard` satisfies its documented `CanActivate` extension
++point) but is not modified, consistent with that cell already treating all
++consumer-defined guards as out of its own enumeration scope.
++
++## Artifacts
++
++### Cell: `packages/common/exceptions` (MODIFIED)
++
++Diff: insert one new type entry between the existing `NotFoundException` and
++`InternalServerErrorException` entries. No header changes, no other body changes,
++no footer changes.
++
++```yaml
++"HttpException::ServiceUnavailableException(objectOrError: any, descriptionOrOptions: string | Object<string, any>)":
++  location: service-unavailable.exception.ts
++  annotations: |
++    503 Service Unavailable, constructed identically to `BadRequestException`. Thrown by
++    application-defined guards (for example, maintenance-mode gating) to signal the
++    service is temporarily unable to handle the request.
++```
++
++`.usages/` files: none (unchanged).
++
++### Cell: `packages/core/maintenance` (NEW)
++
++Full CODEMANIFEST:
++
++```yaml
++Imports:
++  - Types:
++      - ServiceUnavailableException
++    From: packages/common/exceptions
++
++Annotations: |
++  Implements a runtime-toggleable maintenance-mode gate for individual handlers.
++  `Maintenance()` marks a method or class; `MaintenanceModeService` holds the in-process
++  on/off flag; `MaintenanceModeGuard` is a standard CanActivate guard (see
++  packages/core/guards) that an application registers globally so it runs — and can
++  reject — before any marked handler's logic executes, on both the HTTP and WebSocket
++  pipelines, since both already route through the same guard-resolution mechanism. This
++  cell introduces no new dispatch machinery; it is a consumer of the existing guard
++  extension point.
++
++---
++
++"MaintenanceModeService()":
++  location: maintenance-mode.service.ts
++  annotations: |
++    Holds the process-local maintenance-mode flag, defaulting to off. No persistence,
++    no cross-instance sync — flipped directly by application code (e.g. an admin
++    endpoint) via dependency injection.
++
++    Requirements: a single application-wide instance must be shared between whatever
++    toggles the flag and the MaintenanceModeGuard instance(s) checking it (i.e. provide
++    it once, inject it wherever needed — standard Nest singleton provider scope).
++  properties:
++    "enabled -> boolean": |
++      Whether maintenance mode is currently on. Defaults to false.
++  methods:
++    "enable()": |
++      Turn maintenance mode on. Takes effect immediately for the next call to any
++      marked handler.
++    "disable()": |
++      Turn maintenance mode off. Marked handlers resume normal behavior immediately.
++    "isEnabled() -> enabled: boolean": |
++      Return the current on/off state.
++
++"Maintenance() -> decorator: MethodDecorator | ClassDecorator":
++  location: maintenance.decorator.ts
++  annotations: |
++    Marks a handler method, or every handler in a controller/gateway class, as affected
++    by maintenance mode. Applied the same way at either level as `@UseGuards`:
++    method-level decoration marks one handler; class-level decoration marks every
++    handler in that class.
++
++    Algorithm: writes boolean metadata onto the decorated method or class, under a key
++    private to this cell.
++
++"MaintenanceModeGuard(maintenanceModeService: MaintenanceModeService, reflector: any)":
++  location: maintenance-mode.guard.ts
++  annotations: |
++    CanActivate implementation an application registers as a global guard (or
++    per-controller, via @UseGuards) to enforce maintenance-mode gating.
++
++    `maintenanceModeService`: the shared flag holder this guard consults on every
++    activation
++    `reflector`: standard framework Reflector, used to read the metadata Maintenance()
++    wrote, checking the handler method before falling back to its class (method-level
++    marking takes precedence, matching @UseGuards' own precedence convention)
++
++    Constraints: must resolve metadata via a handler-then-class lookup so a
++    class-level @Maintenance() marks every method in that class, and there is no
++    opt-out decorator for a single method within a marked class — marking is
++    "this handler" or "this whole controller/gateway", matching the requirement.
++  methods:
++    "canActivate(context: any) -> allowed: boolean": |
++      Returns true (allowed) unless both (a) maintenanceModeService.isEnabled() is
++      true and (b) the target (method, else class) carries Maintenance()'s metadata —
++      in which case it throws ServiceUnavailableException instead of returning false,
++      so the caller gets a clear, specific error rather than a generic guard-denial
++      ForbiddenException.
++
++      Algorithm:
++      1. If maintenance mode is off, return true immediately — zero overhead on the
++         unaffected path.
++      2. Read metadata off the handler, falling back to its class if the handler
++         itself carries none.
++      3. If unmarked, return true.
++      4. If marked, throw ServiceUnavailableException.
++
++      Requirements: must be synchronous and side-effect-free beyond reading service
++      state and metadata — this is what makes it constructible and callable directly
++      in a unit test with a hand-built context object, no server/socket required.
++
++---
++
++Author: Goga
++CreatedAt: 15/09/26
++Description: |
++  Documents the maintenance-mode gating mechanism: a decorator to mark handlers or
++  whole controllers/gateways (`Maintenance`), a runtime-toggleable flag holder
++  (`MaintenanceModeService`), and a `CanActivate` guard (`MaintenanceModeGuard`) that
++  rejects marked handlers with a clear `ServiceUnavailableException` while the flag is
++  on. Built entirely on top of the framework's existing, transport-agnostic guard
++  extension point (packages/core/guards), so the same mechanism protects both HTTP
++  route handlers and WebSocket message handlers without separate machinery.
++```
++
++`.usages/` files: none — no external library and no non-obvious multi-step consumer
++pattern beyond what the annotations above already state.
++
++## Dependency Map
++
++```
++packages/common/exceptions  (leaf, unchanged dependency set; +1 documented type)
++        ^
++        | imports ServiceUnavailableException
++        |
++packages/core/maintenance  (new leaf-adjacent cell)
++
++packages/core/guards  (unchanged; MaintenanceModeGuard satisfies its CanActivate
++                        extension point as a consumer, not a formal Import edge —
++                        same treatment as every other consumer-defined guard)
++```
++
++## Verification Checklist
++
++- `packages/common/exceptions/CODEMANIFEST`: new `ServiceUnavailableException` entry
++  present, `location:` matches the real existing file
++  (`service-unavailable.exception.ts`), constructor shape matches its siblings.
++- `packages/core/maintenance/CODEMANIFEST`: `Imports` resolves to a real type in
++  `packages/common/exceptions`; all three types have a `location:` matching the file
++  to be implemented; DSL syntax valid (`goga lint`).
++- Implementation (next stage, outside this plan): `MaintenanceModeService`,
++  `Maintenance`, `MaintenanceModeGuard` match the documented signatures exactly;
++  `index.ts` facade exports all three; guard's `canActivate` is synchronous and
++  throws the documented exception only when both conditions hold.
++- `goga contract` passes for `packages/core/maintenance` once implemented (contract
++  matches implementation).
++- Unit tests exist proving: (a) marked handler blocked while mode is on, (b) unmarked
++  handler unaffected while mode is on, (c) marked handler works again once mode is
++  off, (d) both method-level and class-level marking are honored — all without a real
++  server or socket.
+diff --git a/packages/common/exceptions/CODEMANIFEST b/packages/common/exceptions/CODEMANIFEST
+index e21f259..e904386 100644
+--- a/packages/common/exceptions/CODEMANIFEST
++++ b/packages/common/exceptions/CODEMANIFEST
+@@ -67,6 +67,13 @@ Annotations: |
+     404 Not Found, constructed identically to `BadRequestException`. Thrown by the
+     router when no route matches the incoming request.
+ 
++"HttpException::ServiceUnavailableException(objectOrError: any, descriptionOrOptions: string | Object<string, any>)":
++  location: service-unavailable.exception.ts
++  annotations: |
++    503 Service Unavailable, constructed identically to `BadRequestException`. Thrown by
++    application-defined guards (for example, maintenance-mode gating) to signal the
++    service is temporarily unable to handle the request.
++
+ "HttpException::InternalServerErrorException(objectOrError: any, descriptionOrOptions: string | Object<string, any>)":
+   location: internal-server-error.exception.ts
+   annotations: |
+diff --git a/packages/core/index.ts b/packages/core/index.ts
+index 64791fa..5170391 100644
+--- a/packages/core/index.ts
++++ b/packages/core/index.ts
+@@ -19,6 +19,7 @@ export * from './exceptions/index.js';
+ export * from './helpers/index.js';
+ export * from './injector/index.js';
+ export * from './inspector/index.js';
++export * from './maintenance/index.js';
+ export * from './metadata-scanner.js';
+ export * from './middleware/index.js';
+ export * from './nest-application.js';
+diff --git a/packages/core/maintenance/CODEMANIFEST b/packages/core/maintenance/CODEMANIFEST
+new file mode 100644
+index 0000000..9cccd00
+--- /dev/null
++++ b/packages/core/maintenance/CODEMANIFEST
+@@ -0,0 +1,98 @@
++Imports:
++  - Types:
++      - ServiceUnavailableException
++    From: packages/common/exceptions
++
++Annotations: |
++  Implements a runtime-toggleable maintenance-mode gate for individual handlers.
++  `Maintenance` marks a method or class; `MaintenanceModeService` holds the in-process
++  on/off flag; `MaintenanceModeGuard` is a standard CanActivate guard (see
++  packages/core/guards) that an application registers globally so it runs — and can
++  reject — before any marked handler's logic executes, on both the HTTP and WebSocket
++  pipelines, since both already route through the same guard-resolution mechanism. This
++  cell introduces no new dispatch machinery; it is a consumer of the existing guard
++  extension point.
++
++---
++
++"MaintenanceModeService()":
++  location: maintenance-mode.service.ts
++  annotations: |
++    Holds the process-local maintenance-mode flag, defaulting to off. No persistence,
++    no cross-instance sync — flipped directly by application code (e.g. an admin
++    endpoint) via dependency injection.
++
++    Requirements: a single application-wide instance must be shared between whatever
++    toggles the flag and the MaintenanceModeGuard instance(s) checking it (i.e. provide
++    it once, inject it wherever needed — standard Nest singleton provider scope).
++  properties:
++    "enabled -> boolean": |
++      Whether maintenance mode is currently on. Defaults to false.
++  methods:
++    "enable()": |
++      Turn maintenance mode on. Takes effect immediately for the next call to any
++      marked handler.
++    "disable()": |
++      Turn maintenance mode off. Marked handlers resume normal behavior immediately.
++    "isEnabled() -> enabled: boolean": |
++      Return the current on/off state.
++
++"Maintenance() -> decorator: MethodDecorator & ClassDecorator":
++  location: maintenance.decorator.ts
++  annotations: |
++    Marks a handler method, or every handler in a controller/gateway class, as affected
++    by maintenance mode. Applied the same way at either level as @UseGuards:
++    method-level decoration marks one handler; class-level decoration marks every
++    handler in that class.
++
++    Algorithm: writes boolean metadata onto the decorated method or class, under a key
++    private to this cell.
++
++"MaintenanceModeGuard(maintenanceModeService: MaintenanceModeService, reflector: any)":
++  location: maintenance-mode.guard.ts
++  annotations: |
++    CanActivate implementation an application registers as a global guard (or
++    per-controller, via @UseGuards) to enforce maintenance-mode gating.
++
++    `maintenanceModeService`: the shared flag holder this guard consults on every
++    activation
++    `reflector`: standard framework Reflector, used to read the metadata Maintenance()
++    wrote, checking the handler method before falling back to its class (method-level
++    marking takes precedence, matching @UseGuards' own precedence convention)
++
++    Constraints: must resolve metadata via a handler-then-class lookup so a
++    class-level @Maintenance() marks every method in that class, and there is no
++    opt-out decorator for a single method within a marked class — marking is
++    "this handler" or "this whole controller/gateway", matching the requirement.
++  methods:
++    "canActivate(context: any) -> allowed: boolean": |
++      Returns true (allowed) unless both (a) maintenanceModeService.isEnabled() is
++      true and (b) the target (method, else class) carries Maintenance's metadata —
++      in which case it throws `ServiceUnavailableException` instead of returning false,
++      so the caller gets a clear, specific error rather than a generic guard-denial
++      ForbiddenException.
++
++      Algorithm:
++      1. If maintenance mode is off, return true immediately — zero overhead on the
++         unaffected path.
++      2. Read metadata off the handler, falling back to its class if the handler
++         itself carries none.
++      3. If unmarked, return true.
++      4. If marked, throw `ServiceUnavailableException`.
++
++      Requirements: must be synchronous and side-effect-free beyond reading service
++      state and metadata — this is what makes it constructible and callable directly
++      in a unit test with a hand-built context object, no server/socket required.
++
++---
++
++Author: Goga
++CreatedAt: 15/09/26
++Description: |
++  Documents the maintenance-mode gating mechanism: a decorator to mark handlers or
++  whole controllers/gateways (`Maintenance`), a runtime-toggleable flag holder
++  (`MaintenanceModeService`), and a `CanActivate` guard (`MaintenanceModeGuard`) that
++  rejects marked handlers with a clear `ServiceUnavailableException` while the flag is
++  on. Built entirely on top of the framework's existing, transport-agnostic guard
++  extension point (packages/core/guards), so the same mechanism protects both HTTP
++  route handlers and WebSocket message handlers without separate machinery.
+diff --git a/packages/core/maintenance/index.ts b/packages/core/maintenance/index.ts
+new file mode 100644
+index 0000000..bbc22aa
+--- /dev/null
++++ b/packages/core/maintenance/index.ts
+@@ -0,0 +1,3 @@
++export * from './maintenance-mode.service.js';
++export * from './maintenance.decorator.js';
++export * from './maintenance-mode.guard.js';
+diff --git a/packages/core/maintenance/maintenance-metadata.constants.ts b/packages/core/maintenance/maintenance-metadata.constants.ts
+new file mode 100644
+index 0000000..67af57a
+--- /dev/null
++++ b/packages/core/maintenance/maintenance-metadata.constants.ts
+@@ -0,0 +1 @@
++export const MAINTENANCE_METADATA = '__maintenance__';
+diff --git a/packages/core/maintenance/maintenance-mode.guard.ts b/packages/core/maintenance/maintenance-mode.guard.ts
+new file mode 100644
+index 0000000..be83503
+--- /dev/null
++++ b/packages/core/maintenance/maintenance-mode.guard.ts
+@@ -0,0 +1,45 @@
++import type { CanActivate, ExecutionContext } from '@nestjs/common';
++import { Injectable, ServiceUnavailableException } from '@nestjs/common';
++import { Reflector } from '../services/reflector.service.js';
++import { MAINTENANCE_METADATA } from './maintenance-metadata.constants.js';
++import { MaintenanceModeService } from './maintenance-mode.service.js';
++
++/**
++ * `CanActivate` implementation that rejects calls to handlers marked with
++ * `@Maintenance()` while `MaintenanceModeService` reports maintenance mode as
++ * on, before the handler's own logic runs. Unmarked handlers, and marked
++ * handlers while maintenance mode is off, are unaffected.
++ *
++ * Register it as a global guard (e.g. via the `APP_GUARD` provider token, or
++ * `app.useGlobalGuards(...)`) so it gates every request through the same
++ * guard-resolution pipeline the framework already runs for both HTTP routes
++ * and WebSocket `@SubscribeMessage()` handlers.
++ *
++ * @publicApi
++ */
++@Injectable()
++export class MaintenanceModeGuard implements CanActivate {
++  constructor(
++    private readonly maintenanceModeService: MaintenanceModeService,
++    private readonly reflector: Reflector,
++  ) {}
++
++  canActivate(context: ExecutionContext): boolean {
++    if (!this.maintenanceModeService.isEnabled()) {
++      return true;
++    }
++
++    const isMarked = this.reflector.getAllAndOverride<boolean>(
++      MAINTENANCE_METADATA,
++      [context.getHandler(), context.getClass()],
++    );
++
++    if (isMarked) {
++      throw new ServiceUnavailableException(
++        'Service is currently in maintenance mode',
++      );
++    }
++
++    return true;
++  }
++}
+diff --git a/packages/core/maintenance/maintenance-mode.service.ts b/packages/core/maintenance/maintenance-mode.service.ts
+new file mode 100644
+index 0000000..10b579c
+--- /dev/null
++++ b/packages/core/maintenance/maintenance-mode.service.ts
+@@ -0,0 +1,36 @@
++import { Injectable } from '@nestjs/common';
++
++/**
++ * Holds the process-local maintenance-mode flag. Toggling it is an in-process
++ * runtime action (inject this service and call `enable()`/`disable()`), not a
++ * redeploy or config change.
++ *
++ * @publicApi
++ */
++@Injectable()
++export class MaintenanceModeService {
++  private enabled = false;
++
++  /**
++   * Turn maintenance mode on. Takes effect immediately for the next call to
++   * any handler marked with `@Maintenance()`.
++   */
++  enable(): void {
++    this.enabled = true;
++  }
++
++  /**
++   * Turn maintenance mode off. Marked handlers resume normal behavior
++   * immediately.
++   */
++  disable(): void {
++    this.enabled = false;
++  }
++
++  /**
++   * Return the current on/off state.
++   */
++  isEnabled(): boolean {
++    return this.enabled;
++  }
++}
+diff --git a/packages/core/maintenance/maintenance.decorator.ts b/packages/core/maintenance/maintenance.decorator.ts
+new file mode 100644
+index 0000000..246c641
+--- /dev/null
++++ b/packages/core/maintenance/maintenance.decorator.ts
+@@ -0,0 +1,19 @@
++import { SetMetadata } from '@nestjs/common';
++import { MAINTENANCE_METADATA } from './maintenance-metadata.constants.js';
++
++/**
++ * Marks a handler method, or every handler in a controller/gateway class, as
++ * affected by maintenance mode.
++ *
++ * When `@Maintenance()` is used at the method level, only that handler is
++ * gated by `MaintenanceModeGuard`. When used at the class level, every
++ * handler in that controller/gateway is gated — the same method/class scoping
++ * convention as `@UseGuards()`.
++ *
++ * @see [Maintenance mode](https://docs.nestjs.com/guards)
++ *
++ * @publicApi
++ */
++export function Maintenance(): MethodDecorator & ClassDecorator {
++  return SetMetadata(MAINTENANCE_METADATA, true);
++}
+diff --git a/packages/core/test/maintenance/maintenance-mode.guard.spec.ts b/packages/core/test/maintenance/maintenance-mode.guard.spec.ts
+new file mode 100644
+index 0000000..c0a5f8f
+--- /dev/null
++++ b/packages/core/test/maintenance/maintenance-mode.guard.spec.ts
+@@ -0,0 +1,90 @@
++import type { ExecutionContext } from '@nestjs/common';
++import { Reflector } from '../../services/reflector.service.js';
++import { Maintenance } from '../../maintenance/maintenance.decorator.js';
++import { MaintenanceModeGuard } from '../../maintenance/maintenance-mode.guard.js';
++import { MaintenanceModeService } from '../../maintenance/maintenance-mode.service.js';
++
++class AffectedController {
++  @Maintenance()
++  affectedHandler() {}
++
++  unaffectedHandler() {}
++}
++
++@Maintenance()
++class FullyAffectedGateway {
++  affectedMessageHandler() {}
++}
++
++function contextFor(
++  instance: object,
++  handler: (...args: unknown[]) => unknown,
++): ExecutionContext {
++  return {
++    getHandler: () => handler,
++    getClass: () => instance.constructor,
++  } as unknown as ExecutionContext;
++}
++
++describe('MaintenanceModeGuard', () => {
++  let maintenanceModeService: MaintenanceModeService;
++  let guard: MaintenanceModeGuard;
++  let controller: AffectedController;
++  let gateway: FullyAffectedGateway;
++
++  beforeEach(() => {
++    maintenanceModeService = new MaintenanceModeService();
++    guard = new MaintenanceModeGuard(maintenanceModeService, new Reflector());
++    controller = new AffectedController();
++    gateway = new FullyAffectedGateway();
++  });
++
++  describe('when maintenance mode is off', () => {
++    it('should allow a marked handler', () => {
++      const context = contextFor(controller, controller.affectedHandler);
++      expect(guard.canActivate(context)).toBe(true);
++    });
++
++    it('should allow an unmarked handler', () => {
++      const context = contextFor(controller, controller.unaffectedHandler);
++      expect(guard.canActivate(context)).toBe(true);
++    });
++  });
++
++  describe('when maintenance mode is on', () => {
++    beforeEach(() => {
++      maintenanceModeService.enable();
++    });
++
++    it('should reject a method-level marked handler', () => {
++      const context = contextFor(controller, controller.affectedHandler);
++      expect(() => guard.canActivate(context)).toThrow(
++        'Service is currently in maintenance mode',
++      );
++    });
++
++    it('should allow an unmarked handler on an unmarked controller', () => {
++      const context = contextFor(controller, controller.unaffectedHandler);
++      expect(guard.canActivate(context)).toBe(true);
++    });
++
++    it('should reject every handler on a class-level marked gateway', () => {
++      const context = contextFor(gateway, gateway.affectedMessageHandler);
++      expect(() => guard.canActivate(context)).toThrow(
++        'Service is currently in maintenance mode',
++      );
++    });
++  });
++
++  describe('when maintenance mode is switched back off', () => {
++    it('should allow a previously-blocked handler again', () => {
++      const context = contextFor(controller, controller.affectedHandler);
++
++      maintenanceModeService.enable();
++      expect(() => guard.canActivate(context)).toThrow();
++
++      maintenanceModeService.disable();
++      expect(guard.canActivate(context)).toBe(true);
++    });
++  });
++});
+diff --git a/packages/core/test/maintenance/maintenance-mode.service.spec.ts b/packages/core/test/maintenance/maintenance-mode.service.spec.ts
+new file mode 100644
+index 0000000..7e71866
+--- /dev/null
++++ b/packages/core/test/maintenance/maintenance-mode.service.spec.ts
+@@ -0,0 +1,34 @@
++import { MaintenanceModeService } from '../../maintenance/maintenance-mode.service.js';
++
++describe('MaintenanceModeService', () => {
++  let service: MaintenanceModeService;
++
++  beforeEach(() => {
++    service = new MaintenanceModeService();
++  });
++
++  it('should default to disabled', () => {
++    expect(service.isEnabled()).toBe(false);
++  });
++
++  it('should report enabled after enable()', () => {
++    service.enable();
++    expect(service.isEnabled()).toBe(true);
++  });
++
++  it('should report disabled after disable()', () => {
++    service.enable();
++    service.disable();
++    expect(service.isEnabled()).toBe(false);
++  });
++
++  it('should be idempotent', () => {
++    service.enable();
++    service.enable();
++    expect(service.isEnabled()).toBe(true);
++
++    service.disable();
++    service.disable();
++    expect(service.isEnabled()).toBe(false);
++  });
++});
+diff --git a/packages/core/test/maintenance/maintenance.decorator.spec.ts b/packages/core/test/maintenance/maintenance.decorator.spec.ts
+new file mode 100644
+index 0000000..4e2ad1a
+--- /dev/null
++++ b/packages/core/test/maintenance/maintenance.decorator.spec.ts
+@@ -0,0 +1,32 @@
++import { Maintenance } from '../../maintenance/maintenance.decorator.js';
++import { MAINTENANCE_METADATA } from '../../maintenance/maintenance-metadata.constants.js';
++
++describe('@Maintenance', () => {
++  it('should mark a method with maintenance metadata', () => {
++    class TestController {
++      @Maintenance()
++      affectedHandler() {}
++
++      unaffectedHandler() {}
++    }
++
++    const instance = new TestController();
++    expect(
++      Reflect.getMetadata(MAINTENANCE_METADATA, instance.affectedHandler),
++    ).toBe(true);
++    expect(
++      Reflect.getMetadata(MAINTENANCE_METADATA, instance.unaffectedHandler),
++    ).toBeUndefined();
++  });
++
++  it('should mark a class with maintenance metadata', () => {
++    @Maintenance()
++    class TestController {
++      someHandler() {}
++    }
++
++    expect(Reflect.getMetadata(MAINTENANCE_METADATA, TestController)).toBe(
++      true,
++    );
++  });
++});

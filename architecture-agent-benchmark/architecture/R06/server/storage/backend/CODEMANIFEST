@@ -1,0 +1,115 @@
+Usages:
+  transaction_lifecycle: |
+    Two lock modes gate every BatchTx transaction: LockInsideApply (acquired while executing a
+    raft-committed request) and LockOutsideApply (acquired by background jobs such as
+    compaction or defrag). Never mix the two across the same critical section — each is
+    validated at runtime against the call stack it was invoked from. Commit() flushes the
+    batched writes into a single underlying bbolt transaction and begins a fresh writable one;
+    Unlock() auto-commits once the pending write count reaches the backend's configured batch
+    limit, so most callers never call Commit() directly.
+
+Annotations: |
+  This cell wraps a single embedded bbolt (BoltDB) file into etcd's own transactional,
+  byte-oriented key/value primitive: named buckets, batched writes, and a buffered read path
+  that makes uncommitted writes immediately visible to subsequent reads. It has no awareness of
+  MVCC, revisions, watch, or etcd's data model — it exposes only bucket/key/value operations
+  plus lock discipline tied to etcd's raft-apply pipeline. It is a leaf: nothing documented in
+  this architecture forest is a dependency of this cell, and every other storage-adjacent cell
+  imports from here.
+
+  Use `transaction_lifecycle` to decide which lock method a new caller should acquire.
+
+---
+
+"Backend()":
+  location: backend.go
+  annotations: |
+    The top-level storage handle: one bbolt file's lifecycle (open, defrag, snapshot, close)
+    plus a background commit loop that coalesces many logical writes into one periodic bbolt
+    commit.
+  methods:
+    "ReadTx() -> tx:ReadTx": |
+      Return the shared, lock-guarded read transaction, backed by the latest committed data
+      plus any buffered-but-uncommitted writes.
+    "ConcurrentReadTx() -> tx:ReadTx": |
+      Return a non-blocking read transaction over a snapshotted copy of the write buffer.
+      Prefer this over `ReadTx` on hot read paths that will not themselves become a writer
+      during their lifetime.
+    "BatchTx() -> tx:BatchTx": |
+      Return the single writable transaction handle for this backend.
+    "Snapshot() -> snapshot:Snapshot": |
+      Commit pending writes and return a consistent, point-in-time byte stream of the entire
+      store, used for full-state transfer to a lagging or newly-joined peer.
+    "Hash(ignore BucketKeyPredicate) -> hash:uint32, err:error": |
+      Compute a CRC32C digest over every bucket/key/value pair not excluded by `ignore`, used
+      for cross-member corruption detection.
+    "Defrag() -> err:error": |
+      Compact the on-disk bbolt file by rewriting all live data into a fresh file and swapping
+      it into place.
+    "ForceCommit()": |
+      Commit the current batch transaction immediately rather than waiting for the configured
+      batch interval or batch-size limit to elapse.
+
+"BatchTx()":
+  location: batch_tx.go
+  annotations: |
+    The single writable transaction against the backing bbolt file for this `Backend`. Writes
+    made through this transaction are buffered so they are immediately visible to subsequent
+    reads before the underlying bbolt transaction actually commits.
+
+    Use `transaction_lifecycle` to choose between the inside-apply and outside-apply lock
+    methods below.
+  methods:
+    "LockInsideApply()": |
+      Acquire the write lock from within the raft-apply pipeline (i.e. while executing one
+      raft-committed request).
+    "LockOutsideApply()": |
+      Acquire the write lock from a background job outside raft apply (e.g. compaction,
+      defrag).
+    "Unlock()": |
+      Release the write lock; auto-commits once the pending write count reaches the backend's
+      configured batch limit.
+    "Commit()": |
+      Flush pending writes into a new bbolt transaction and begin a fresh writable one.
+    "UnsafeCreateBucket(bucket Bucket)": |
+      Create a named bucket. Caller must already hold the write lock.
+    "UnsafePut(bucket Bucket, key []byte, value []byte)": |
+      Write one key/value pair into `bucket`. Caller must already hold the write lock.
+    "UnsafeDelete(bucket Bucket, key []byte)": |
+      Remove one key from `bucket`. Caller must already hold the write lock.
+    "UnsafeRange(bucket Bucket, key []byte, endKey []byte, limit int64) -> keys:[][]byte, vals:[][]byte": |
+      Scan the half-open range from `key` up to (excluding) `endKey` in `bucket`, merging
+      buffered and already-committed data, bounded by `limit` (0 means unbounded).
+
+"ReadTx()":
+  location: read_tx.go
+  annotations: |
+    A read-only view merging the in-memory write buffer with the last committed bbolt
+    transaction.
+  methods:
+    "RLock()": |
+      Acquire a read lock.
+    "RUnlock()": |
+      Release a read lock.
+    "UnsafeRange(bucket Bucket, key []byte, endKey []byte, limit int64) -> keys:[][]byte, vals:[][]byte": |
+      Scan the half-open range from `key` up to (excluding) `endKey` in `bucket`, merging
+      buffered and committed data. Caller must already hold a read lock.
+
+"Hooks()":
+  location: hooks.go
+  annotations: |
+    Extension point letting a layer above this cell inject one additional write into the same
+    bbolt commit, atomically with everything else already staged in that transaction.
+  methods:
+    "OnPreCommitUnsafe(tx BatchTx)": |
+      Called immediately before a batch transaction commits. Implementations perform
+      additional unsafe put/delete calls against `tx` (e.g. persisting a consistency index
+      alongside the data it describes).
+
+---
+
+Author: Goga
+CreatedAt: 26/08/26
+Description: |
+  The bbolt-backed transactional storage primitive underneath etcd's MVCC layer, lease store,
+  and auth store. Leaf cell — nothing documented in this forest is a dependency of this cell.

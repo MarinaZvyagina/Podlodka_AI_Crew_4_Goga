@@ -1,0 +1,327 @@
+diff --git a/docs/includes/protections.md b/docs/includes/protections.md
+index 70e309e..f0d1de2 100644
+--- a/docs/includes/protections.md
++++ b/docs/includes/protections.md
+@@ -16,6 +16,7 @@ All protection end times are rounded up to the next candle to avoid sudden, unex
+ * [`StoplossGuard`](#stoploss-guard) Stop trading if a certain amount of stoploss occurred within a certain time window.
+ * [`MaxDrawdown`](#maxdrawdown) Stop trading if max-drawdown is reached.
+ * [`LowProfitPairs`](#low-profit-pairs) Lock pairs with low profits
++* [`MaxConsecutiveLosses`](#max-consecutive-losses) Stop trading after a losing streak.
+ * [`CooldownPeriod`](#cooldown-period) Don't enter a trade right after selling a trade.
+ 
+ ### Common settings to all Protections
+@@ -122,6 +123,36 @@ def protections(self):
+     ]
+ ```
+ 
++#### Max Consecutive Losses
++
++`MaxConsecutiveLosses` counts the unbroken streak of losing trades closed within `lookback_period` in minutes (or in candles when using `lookback_period_candles`), most-recent-trade first, stopping at the first trade that isn't a loss.
++If that streak reaches `trade_limit` or more, trading will stop for `stop_duration` in minutes (or in candles when using `stop_duration_candles`, or until the set time when using `unlock_at`).
++
++A trade counts as a loss when its close profit is below `required_profit` (defaults to `0.0`).
++
++This is evaluated both per-pair (locking only the affected pair) and bot-wide across all pairs (locking every pair), unless `only_per_pair` is set to true, which disables the bot-wide check and only locks the individual pair.
++
++For futures bots, setting `only_per_side` will make the bot only consider one side, and will then only lock this one side, allowing for example shorts to continue after a series of long losses.
++
++Unlike `StoplossGuard`, any losing trade counts towards the streak - not just trades that exited via stoploss - and a single winning (or breakeven) trade resets the streak.
++
++The below example stops trading for a pair (and, since `only_per_pair` is not set, for the whole bot) for 12 candles after 3 losing trades in a row within the last 24 candles.
++
++``` python
++@property
++def protections(self):
++    return [
++        {
++            "method": "MaxConsecutiveLosses",
++            "lookback_period_candles": 24,
++            "trade_limit": 3,
++            "stop_duration_candles": 12,
++            "only_per_pair": False,
++            "only_per_side": False
++        }
++    ]
++```
++
+ #### Cooldown Period
+ 
+ `CooldownPeriod` locks a pair for `stop_duration` in minutes (or in candles when using `stop_duration_candles`, or until the set time when using `unlock_at`) after exiting, avoiding a re-entry for this pair for `stop_duration` minutes.
+diff --git a/freqtrade/plugins/protections/max_consecutive_losses.py b/freqtrade/plugins/protections/max_consecutive_losses.py
+new file mode 100644
+index 0000000..4fa0e4e
+--- /dev/null
++++ b/freqtrade/plugins/protections/max_consecutive_losses.py
+@@ -0,0 +1,113 @@
++import logging
++from datetime import datetime, timedelta
++from typing import Any
++
++from freqtrade.constants import Config, LongShort
++from freqtrade.persistence import LocalTrade, Trade
++from freqtrade.plugins.protections import IProtection, ProtectionReturn
++
++
++logger = logging.getLogger(__name__)
++
++
++class MaxConsecutiveLosses(IProtection):
++    has_global_stop: bool = True
++    has_local_stop: bool = True
++
++    def __init__(self, config: Config, protection_config: dict[str, Any]) -> None:
++        super().__init__(config, protection_config)
++
++        self._trade_limit = protection_config.get("trade_limit", 3)
++        self._disable_global_stop = protection_config.get("only_per_pair", False)
++        self._only_per_side = protection_config.get("only_per_side", False)
++        self._required_profit = protection_config.get("required_profit", 0.0)
++
++    def short_desc(self) -> str:
++        """
++        Short method description - used for startup-messages
++        """
++        return (
++            f"{self.name} - {self._trade_limit} consecutive losses within "
++            f"{self.lookback_period_str}."
++        )
++
++    def _reason(self) -> str:
++        """
++        LockReason to use
++        """
++        return (
++            f"{self._trade_limit} consecutive losses in {self._lookback_period} min, "
++            f"locking {self.unlock_reason_time_element}."
++        )
++
++    def _find_losing_streak(
++        self, date_now: datetime, pair: str | None, side: LongShort
++    ) -> list[LocalTrade]:
++        """
++        Determine the current unbroken losing streak, most-recent-trade-first,
++        for trades closed within the lookback window.
++        """
++        look_back_until = date_now - timedelta(minutes=self._lookback_period)
++        trades = Trade.get_trades_proxy(pair=pair, is_open=False, close_date=look_back_until)
++
++        if self._only_per_side:
++            trades = [trade for trade in trades if trade.trade_direction == side]
++
++        trades.sort(key=lambda trade: trade.close_date, reverse=True)
++
++        streak = []
++        for trade in trades:
++            if trade.close_profit is not None and trade.close_profit < self._required_profit:
++                streak.append(trade)
++            else:
++                break
++        return streak
++
++    def _consecutive_losses(
++        self, date_now: datetime, pair: str | None, side: LongShort
++    ) -> ProtectionReturn | None:
++        """
++        Evaluate whether recent trades form an unbroken losing streak
++        """
++        streak = self._find_losing_streak(date_now, pair, side)
++
++        if len(streak) < self._trade_limit:
++            return None
++
++        locked_scope = pair or "all pairs"
++        self.log_once(
++            f"Trading stopped for {locked_scope} due to {self._trade_limit} "
++            f"consecutive losses within {self._lookback_period} minutes.",
++            logger.info,
++        )
++        until = self.calculate_lock_end(streak)
++        return ProtectionReturn(
++            lock=True,
++            until=until,
++            reason=self._reason(),
++            lock_side=(side if self._only_per_side else "*"),
++        )
++
++    def global_stop(
++        self, date_now: datetime, side: LongShort, starting_balance: float
++    ) -> ProtectionReturn | None:
++        """
++        Stops trading (position entering) for all pairs
++        This must evaluate to true for the whole period of the "cooldown period".
++        :return: Tuple of [bool, until, reason].
++            If true, all pairs will be locked with <reason> until <until>
++        """
++        if self._disable_global_stop:
++            return None
++        return self._consecutive_losses(date_now, None, side)
++
++    def stop_per_pair(
++        self, pair: str, date_now: datetime, side: LongShort, starting_balance: float
++    ) -> ProtectionReturn | None:
++        """
++        Stops trading (position entering) for this pair
++        This must evaluate to true for the whole period of the "cooldown period".
++        :return: Tuple of [bool, until, reason].
++            If true, this pair will be locked with <reason> until <until>
++        """
++        return self._consecutive_losses(date_now, pair, side)
+diff --git a/tests/plugins/test_protections.py b/tests/plugins/test_protections.py
+index 8773454..6ebc31c 100644
+--- a/tests/plugins/test_protections.py
++++ b/tests/plugins/test_protections.py
+@@ -12,7 +12,13 @@ from freqtrade.plugins.protectionmanager import ProtectionManager
+ from tests.conftest import get_patched_freqtradebot, log_has_re
+ 
+ 
+-AVAILABLE_PROTECTIONS = ["CooldownPeriod", "LowProfitPairs", "MaxDrawdown", "StoplossGuard"]
++AVAILABLE_PROTECTIONS = [
++    "CooldownPeriod",
++    "LowProfitPairs",
++    "MaxConsecutiveLosses",
++    "MaxDrawdown",
++    "StoplossGuard",
++]
+ 
+ 
+ def generate_mock_trade(
+@@ -438,6 +444,139 @@ def test_stoploss_guard_perpair(mocker, default_conf, fee, caplog, only_per_pair
+         assert not PairLocks.is_global_lock(side="*")
+ 
+ 
++@pytest.mark.usefixtures("init_persistence")
++def test_max_consecutive_losses_global(mocker, default_conf, fee, caplog):
++    default_conf["_strategy_protections"] = [
++        {
++            "method": "MaxConsecutiveLosses",
++            "lookback_period": 1000,
++            "trade_limit": 3,
++            "stop_duration": 40,
++        }
++    ]
++    freqtrade = get_patched_freqtradebot(mocker, default_conf)
++    message = r"Trading stopped for .*due to 3 consecutive losses.*"
++    assert not freqtrade.protections.global_stop()
++    assert not log_has_re(message, caplog)
++    caplog.clear()
++
++    # 2 losses in a row (different pairs) - not enough yet.
++    for pair, min_ago_close in (("XRP/BTC", 50), ("BCH/BTC", 40)):
++        generate_mock_trade(
++            pair,
++            fee.return_value,
++            False,
++            exit_reason=ExitType.STOP_LOSS.value,
++            min_ago_open=min_ago_close + 10,
++            min_ago_close=min_ago_close,
++            profit_rate=0.9,
++        )
++    assert not freqtrade.protections.global_stop()
++
++    # A win breaks the streak.
++    generate_mock_trade(
++        "LTC/BTC",
++        fee.return_value,
++        False,
++        exit_reason=ExitType.ROI.value,
++        min_ago_open=40,
++        min_ago_close=30,
++        profit_rate=1.1,
++    )
++    assert not freqtrade.protections.global_stop()
++    assert not log_has_re(message, caplog)
++
++    # 2 more losses - streak since the win is only 2, still not enough.
++    for pair, min_ago_close in (("XRP/BTC", 20), ("BCH/BTC", 10)):
++        generate_mock_trade(
++            pair,
++            fee.return_value,
++            False,
++            exit_reason=ExitType.STOP_LOSS.value,
++            min_ago_open=min_ago_close + 10,
++            min_ago_close=min_ago_close,
++            profit_rate=0.9,
++        )
++    assert not freqtrade.protections.global_stop()
++
++    # 3rd consecutive loss since the win - triggers the global lock.
++    generate_mock_trade(
++        "ETH/BTC",
++        fee.return_value,
++        False,
++        exit_reason=ExitType.STOP_LOSS.value,
++        min_ago_open=12,
++        min_ago_close=2,
++        profit_rate=0.9,
++    )
++
++    assert freqtrade.protections.global_stop()
++    assert log_has_re(message, caplog)
++    assert PairLocks.is_global_lock()
++
++
++@pytest.mark.parametrize("only_per_pair", [False, True])
++@pytest.mark.usefixtures("init_persistence")
++def test_max_consecutive_losses_perpair(mocker, default_conf, fee, caplog, only_per_pair):
++    default_conf["_strategy_protections"] = [
++        {
++            "method": "MaxConsecutiveLosses",
++            "lookback_period": 1000,
++            "trade_limit": 2,
++            "stop_duration": 60,
++            "only_per_pair": only_per_pair,
++        }
++    ]
++    freqtrade = get_patched_freqtradebot(mocker, default_conf)
++    message = r"Trading stopped for .*due to 2 consecutive losses.*"
++    pair = "XRP/BTC"
++    assert not freqtrade.protections.stop_per_pair(pair)
++    assert not freqtrade.protections.global_stop()
++    assert not log_has_re(message, caplog)
++    caplog.clear()
++
++    # Unrelated pair should not affect XRP/BTC's per-pair streak
++    generate_mock_trade(
++        "ETH/BTC",
++        fee.return_value,
++        False,
++        exit_reason=ExitType.STOP_LOSS.value,
++        min_ago_open=80,
++        min_ago_close=60,
++        profit_rate=0.9,
++    )
++
++    generate_mock_trade(
++        pair,
++        fee.return_value,
++        False,
++        exit_reason=ExitType.STOP_LOSS.value,
++        min_ago_open=70,
++        min_ago_close=50,
++        profit_rate=0.9,
++    )
++    assert not freqtrade.protections.stop_per_pair(pair)
++    assert not PairLocks.is_pair_locked(pair)
++
++    generate_mock_trade(
++        pair,
++        fee.return_value,
++        False,
++        exit_reason=ExitType.STOP_LOSS.value,
++        min_ago_open=40,
++        min_ago_close=20,
++        profit_rate=0.9,
++    )
++
++    assert freqtrade.protections.stop_per_pair(pair)
++    assert log_has_re(message, caplog)
++    assert PairLocks.is_pair_locked(pair)
++    # The bot-wide streak (ETH/BTC loss + 2 XRP/BTC losses) is 3 consecutive losses overall,
++    # so the global lock should also trigger unless disabled via only_per_pair.
++    assert freqtrade.protections.global_stop() != only_per_pair
++    assert PairLocks.is_global_lock() != only_per_pair
++
++
+ @pytest.mark.usefixtures("init_persistence")
+ def test_CooldownPeriod(mocker, default_conf, fee, caplog):
+     default_conf["_strategy_protections"] = [

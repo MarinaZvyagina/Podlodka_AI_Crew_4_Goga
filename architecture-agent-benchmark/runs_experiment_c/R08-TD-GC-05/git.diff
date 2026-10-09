@@ -1,0 +1,238 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModel.kt b/app/src/main/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModel.kt
+index bafbb3f..f35edaf 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModel.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModel.kt
+@@ -39,6 +39,7 @@ import org.signal.paging.PagingConfig
+ import org.signal.paging.PagingController
+ import org.signal.paging.StateFlowPagedData
+ import org.thoughtcrime.securesms.conversationlist.chatfilter.ConversationFilterRequest
++import org.thoughtcrime.securesms.database.RxDatabaseObserver
+ import org.thoughtcrime.securesms.database.model.DistributionListPrivacyMode
+ import org.thoughtcrime.securesms.groups.SelectionLimits
+ import org.thoughtcrime.securesms.recipients.Recipient
+@@ -118,6 +119,10 @@ class ContactSearchViewModel(
+         internalConfigurationState.update { it.copy(query = query) }
+       }
+     }
++
++    // Conversations/messages may have changed underneath a previously-cached search term, so drop
++    // the whole cache rather than risk serving stale results for it.
++    disposables += RxDatabaseObserver.conversationList.subscribe { searchRepository.clearCache() }
+   }
+ 
+   /** The paging controller for the current data source. Null until [setConfiguration] is called. */
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+index f47eddb..e5448aa 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+@@ -13,6 +13,7 @@ import androidx.annotation.VisibleForTesting;
+ import androidx.annotation.WorkerThread;
+ 
+ import org.signal.core.util.CursorUtil;
++import org.signal.core.util.LRUCache;
+ import org.signal.core.util.concurrent.SignalExecutors;
+ import org.signal.core.util.logging.Log;
+ import org.thoughtcrime.securesms.conversation.MessageStyler;
+@@ -62,6 +63,9 @@ public class SearchRepository {
+ 
+   private static final int MAX_SNIPPET_SIZE = 100;
+ 
++  /** Bounds how many distinct chat-list search queries (per section) are kept warm at once. */
++  private static final int RESULT_CACHE_SIZE = 25;
++
+   private final Context           context;
+   private final String            noteToSelfTitle;
+   private final SearchTable       searchDatabase;
+@@ -72,6 +76,16 @@ public class SearchRepository {
+ 
+   private final Executor serialExecutor;
+ 
++  /**
++   * Caches results for {@link #queryThreadsSync} and {@link #queryMessagesSync}, keyed on the
++   * exact query text plus whatever filter was applied, so retyping an identical chat-list search
++   * skips the underlying database scan. Cleared wholesale via {@link #clearCache()} whenever the
++   * underlying data could have changed, since these results are cheap to recompute but expensive
++   * to selectively invalidate.
++   */
++  private final Map<List<Object>, ThreadSearchResult>  threadSearchCache  = Collections.synchronizedMap(new LRUCache<>(RESULT_CACHE_SIZE));
++  private final Map<List<Object>, MessageSearchResult> messageSearchCache = Collections.synchronizedMap(new LRUCache<>(RESULT_CACHE_SIZE));
++
+   public SearchRepository(@NonNull String noteToSelfTitle) {
+     this.context           = AppDependencies.getApplication().getApplicationContext();
+     this.noteToSelfTitle   = noteToSelfTitle;
+@@ -85,6 +99,12 @@ public class SearchRepository {
+ 
+   @WorkerThread
+   public @NonNull ThreadSearchResult queryThreadsSync(@NonNull String query, boolean unreadOnly) {
++    List<Object> cacheKey = Arrays.asList(query, unreadOnly);
++    ThreadSearchResult cached = threadSearchCache.get(cacheKey);
++    if (cached != null) {
++      return cached;
++    }
++
+     SignalTrace.beginSection("ConversationListSearch-Threads");
+     try {
+       long                      start  = System.currentTimeMillis();
+@@ -92,7 +112,9 @@ public class SearchRepository {
+ 
+       Log.d(TAG, "[threads] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new ThreadSearchResult(result, query);
++      ThreadSearchResult searchResult = new ThreadSearchResult(result, query);
++      threadSearchCache.put(cacheKey, searchResult);
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -100,6 +122,12 @@ public class SearchRepository {
+ 
+   @WorkerThread
+   public @NonNull MessageSearchResult queryMessagesSync(@NonNull String query, @NonNull SearchFilter filter) {
++    List<Object> cacheKey = Arrays.asList(query, filter);
++    MessageSearchResult cached = messageSearchCache.get(cacheKey);
++    if (cached != null) {
++      return cached;
++    }
++
+     SignalTrace.beginSection("ConversationListSearch-Messages");
+     try {
+       long start = System.currentTimeMillis();
+@@ -111,12 +139,24 @@ public class SearchRepository {
+ 
+       Log.d(TAG, "[messages] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new MessageSearchResult(combined, query);
++      MessageSearchResult searchResult = new MessageSearchResult(combined, query);
++      messageSearchCache.put(cacheKey, searchResult);
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+   }
+ 
++  /**
++   * Discards all cached {@link #queryThreadsSync} / {@link #queryMessagesSync} results. Callers
++   * should invoke this whenever conversations or messages may have changed, so a subsequent
++   * search for a previously-cached term reflects the current data instead of a stale snapshot.
++   */
++  public void clearCache() {
++    threadSearchCache.clear();
++    messageSearchCache.clear();
++  }
++
+   public void query(@NonNull String query, long threadId, @NonNull Callback<List<MessageResult>> callback) {
+     if (TextUtils.isEmpty(query)) {
+       callback.onResult(Collections.emptyList());
+diff --git a/app/src/test/java/org/thoughtcrime/securesms/search/SearchRepositoryCacheTest.kt b/app/src/test/java/org/thoughtcrime/securesms/search/SearchRepositoryCacheTest.kt
+new file mode 100644
+index 0000000..ebb339d
+--- /dev/null
++++ b/app/src/test/java/org/thoughtcrime/securesms/search/SearchRepositoryCacheTest.kt
+@@ -0,0 +1,107 @@
++/*
++ * Copyright 2026 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.search
++
++import android.app.Application
++import io.mockk.every
++import io.mockk.mockk
++import io.mockk.mockkObject
++import io.mockk.unmockkAll
++import io.mockk.verify
++import org.junit.After
++import org.junit.Before
++import org.junit.Rule
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import org.thoughtcrime.securesms.database.GroupTable
++import org.thoughtcrime.securesms.database.MentionTable
++import org.thoughtcrime.securesms.database.MessageTable
++import org.thoughtcrime.securesms.database.RecipientTable
++import org.thoughtcrime.securesms.database.SearchTable
++import org.thoughtcrime.securesms.database.SignalDatabase
++import org.thoughtcrime.securesms.database.ThreadTable
++import org.thoughtcrime.securesms.testutil.MockAppDependenciesRule
++
++/**
++ * Verifies [SearchRepository] serves repeated identical chat-list searches from cache, keeps
++ * distinct queries independent, and drops everything on [SearchRepository.clearCache].
++ */
++@RunWith(RobolectricTestRunner::class)
++@Config(manifest = Config.NONE, application = Application::class)
++class SearchRepositoryCacheTest {
++
++  @get:Rule
++  val appDependencies = MockAppDependenciesRule()
++
++  private lateinit var threadTable: ThreadTable
++  private lateinit var searchRepository: SearchRepository
++
++  @Before
++  fun setUp() {
++    threadTable = mockk(relaxed = true)
++    val recipientTable = mockk<RecipientTable>(relaxed = true)
++    val groupTable = mockk<GroupTable>(relaxed = true)
++
++    mockkObject(SignalDatabase)
++    every { SignalDatabase.threads } returns threadTable
++    every { SignalDatabase.recipients } returns recipientTable
++    every { SignalDatabase.groups } returns groupTable
++    every { SignalDatabase.messages } returns mockk<MessageTable>(relaxed = true)
++    every { SignalDatabase.mentions } returns mockk<MentionTable>(relaxed = true)
++    every { SignalDatabase.messageSearch } returns mockk<SearchTable>(relaxed = true)
++
++    every { recipientTable.queryAllContacts(any(), any()) } returns null
++    every { groupTable.queryGroupsByTitle(any(), any(), any(), any()) } returns GroupTable.Reader(null)
++    every { threadTable.getFilteredConversationList(any(), any()) } returns null
++
++    searchRepository = SearchRepository("Note to Self")
++  }
++
++  @After
++  fun cleanup() {
++    unmockkAll()
++  }
++
++  // queryThreadsSync hits getFilteredConversationList twice per uncached call (once for matching
++  // contacts, once for matching groups), so counts below come in multiples of 2.
++
++  @Test
++  fun `repeated identical search is served from cache`() {
++    searchRepository.queryThreadsSync("hello", false)
++    searchRepository.queryThreadsSync("hello", false)
++
++    verify(exactly = 2) { threadTable.getFilteredConversationList(any(), any()) }
++  }
++
++  @Test
++  fun `different queries are cached independently`() {
++    searchRepository.queryThreadsSync("hello", false)
++    searchRepository.queryThreadsSync("world", false)
++    searchRepository.queryThreadsSync("hello", false)
++    searchRepository.queryThreadsSync("world", false)
++
++    verify(exactly = 4) { threadTable.getFilteredConversationList(any(), any()) }
++  }
++
++  @Test
++  fun `same text with a different filter is cached independently`() {
++    searchRepository.queryThreadsSync("hello", false)
++    searchRepository.queryThreadsSync("hello", true)
++
++    verify(exactly = 4) { threadTable.getFilteredConversationList(any(), any()) }
++  }
++
++  @Test
++  fun `clearCache forces the next identical search to hit the database again`() {
++    searchRepository.queryThreadsSync("hello", false)
++    searchRepository.clearCache()
++    searchRepository.queryThreadsSync("hello", false)
++
++    verify(exactly = 4) { threadTable.getFilteredConversationList(any(), any()) }
++  }
++}

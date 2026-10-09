@@ -1,0 +1,752 @@
+diff --git a/server/etcdserver/apply/interface.go b/server/etcdserver/apply/interface.go
+index 00ba221ed..973850a24 100644
+--- a/server/etcdserver/apply/interface.go
++++ b/server/etcdserver/apply/interface.go
+@@ -28,6 +28,7 @@ import (
+ 	"go.etcd.io/etcd/server/v3/etcdserver/api/membership"
+ 	"go.etcd.io/etcd/server/v3/etcdserver/api/v3alarm"
+ 	"go.etcd.io/etcd/server/v3/etcdserver/cindex"
++	"go.etcd.io/etcd/server/v3/etcdserver/txn"
+ 	"go.etcd.io/etcd/server/v3/lease"
+ 	"go.etcd.io/etcd/server/v3/storage/backend"
+ 	"go.etcd.io/etcd/server/v3/storage/mvcc"
+@@ -98,6 +99,9 @@ type ApplierOptions struct {
+ 	Backend                      backend.Backend
+ 	QuotaBackendBytesCfg         int64
+ 	WarningApplyDuration         time.Duration
++	// RangeCache is invalidated as writes are applied, in step with the KV
++	// store; may be nil, in which case invalidation is skipped.
++	RangeCache *txn.RangeCache
+ }
+ 
+ type SnapshotServer interface {
+diff --git a/server/etcdserver/apply/rangecache.go b/server/etcdserver/apply/rangecache.go
+new file mode 100644
+index 000000000..2a679b048
+--- /dev/null
++++ b/server/etcdserver/apply/rangecache.go
+@@ -0,0 +1,91 @@
++// Copyright 2026 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package apply
++
++import (
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/pkg/v3/traceutil"
++	"go.etcd.io/etcd/server/v3/etcdserver/txn"
++)
++
++// rangeCacheInvalidatingApplierV3 evicts a shared RangeCache's entries for
++// whatever a write is about to touch, before executing it, so that once the
++// write becomes visible no cached response can still be describing the data
++// it just replaced.
++//
++// This wraps applierV3Backend directly (see newApplierV3) rather than living
++// in the v3rpc gRPC layer, because this Apply path is the one place every
++// member runs for every committed request regardless of which member the
++// client's original request landed on: a Put proposed through member A is
++// applied here on member B too when B replays the raft log, which a decorator
++// sitting only in front of member B's own gRPC KV service would never see.
++type rangeCacheInvalidatingApplierV3 struct {
++	applierV3
++	cache *txn.RangeCache
++}
++
++func newRangeCacheInvalidatingApplierV3(cache *txn.RangeCache, app applierV3) applierV3 {
++	return &rangeCacheInvalidatingApplierV3{app, cache}
++}
++
++func (a *rangeCacheInvalidatingApplierV3) Put(p *pb.PutRequest) (*pb.PutResponse, *traceutil.Trace, error) {
++	a.cache.Invalidate(p.Key, nil)
++	return a.applierV3.Put(p)
++}
++
++func (a *rangeCacheInvalidatingApplierV3) DeleteRange(dr *pb.DeleteRangeRequest) (*pb.DeleteRangeResponse, *traceutil.Trace, error) {
++	a.cache.Invalidate(dr.Key, dr.RangeEnd)
++	return a.applierV3.DeleteRange(dr)
++}
++
++func (a *rangeCacheInvalidatingApplierV3) Txn(rt *pb.TxnRequest, skipRangeExecution bool) (*pb.TxnResponse, *traceutil.Trace, error) {
++	// Which branch runs depends on comparisons evaluated during execution, so
++	// both branches are invalidated unconditionally before execution: whichever
++	// Put/DeleteRange ends up applied can then never be applied without first
++	// clearing whatever cached response it's about to invalidate.
++	invalidateTxnWrites(a.cache, rt.Success)
++	invalidateTxnWrites(a.cache, rt.Failure)
++	return a.applierV3.Txn(rt, skipRangeExecution)
++}
++
++func (a *rangeCacheInvalidatingApplierV3) LeaseRevoke(lc *pb.LeaseRevokeRequest) (*pb.LeaseRevokeResponse, error) {
++	// A revoked lease deletes every key attached to it, a set this layer
++	// doesn't have cheap access to; invalidate broadly rather than asking the
++	// lessor to enumerate them.
++	a.cache.Reset()
++	return a.applierV3.LeaseRevoke(lc)
++}
++
++// invalidateTxnWrites evicts RangeCache entries for every Put/DeleteRange in
++// reqs, recursing into nested Txns.
++func invalidateTxnWrites(cache *txn.RangeCache, reqs []*pb.RequestOp) {
++	for _, req := range reqs {
++		switch tv := req.Request.(type) {
++		case *pb.RequestOp_RequestPut:
++			if tv.RequestPut != nil {
++				cache.Invalidate(tv.RequestPut.Key, nil)
++			}
++		case *pb.RequestOp_RequestDeleteRange:
++			if tv.RequestDeleteRange != nil {
++				cache.Invalidate(tv.RequestDeleteRange.Key, tv.RequestDeleteRange.RangeEnd)
++			}
++		case *pb.RequestOp_RequestTxn:
++			if tv.RequestTxn != nil {
++				invalidateTxnWrites(cache, tv.RequestTxn.Success)
++				invalidateTxnWrites(cache, tv.RequestTxn.Failure)
++			}
++		}
++	}
++}
+diff --git a/server/etcdserver/apply/rangecache_test.go b/server/etcdserver/apply/rangecache_test.go
+new file mode 100644
+index 000000000..108f3e46a
+--- /dev/null
++++ b/server/etcdserver/apply/rangecache_test.go
+@@ -0,0 +1,179 @@
++// Copyright 2026 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package apply
++
++import (
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++	"go.uber.org/zap/zaptest"
++	"golang.org/x/crypto/bcrypt"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/server/v3/auth"
++	"go.etcd.io/etcd/server/v3/etcdserver/api/membership"
++	"go.etcd.io/etcd/server/v3/etcdserver/api/v3alarm"
++	"go.etcd.io/etcd/server/v3/etcdserver/cindex"
++	"go.etcd.io/etcd/server/v3/etcdserver/txn"
++	"go.etcd.io/etcd/server/v3/lease"
++	betesting "go.etcd.io/etcd/server/v3/storage/backend/testing"
++	"go.etcd.io/etcd/server/v3/storage/mvcc"
++	"go.etcd.io/etcd/server/v3/storage/schema"
++)
++
++func uberApplierWithRangeCache(t *testing.T) (UberApplier, *txn.RangeCache, mvcc.WatchableKV) {
++	lg := zaptest.NewLogger(t)
++	be, _ := betesting.NewDefaultTmpBackend(t)
++	t.Cleanup(func() {
++		betesting.Close(t, be)
++	})
++
++	cluster := membership.NewCluster(lg)
++	cluster.SetBackend(schema.NewMembershipBackend(lg, be))
++	cluster.AddMember(&membership.Member{ID: memberID}, true)
++	lessor := lease.NewLessor(lg, be, cluster, lease.LessorConfig{})
++	kv := mvcc.New(lg, be, lessor, mvcc.StoreConfig{})
++	alarmStore, err := v3alarm.NewAlarmStore(lg, schema.NewAlarmBackend(lg, be))
++	require.NoError(t, err)
++
++	tp, err := auth.NewTokenProvider(lg, "simple", dummyIndexWaiter, 300*time.Second)
++	require.NoError(t, err)
++	authStore := auth.NewAuthStore(lg, schema.NewAuthBackend(lg, be), tp, bcrypt.DefaultCost)
++	consistentIndex := cindex.NewConsistentIndex(be)
++	cache := txn.NewRangeCache(16)
++	opts := ApplierOptions{
++		Logger:                       lg,
++		KV:                           kv,
++		AlarmStore:                   alarmStore,
++		AuthStore:                    authStore,
++		Lessor:                       lessor,
++		Cluster:                      cluster,
++		RaftStatus:                   &fakeRaftStatusGetter{},
++		SnapshotServer:               &fakeSnapshotServer{},
++		ConsistentIndex:              consistentIndex,
++		TxnModeWriteWithSharedBuffer: false,
++		Backend:                      be,
++		QuotaBackendBytesCfg:         16 * 1024 * 1024, // 16MB
++		WarningApplyDuration:         time.Hour,
++		RangeCache:                   cache,
++	}
++	return NewUberApplier(opts), cache, kv
++}
++
++func rangeReq(key string) *pb.RangeRequest { return &pb.RangeRequest{Key: []byte(key)} }
++
++func rangeResp(rev int64) *pb.RangeResponse {
++	return &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: rev}}
++}
++
++// TestUberApplier_RangeCache_InvalidatesOnPut verifies that a Put applied
++// through the uber applier evicts any RangeCache entry for the key it wrote,
++// exercising the same decorator chain a raft-committed entry goes through on
++// every member (not just the one a client's write RPC happened to land on).
++func TestUberApplier_RangeCache_InvalidatesOnPut(t *testing.T) {
++	ua, cache, kv := uberApplierWithRangeCache(t)
++
++	req := rangeReq("foo")
++	cache.Put(kv, req, rangeResp(kv.Rev()))
++	_, ok := cache.Get(req)
++	require.True(t, ok, "expected the seeded entry to be cached")
++
++	result := ua.Apply(&InternalRaftRequestWrapper{InternalRaftRequest: &pb.InternalRaftRequest{
++		Put: &pb.PutRequest{Key: []byte("foo"), Value: []byte("bar")},
++	}}, membership.ApplyBoth)
++	require.NoError(t, result.Err)
++
++	_, ok = cache.Get(req)
++	require.False(t, ok, "expected the Put to evict the cached entry for the key it wrote")
++}
++
++// TestUberApplier_RangeCache_InvalidatesOnDeleteRange verifies DeleteRange
++// evicts overlapping RangeCache entries, including ones for a wider range
++// than the deleted keys.
++func TestUberApplier_RangeCache_InvalidatesOnDeleteRange(t *testing.T) {
++	ua, cache, kv := uberApplierWithRangeCache(t)
++
++	wideReq := &pb.RangeRequest{Key: []byte("a"), RangeEnd: []byte("z")}
++	cache.Put(kv, wideReq, rangeResp(kv.Rev()))
++	_, ok := cache.Get(wideReq)
++	require.True(t, ok)
++
++	result := ua.Apply(&InternalRaftRequestWrapper{InternalRaftRequest: &pb.InternalRaftRequest{
++		DeleteRange: &pb.DeleteRangeRequest{Key: []byte("foo")},
++	}}, membership.ApplyBoth)
++	require.NoError(t, result.Err)
++
++	_, ok = cache.Get(wideReq)
++	require.False(t, ok, "expected the DeleteRange to evict the overlapping cached range")
++}
++
++// TestUberApplier_RangeCache_InvalidatesOnTxn verifies a Txn evicts RangeCache
++// entries for keys in whichever branch actually runs.
++func TestUberApplier_RangeCache_InvalidatesOnTxn(t *testing.T) {
++	ua, cache, kv := uberApplierWithRangeCache(t)
++
++	successReq := rangeReq("success-key")
++	failureReq := rangeReq("failure-key")
++	cache.Put(kv, successReq, rangeResp(kv.Rev()))
++	cache.Put(kv, failureReq, rangeResp(kv.Rev()))
++
++	// Compare fails (the key doesn't exist yet), so the Failure branch runs.
++	result := ua.Apply(&InternalRaftRequestWrapper{InternalRaftRequest: &pb.InternalRaftRequest{
++		Txn: &pb.TxnRequest{
++			Compare: []*pb.Compare{{
++				Key:         []byte("missing"),
++				Target:      pb.Compare_VERSION,
++				Result:      pb.Compare_EQUAL,
++				TargetUnion: &pb.Compare_Version{Version: 1},
++			}},
++			Success: []*pb.RequestOp{{Request: &pb.RequestOp_RequestPut{RequestPut: &pb.PutRequest{
++				Key: []byte("success-key"), Value: []byte("v"),
++			}}}},
++			Failure: []*pb.RequestOp{{Request: &pb.RequestOp_RequestPut{RequestPut: &pb.PutRequest{
++				Key: []byte("failure-key"), Value: []byte("v"),
++			}}}},
++		},
++	}}, membership.ApplyBoth)
++	require.NoError(t, result.Err)
++
++	_, ok := cache.Get(failureReq)
++	require.False(t, ok, "expected the taken Failure branch's write to evict its cached entry")
++}
++
++// TestUberApplier_RangeCache_LeaseRevokeClearsCache verifies a lease
++// revocation clears the whole cache, since the keys it deletes aren't known
++// to this layer.
++func TestUberApplier_RangeCache_LeaseRevokeClearsCache(t *testing.T) {
++	ua, cache, kv := uberApplierWithRangeCache(t)
++
++	unrelated := rangeReq("unrelated-key")
++	cache.Put(kv, unrelated, rangeResp(kv.Rev()))
++
++	grantResult := ua.Apply(&InternalRaftRequestWrapper{InternalRaftRequest: &pb.InternalRaftRequest{
++		LeaseGrant: &pb.LeaseGrantRequest{ID: 7, TTL: 100},
++	}}, membership.ApplyBoth)
++	require.NoError(t, grantResult.Err)
++	_, ok := grantResult.Resp.(*pb.LeaseGrantResponse)
++	require.True(t, ok)
++
++	result := ua.Apply(&InternalRaftRequestWrapper{InternalRaftRequest: &pb.InternalRaftRequest{
++		LeaseRevoke: &pb.LeaseRevokeRequest{ID: 7},
++	}}, membership.ApplyBoth)
++	require.NoError(t, result.Err)
++
++	_, ok = cache.Get(unrelated)
++	require.False(t, ok, "expected a lease revocation to clear the whole cache")
++}
+diff --git a/server/etcdserver/apply/uber_applier.go b/server/etcdserver/apply/uber_applier.go
+index edb3bd0fe..de15be842 100644
+--- a/server/etcdserver/apply/uber_applier.go
++++ b/server/etcdserver/apply/uber_applier.go
+@@ -60,9 +60,13 @@ func NewUberApplier(opts ApplierOptions) UberApplier {
+ 
+ func newApplierV3(opts ApplierOptions) applierV3 {
+ 	applierBackend := newApplierV3Backend(opts)
++	base := applierV3(applierBackend)
++	if opts.RangeCache != nil {
++		base = newRangeCacheInvalidatingApplierV3(opts.RangeCache, applierBackend)
++	}
+ 	return newAuthApplierV3(
+ 		opts.AuthStore,
+-		newQuotaApplierV3(opts.Logger, opts.QuotaBackendBytesCfg, opts.Backend, applierBackend),
++		newQuotaApplierV3(opts.Logger, opts.QuotaBackendBytesCfg, opts.Backend, base),
+ 		opts.Lessor,
+ 	)
+ }
+diff --git a/server/etcdserver/server.go b/server/etcdserver/server.go
+index ac782a8a4..2dbee134f 100644
+--- a/server/etcdserver/server.go
++++ b/server/etcdserver/server.go
+@@ -62,6 +62,7 @@ import (
+ 	"go.etcd.io/etcd/server/v3/etcdserver/cindex"
+ 	"go.etcd.io/etcd/server/v3/etcdserver/errors"
+ 	"go.etcd.io/etcd/server/v3/etcdserver/read"
++	"go.etcd.io/etcd/server/v3/etcdserver/txn"
+ 	serverversion "go.etcd.io/etcd/server/v3/etcdserver/version"
+ 	"go.etcd.io/etcd/server/v3/features"
+ 	"go.etcd.io/etcd/server/v3/lease"
+@@ -252,6 +253,7 @@ type EtcdServer struct {
+ 	applyWait wait.WaitTime
+ 
+ 	kv         mvcc.WatchableKV
++	readCache  *txn.RangeCache
+ 	lessor     lease.Lessor
+ 	bemu       sync.RWMutex
+ 	be         backend.Backend
+@@ -368,6 +370,7 @@ func NewServer(cfg config.ServerConfig) (srv *EtcdServer, err error) {
+ 		CompactionSleepInterval: cfg.CompactionSleepInterval,
+ 	}
+ 	srv.kv = mvcc.New(srv.Logger(), srv.be, srv.lessor, mvccStoreConfig)
++	srv.readCache = txn.NewRangeCache(txn.DefaultRangeCacheSize)
+ 	srv.corruptionChecker = newCorruptionChecker(cfg.Logger, srv, srv.kv.HashStorage())
+ 
+ 	srv.authStore = auth.NewAuthStore(srv.Logger(), schema.NewAuthBackend(srv.Logger(), srv.be), tp, int(cfg.BcryptCost))
+@@ -1139,6 +1142,11 @@ func (s *EtcdServer) applySnapshot(ep *etcdProgress, toApply *toApply) {
+ }
+ 
+ func (s *EtcdServer) NewUberApplier() apply.UberApplier {
++	// The backend/KV this applier will write through may just have been
++	// rebuilt wholesale (snapshot restore); any response cached against the
++	// old one is meaningless against the new one, revision numbers included.
++	s.readCache.Reset()
++
+ 	opts := apply.ApplierOptions{
+ 		Logger:                       s.lg,
+ 		KV:                           s.KV(),
+@@ -1153,6 +1161,7 @@ func (s *EtcdServer) NewUberApplier() apply.UberApplier {
+ 		Backend:                      s.be,
+ 		QuotaBackendBytesCfg:         s.Cfg.QuotaBackendBytes,
+ 		WarningApplyDuration:         s.Cfg.WarningApplyDuration,
++		RangeCache:                   s.readCache,
+ 	}
+ 	return apply.NewUberApplier(opts)
+ }
+diff --git a/server/etcdserver/txn/readcache.go b/server/etcdserver/txn/readcache.go
+new file mode 100644
+index 000000000..baf4fd1cb
+--- /dev/null
++++ b/server/etcdserver/txn/readcache.go
+@@ -0,0 +1,156 @@
++// Copyright 2026 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package txn
++
++import (
++	"sync"
++
++	"google.golang.org/protobuf/proto"
++	"k8s.io/utils/lru"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/pkg/v3/adt"
++	"go.etcd.io/etcd/server/v3/storage/mvcc"
++)
++
++// DefaultRangeCacheSize bounds how many distinct Range requests a RangeCache
++// remembers at once.
++var DefaultRangeCacheSize = 2048
++
++// RangeCache memoizes RangeResponses for repeated Range requests that ask for
++// the current revision (Revision == 0). Unlike a time-based cache, an entry is
++// evicted the instant a write lands on a key range that could have affected
++// it (see Invalidate/Reset) rather than after some fixed delay, so a cache hit
++// is always exactly as fresh as re-running the read would have been.
++type RangeCache struct {
++	mu         sync.Mutex
++	maxEntries int
++	lru        *lru.Cache
++	// affected indexes cached entries by the key range their request covers,
++	// so a write touching part of that range can find and evict them.
++	affected adt.IntervalTree
++}
++
++// NewRangeCache builds a RangeCache holding at most maxEntries responses.
++func NewRangeCache(maxEntries int) *RangeCache {
++	c := &RangeCache{maxEntries: maxEntries}
++	c.Reset()
++	return c
++}
++
++// Get returns a previously cached response for an equivalent request, if one
++// is still on file.
++func (c *RangeCache) Get(r *pb.RangeRequest) (*pb.RangeResponse, bool) {
++	if c == nil || !cacheableRangeRequest(r) {
++		return nil, false
++	}
++	key := rangeCacheKey(r)
++
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	v, ok := c.lru.Get(key)
++	if !ok {
++		return nil, false
++	}
++	return proto.Clone(v.(*pb.RangeResponse)).(*pb.RangeResponse), true
++}
++
++// Put remembers resp as the answer for future requests equivalent to r. If a
++// write has already landed since resp was read (rv no longer reports the
++// revision resp was read at), Put does nothing: caching resp now would risk
++// handing out a stale answer with no later write left to invalidate it.
++func (c *RangeCache) Put(rv mvcc.ReadView, r *pb.RangeRequest, resp *pb.RangeResponse) {
++	if c == nil || !cacheableRangeRequest(r) || resp == nil || resp.Header == nil {
++		return
++	}
++	key := rangeCacheKey(r)
++
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if rv.Rev() != resp.Header.Revision {
++		return
++	}
++
++	c.lru.Add(key, proto.Clone(resp).(*pb.RangeResponse))
++
++	ivl := rangeInterval(r.Key, r.RangeEnd)
++	if iv := c.affected.Find(ivl); iv != nil {
++		iv.Val.(map[string]struct{})[key] = struct{}{}
++	} else {
++		c.affected.Insert(ivl, map[string]struct{}{key: {}})
++	}
++}
++
++// Invalidate evicts every cached response whose requested range intersects
++// [key, end). Pass a nil end to invalidate a single key.
++func (c *RangeCache) Invalidate(key, end []byte) {
++	if c == nil {
++		return
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	ivl := rangeInterval(key, end)
++	for _, iv := range c.affected.Stab(ivl) {
++		for k := range iv.Val.(map[string]struct{}) {
++			c.lru.Remove(k)
++		}
++	}
++	// Deletion happens after the lookup above since it mutates the tree
++	// the Stab traversal is walking.
++	c.affected.Delete(ivl)
++}
++
++// Reset evicts every cached response, e.g. because the set of keys a write
++// touched isn't cheaply known (a lease revocation) or the store it mirrors
++// was replaced wholesale (a snapshot restore).
++func (c *RangeCache) Reset() {
++	if c == nil {
++		return
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.lru = lru.New(c.maxEntries)
++	c.affected = adt.NewIntervalTree()
++}
++
++func cacheableRangeRequest(r *pb.RangeRequest) bool {
++	// A request pinned to a historical revision is immutable, but caching it
++	// is left for another day: it would need its own compaction-aware
++	// invalidation instead of piggy-backing on writes.
++	return r.Revision == 0
++}
++
++// rangeCacheKey normalizes a request so that a serializable and a
++// linearizable request for the same range, with the same options, share a
++// cache entry: by the time the cache is consulted, the linearizable read
++// barrier (if any) has already run, so the two only differ in how they got
++// here, not in what they should return.
++func rangeCacheKey(r *pb.RangeRequest) string {
++	norm := proto.Clone(r).(*pb.RangeRequest)
++	norm.Serializable = true
++	b, err := proto.Marshal(norm)
++	if err != nil {
++		panic(err)
++	}
++	return string(b)
++}
++
++func rangeInterval(key, end []byte) adt.Interval {
++	if len(end) == 0 {
++		return adt.NewBytesAffinePoint(key)
++	}
++	return adt.NewBytesAffineInterval(key, end)
++}
+diff --git a/server/etcdserver/txn/readcache_test.go b/server/etcdserver/txn/readcache_test.go
+new file mode 100644
+index 000000000..2a46d738e
+--- /dev/null
++++ b/server/etcdserver/txn/readcache_test.go
+@@ -0,0 +1,187 @@
++// Copyright 2026 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package txn
++
++import (
++	"context"
++	"testing"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/api/v3/mvccpb"
++	"go.etcd.io/etcd/server/v3/storage/mvcc"
++)
++
++// fakeReadView reports a fixed store revision, standing in for the KV store's
++// ReadView when exercising RangeCache in isolation.
++type fakeReadView struct{ rev int64 }
++
++func (f fakeReadView) FirstRev() int64 { return 1 }
++func (f fakeReadView) Rev() int64      { return f.rev }
++func (f fakeReadView) Range(context.Context, []byte, []byte, mvcc.RangeOptions) (*mvcc.RangeResult, error) {
++	panic("not used by RangeCache")
++}
++
++func rangeReq(key, end string) *pb.RangeRequest {
++	r := &pb.RangeRequest{Key: []byte(key)}
++	if end != "" {
++		r.RangeEnd = []byte(end)
++	}
++	return r
++}
++
++func rangeResp(rev int64, keys ...string) *pb.RangeResponse {
++	resp := &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: rev}}
++	for _, k := range keys {
++		resp.Kvs = append(resp.Kvs, &mvccpb.KeyValue{Key: []byte(k)})
++	}
++	return resp
++}
++
++func TestRangeCacheHitAndMiss(t *testing.T) {
++	c := NewRangeCache(16)
++	req := rangeReq("a", "")
++	resp := rangeResp(5, "a")
++
++	if _, ok := c.Get(req); ok {
++		t.Fatalf("expected miss before Put")
++	}
++
++	c.Put(fakeReadView{rev: 5}, req, resp)
++
++	got, ok := c.Get(req)
++	if !ok {
++		t.Fatalf("expected hit after Put")
++	}
++	if got.Header.Revision != 5 || len(got.Kvs) != 1 {
++		t.Fatalf("unexpected cached response: %+v", got)
++	}
++
++	// The returned response must be an independent copy: mutating it (as the
++	// gRPC layer does when it fills in header fields) must not corrupt what's
++	// cached for the next caller.
++	got.Header.Revision = 999
++	got2, ok := c.Get(req)
++	if !ok || got2.Header.Revision != 5 {
++		t.Fatalf("cache entry was mutated through a returned copy: %+v", got2)
++	}
++}
++
++func TestRangeCacheDifferentParamsMiss(t *testing.T) {
++	c := NewRangeCache(16)
++	c.Put(fakeReadView{rev: 5}, rangeReq("a", ""), rangeResp(5, "a"))
++
++	if _, ok := c.Get(rangeReq("b", "")); ok {
++		t.Fatalf("expected miss for a different key")
++	}
++	if _, ok := c.Get(rangeReq("a", "z")); ok {
++		t.Fatalf("expected miss for a different range end")
++	}
++
++	countOnly := rangeReq("a", "")
++	countOnly.CountOnly = true
++	if _, ok := c.Get(countOnly); ok {
++		t.Fatalf("expected miss for different options on the same key")
++	}
++}
++
++func TestRangeCacheSerializableAndLinearizableShareEntry(t *testing.T) {
++	c := NewRangeCache(16)
++	write := rangeReq("a", "")
++	write.Serializable = false
++	c.Put(fakeReadView{rev: 5}, write, rangeResp(5, "a"))
++
++	read := rangeReq("a", "")
++	read.Serializable = true
++	if _, ok := c.Get(read); !ok {
++		t.Fatalf("expected a serializable request to hit an entry cached from a linearizable one")
++	}
++}
++
++func TestRangeCacheSkipsHistoricalRevision(t *testing.T) {
++	c := NewRangeCache(16)
++	req := rangeReq("a", "")
++	req.Revision = 3
++	c.Put(fakeReadView{rev: 5}, req, rangeResp(3, "a"))
++
++	if _, ok := c.Get(req); ok {
++		t.Fatalf("expected a fixed-revision request never to be cached")
++	}
++}
++
++func TestRangeCachePutRejectsRaceWithConcurrentWrite(t *testing.T) {
++	c := NewRangeCache(16)
++	req := rangeReq("a", "")
++	resp := rangeResp(5, "a")
++
++	// The store has already moved past the revision resp was read at: some
++	// other write landed while this response was in flight, so caching it now
++	// would hand out a stale answer with nothing left to evict it.
++	c.Put(fakeReadView{rev: 6}, req, resp)
++
++	if _, ok := c.Get(req); ok {
++		t.Fatalf("expected Put to reject a response that raced with a concurrent write")
++	}
++}
++
++func TestRangeCacheInvalidateEvictsOverlappingEntries(t *testing.T) {
++	c := NewRangeCache(16)
++	single := rangeReq("b", "")
++	rangeQ := rangeReq("a", "c")
++	unrelated := rangeReq("z", "")
++
++	c.Put(fakeReadView{rev: 5}, single, rangeResp(5, "b"))
++	c.Put(fakeReadView{rev: 5}, rangeQ, rangeResp(5, "a", "b"))
++	c.Put(fakeReadView{rev: 5}, unrelated, rangeResp(5, "z"))
++
++	c.Invalidate([]byte("b"), nil)
++
++	if _, ok := c.Get(single); ok {
++		t.Fatalf("expected the single-key entry to be invalidated")
++	}
++	if _, ok := c.Get(rangeQ); ok {
++		t.Fatalf("expected the overlapping range entry to be invalidated")
++	}
++	if _, ok := c.Get(unrelated); !ok {
++		t.Fatalf("expected an unrelated key's entry to survive invalidation")
++	}
++}
++
++func TestRangeCacheReset(t *testing.T) {
++	c := NewRangeCache(16)
++	req := rangeReq("a", "")
++	c.Put(fakeReadView{rev: 5}, req, rangeResp(5, "a"))
++
++	c.Reset()
++
++	if _, ok := c.Get(req); ok {
++		t.Fatalf("expected Reset to evict every entry")
++	}
++
++	// Reset must leave the cache usable afterwards.
++	c.Put(fakeReadView{rev: 5}, req, rangeResp(5, "a"))
++	if _, ok := c.Get(req); !ok {
++		t.Fatalf("expected the cache to accept entries again after Reset")
++	}
++}
++
++func TestRangeCacheNilReceiverIsNoOp(t *testing.T) {
++	var c *RangeCache
++	if _, ok := c.Get(rangeReq("a", "")); ok {
++		t.Fatalf("expected a nil RangeCache to always miss")
++	}
++	c.Put(fakeReadView{rev: 5}, rangeReq("a", ""), rangeResp(5, "a"))
++	c.Invalidate([]byte("a"), nil)
++	c.Reset()
++}
+diff --git a/server/etcdserver/v3_server.go b/server/etcdserver/v3_server.go
+index a357705a0..873ac4bbf 100644
+--- a/server/etcdserver/v3_server.go
++++ b/server/etcdserver/v3_server.go
+@@ -146,7 +146,20 @@ func (s *EtcdServer) Range(ctx context.Context, r *pb.RangeRequest) (*pb.RangeRe
+ 		return s.authStore.IsRangePermitted(ai, r.Key, r.RangeEnd)
+ 	}
+ 
+-	get := func() { resp, _, err = txn.Range(ctx, s.Logger(), s.KV(), r, true) }
++	get := func() {
++		// The linearizability barrier above (when applicable) has already run,
++		// so a cache hit here is exactly as fresh as redoing the read: nothing
++		// can have changed the requested range since it was cached without
++		// also evicting it (see RangeCache and rangeCacheInvalidatingApplierV3).
++		if cached, ok := s.readCache.Get(r); ok {
++			resp = cached
++			return
++		}
++		resp, _, err = txn.Range(ctx, s.Logger(), s.KV(), r, true)
++		if err == nil {
++			s.readCache.Put(s.KV(), r, resp)
++		}
++	}
+ 	if serr := s.doSerialize(ctx, chk, get); serr != nil {
+ 		err = serr
+ 		return nil, err

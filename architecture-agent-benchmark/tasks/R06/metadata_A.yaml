@@ -1,0 +1,77 @@
+task_id: R06-TA
+repository: etcd-io/etcd
+commit: 23a4e406a2e70a807486b4c40a9e24da493886bf
+category: local_change
+
+functional_requirements:
+  - "AuthUserAdd request with an empty password (Password == '' and HashedPassword == '') and Options.NoPassword == false (or Options == nil) must fail with a distinct, non-generic error instead of creating the user."
+  - "AuthUserChangePassword request with an empty password for a user whose Options.NoPassword == false must fail with a distinct, non-generic error instead of overwriting the password with an empty hash."
+  - "AuthUserAdd / AuthUserChangePassword requests where Options.NoPassword == true continue to succeed exactly as before (no regression to the passwordless path)."
+  - "The rejection happens on the server side (server/auth), so it applies regardless of which client (etcdctl, client/v3, raw gRPC) issued the request."
+
+architectural_constraints:
+  - "The new validation must live in the auth domain layer (server/auth/store.go, authStore.UserAdd / authStore.UserChangePassword / selectPassword), which is the single place that already owns all other user-account invariants (ErrUserEmpty, root-user protections, etc.) — evidence: server/auth/store.go lines ~423 (UserAdd) and ~497 (UserChangePassword), and the existing sentinel-error var block at the top of the file (ErrUserEmpty, ErrUserAlreadyExist, ErrNoPasswordUser, ...)."
+  - "server/etcdserver/api/v3rpc/auth.go's AuthServer.UserAdd / UserChangePassword are currently pure passthroughs to the etcdserver.Authenticator interface (no business logic, just togRPCError(err) translation) — evidence: server/etcdserver/api/v3rpc/auth.go lines 115-169. The fix must not turn this into a second place that re-implements the same rule."
+  - "The new error must be a new named sentinel error (matching the existing `var (... = errors.New(...))` block style in server/auth/store.go), not an inline fmt.Errorf/panic, and not silently swallowed."
+  - "Must not be implemented only in a client-side tool (client/v3 or etcdctl) since that would let any other gRPC caller bypass the rule entirely."
+
+required_existing_abstractions:
+  - "server/auth/store.go sentinel-error pattern (e.g. ErrUserEmpty, ErrNoPasswordUser) — new error must follow this pattern"
+  - "authStore.selectPassword(password, hashedPassword) — the existing helper that currently allows both password and hashedPassword to be empty; validation should hook in around this call inside UserAdd/UserChangePassword"
+
+allowed_dependencies:
+  - "server/auth (no new external dependency needed)"
+  - "golang.org/x/crypto/bcrypt (already imported in server/auth/store.go)"
+
+forbidden_dependencies:
+  - "client/v3 -> no new password-length/empty-password validation logic here; would only protect one client library, not the protocol boundary"
+  - "etcdctl -> same reasoning; command-line-only validation is bypassable by any other gRPC client"
+  - "server/etcdserver/api/v3rpc/auth.go should not gain new conditional business logic (e.g. `if r.Password == \"\"`); it is meant to remain a thin passthrough per existing code"
+
+expected_extension_points: []
+
+public_api_constraints:
+  - "No change to the AuthUserAddRequest / AuthUserChangePasswordRequest proto messages is required or expected; this is a validation-only change on existing fields."
+  - "New error must be distinguishable from ErrUserNotFound, ErrUserAlreadyExist, ErrNoPasswordUser at the gRPC boundary (distinct status/message), not reuse of an unrelated existing error."
+
+functional_check_command: "cd server && go test ./auth/... -run 'TestUserAdd|TestUserChangePassword' -v  (extend server/auth/store_test.go with subtests: empty-password UserAdd rejected, empty-password UserChangePassword rejected, NoPassword=true UserAdd/UserChangePassword still succeed with empty password); additionally run the full package to check no regressions: cd server && go test ./auth/..."
+
+architecture_check_command: "grep -n 'Password' server/auth/store.go server/etcdserver/api/v3rpc/auth.go client/v3/auth.go etcdctl/ctlv3/command/user_command.go — confirm the new empty-password check exists only in server/auth/store.go, and that server/etcdserver/api/v3rpc/auth.go's UserAdd/UserChangePassword bodies are still a single passthrough call plus togRPCError(err) with no new conditionals added"
+
+architecture_checks:
+  - id: AC1
+    description: "New validation logic lives in the auth domain layer, not the gRPC passthrough layer."
+    method: "Manual diff review of server/auth/store.go vs server/etcdserver/api/v3rpc/auth.go"
+    expected_result_if_correct: "New check (and new sentinel error) added inside authStore.UserAdd / authStore.UserChangePassword in server/auth/store.go; v3rpc/auth.go unchanged."
+    expected_result_if_trap: "New `if len(r.Password) == 0 { ... }`-style branch added inside server/etcdserver/api/v3rpc/auth.go's AuthServer.UserAdd/UserChangePassword instead of (or in addition to) server/auth/store.go."
+  - id: AC2
+    description: "The rejection is enforced server-side, not only in a client tool."
+    method: "grep for new validation code in client/v3/auth.go and etcdctl/ctlv3/command/user_command.go"
+    expected_result_if_correct: "No new empty-password validation added in client/v3 or etcdctl; a raw gRPC AuthUserAdd call with an empty password against the modified server is still rejected."
+    expected_result_if_trap: "Empty-password check only added in etcdctl's user add/passwd command (e.g. prompting/erroring before ever calling the server), with the server itself still accepting empty passwords over gRPC."
+  - id: AC3
+    description: "Error is a proper named sentinel consistent with existing style, not an ad hoc string or silent success."
+    method: "grep for 'errors.New(' additions near the top-level var block in server/auth/store.go, and for any bare `fmt.Errorf` or swallowed error (`_ = ...`) introduced in the changed functions."
+    expected_result_if_correct: "A new `Err...` sentinel variable declared alongside the existing ones and returned from UserAdd/UserChangePassword; distinguishable from ErrNoPasswordUser."
+    expected_result_if_trap: "Empty password silently accepted (no error path added), or an inline ad hoc error/panic used instead of a sentinel consistent with the file's existing conventions."
+  - id: AC4
+    description: "Passwordless (NoPassword=true) accounts are unaffected."
+    method: "go test with a subtest creating/updating a NoPassword=true user with an empty password and asserting success."
+    expected_result_if_correct: "NoPassword=true UserAdd/UserChangePassword with empty password succeeds exactly as before."
+    expected_result_if_trap: "NoPassword=true accounts now also rejected (overly broad fix that ignores the Options.NoPassword flag)."
+  - id: AC5
+    description: "No new dependency edge introduced between server/auth and server/etcdserver/api/v3rpc beyond what already exists."
+    method: "go list -deps (or manual import review) on server/auth and server/etcdserver/api/v3rpc packages before/after the change."
+    expected_result_if_correct: "Import graph unchanged; server/auth still has no dependency on v3rpc."
+    expected_result_if_trap: "server/auth gains a new dependency on v3rpc-specific types (e.g. rpctypes) to satisfy a misplaced check, or vice versa in an unnatural way."
+
+notes_for_positive_negative_control: >
+  Positive control: adds a sentinel error (e.g. ErrPasswordEmpty) in server/auth/store.go and
+  checks it inside authStore.UserAdd/UserChangePassword right after selectPassword resolves an
+  empty result, only when Options.NoPassword is false; passwordless accounts unaffected; v3rpc/auth.go
+  untouched. Negative control: implements the same-looking check inside
+  server/etcdserver/api/v3rpc/auth.go's UserAdd/UserChangePassword handlers (or only inside
+  etcdctl's user command), which passes a naive functional test that only exercises the gRPC/CLI
+  path used by the test but leaves server/auth/store.go's UserAdd directly callable (e.g. by other
+  embedders of the auth store, or future RPCs) still accepting empty passwords — architecture
+  checks AC1/AC2 catch this even though the obvious functional test appears to pass.

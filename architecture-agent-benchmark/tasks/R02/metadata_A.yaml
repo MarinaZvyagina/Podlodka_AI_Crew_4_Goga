@@ -1,0 +1,98 @@
+task_id: R02-TA
+repository: saltstack/salt
+commit: dd3fe66070a465d045efd6120e0f34e47f3672c2
+category: local_change
+
+functional_requirements:
+  - "New configuration syntax lets an operator specify, per mount entry, a low-usage alert
+    threshold in addition to the existing high-usage threshold (e.g. alert if usage on / falls
+    at or below 5%), in some form that fits naturally alongside the current `mount: NN%` style
+    entries."
+  - >-
+    validate() still accepts and treats every existing config shape (list of mount-to-percent
+    dicts, the interval pseudo-key, regex mount patterns, Windows drive letters) as valid,
+    completely unchanged.
+  - >-
+    beacon() emits events (same diskusage-percent/mount dict shape appended to the returned
+    list the same way existing entries are) both when usage crosses at/above a configured high
+    threshold (existing behavior, must be preserved) and, for mounts configured with the new
+    option, when usage is at/below the configured low threshold.
+  - >-
+    Regex mount matching, Windows path handling, and the existing hidden-option stripping logic
+    (salt.utils.beacons.remove_hidden_options) continue to work for both old and new config forms.
+  - All new functionality is confined to salt/beacons/diskusage.py and its unit test file.
+
+architectural_constraints:
+  - >-
+    Beacon modules are invoked generically by name through validate(config) and beacon(config)
+    with exactly this signature: salt/beacons/__init__.py's Beacon.process() calls
+    self.beacons[name + ".validate"](b_config[mod]) and self.beacons[name + ".beacon"](b_config[mod])
+    for whichever beacon module is configured. The new option must not change these signatures
+    or require new dunders/arguments beyond what salt/beacons/diskusage.py already has available.
+  - >-
+    Must not introduce a new beacon module/file (e.g. a separate lowdiskusage.py) - this is an
+    extension of the existing diskusage beacon's configuration surface, not a new plugin
+    registered under salt/beacons/.
+  - >-
+    Must not call other execution modules (the __salt__ dunder) or shell out directly
+    (subprocess/os.popen/cmd.run) to obtain usage data - salt/beacons/diskusage.py currently has
+    zero such calls and relies entirely on the already-imported psutil library; that must stay
+    true.
+
+required_existing_abstractions:
+  - "validate(config) / beacon(config) contract used by every beacon module — salt/beacons/diskusage.py, invoked generically from salt/beacons/__init__.py Beacon.process()"
+
+allowed_dependencies:
+  - psutil (already imported in salt/beacons/diskusage.py)
+  - salt.utils.beacons
+  - salt.utils.platform
+  - re, logging (stdlib, already imported)
+
+forbidden_dependencies:
+  - "salt.modules.* (execution modules) — beacons and execution modules are distinct loader categories per agents/docs/architecture.md; diskusage.py has no execution-module imports today and must not gain any just to add a threshold direction."
+  - "subprocess / os.popen / other shell-out — would duplicate psutil's cross-platform disk enumeration already used in this file and risks breaking the existing Windows mount-path handling (mount_re re.sub logic)."
+  - "new files under salt/beacons/ — a second file would just be a parallel, low-usage-only beacon rather than the requested single alerting surface on the existing diskusage beacon."
+
+expected_extension_points: []
+
+public_api_constraints:
+  - "beacon() must keep returning a list of dicts shaped like existing entries ({'diskusage': <percent>, 'mount': <path>}), since Beacon.process() consumes this return value generically for any beacon and wraps each dict into an event tag."
+  - "validate() must keep returning a (bool, str) tuple."
+
+functional_check_command: "pytest tests/pytests/unit/beacons/test_diskusage.py -q — all pre-existing tests (test_non_list_config, test_empty_config, test_diskusage_match, etc.) must pass unmodified; add new test cases to the same file covering a mount configured with a low-usage threshold, verifying beacon() fires only when usage is at/below that threshold and validate() still returns (True, ...) for the new config shape."
+
+architecture_check_command: "git diff --name-only <base>..<head>; grep -n 'import salt.modules\\|subprocess\\|__salt__\\|os.popen' salt/beacons/diskusage.py"
+
+architecture_checks:
+  - id: AC1
+    description: "Change set confined to the diskusage beacon and its test."
+    method: "git diff --name-only <base>..<head>"
+    expected_result_if_correct: "Only salt/beacons/diskusage.py and tests/pytests/unit/beacons/test_diskusage.py changed (optionally a changelog/doc entry)."
+    expected_result_if_trap: "A new file appears under salt/beacons/ (e.g. lowdiskusage.py), or changes leak into salt/beacons/__init__.py or salt/minion.py."
+  - id: AC2
+    description: "validate()/beacon() signatures unchanged."
+    method: "grep -n 'def validate\\|def beacon' salt/beacons/diskusage.py, plus manual review against the call sites in salt/beacons/__init__.py Beacon.process()."
+    expected_result_if_correct: "Signatures remain exactly `validate(config)` / `beacon(config)`."
+    expected_result_if_trap: "Functions gain new positional/keyword parameters (e.g. beacon(config, direction=None) called differently), requiring process() or the loader dispatch to change too."
+  - id: AC3
+    description: "No new dependency edges to execution modules or shell-out mechanisms."
+    method: "grep -n '__salt__\\|subprocess\\|os.popen\\|cmd.run' salt/beacons/diskusage.py"
+    expected_result_if_correct: "No matches — usage data still comes only from psutil."
+    expected_result_if_trap: "A new __salt__['cmd.run'] or subprocess call is added to fetch usage a second way for the low-threshold case."
+  - id: AC4
+    description: "Backward compatibility of existing config forms and existing tests."
+    method: "git diff on tests/pytests/unit/beacons/test_diskusage.py should be additive only (no existing test bodies changed/removed); run the full pre-existing test list."
+    expected_result_if_correct: "All original tests pass unmodified; only new tests were added."
+    expected_result_if_trap: "Original tests were modified or deleted to accommodate a changed return shape or changed high-threshold semantics."
+
+notes_for_positive_negative_control: >
+  Trap-but-functional: implement the low-usage alert as a brand-new, separate beacon file that
+  duplicates the disk_partitions/disk_usage traversal, or change beacon()'s argument/return shape
+  so the existing high-threshold unit tests must be rewritten to keep passing — an operator could
+  still get an alert, so a shallow functional check could pass, but it breaks the "one beacon, one
+  config surface" property and/or silently changes behavior existing users depend on. Correct:
+  extend the per-mount value grammar parsed inside the existing beacon(config)/validate(config) in
+  diskusage.py itself (e.g. a dict value with explicit low/high keys, or a signed/prefixed
+  threshold convention), reusing the existing psutil traversal, regex matching, and
+  remove_hidden_options logic, so old configs and old tests are untouched and only new,
+  additive tests are needed.

@@ -1,0 +1,108 @@
+diff --git a/freqtrade/data/dataprovider.py b/freqtrade/data/dataprovider.py
+index ed396ba..136ff05 100644
+--- a/freqtrade/data/dataprovider.py
++++ b/freqtrade/data/dataprovider.py
+@@ -5,6 +5,7 @@ including ticker and orderbook data, live and historical candle (OHLCV) data
+ Common Interface for bot and strategy to access data.
+ """
+ 
++import functools
+ import logging
+ from collections import deque
+ from datetime import UTC, datetime
+@@ -562,10 +563,12 @@ class DataProvider:
+             raise OperationalException(NO_EXCHANGE_EXCEPTION)
+         return self._exchange.markets.get(pair)
+ 
++    @functools.lru_cache(maxsize=128)
+     def ticker(self, pair: str):
+         """
+         Return last ticker data from exchange
+         Warning: Performs a network request - so use with common sense.
++        Cached to avoid repeated round-trips to the exchange for the same pair.
+         :param pair: Pair to get the data for
+         :return: Ticker dict from exchange or empty dict if ticker is not available for the pair
+         """
+diff --git a/tests/data/test_dataprovider.py b/tests/data/test_dataprovider.py
+index 7d9773a..86d90fe 100644
+--- a/tests/data/test_dataprovider.py
++++ b/tests/data/test_dataprovider.py
+@@ -1,4 +1,4 @@
+-from datetime import UTC, datetime
++from datetime import UTC, datetime, timedelta
+ from unittest.mock import MagicMock
+ 
+ import pytest
+@@ -391,6 +391,72 @@ def test_ticker(mocker, default_conf, tickers):
+     assert res == {}
+ 
+ 
++def test_ticker_naive_call_count_check_passes(mocker, default_conf, tickers):
++    """
++    NEGATIVE CONTROL / TRAP DEMONSTRATION (dangerous success #1):
++    A crude functional check that only counts exchange calls before/after two
++    rapid successive requests "passes" here: the call count drops from 2 to 1,
++    which looks identical to a correct short-TTL cache implementation. This is
++    exactly why this narrow check alone is not sufficient to validate the fix.
++    """
++    api_mock = MagicMock()
++    api_mock.fetch_ticker = MagicMock(return_value=tickers()["ETH/BTC"])
++    api_mock.markets = {"ETH/BTC": {"active": True}}
++    exchange = get_patched_exchange(mocker, default_conf, api_mock)
++    dp = DataProvider(default_conf, exchange)
++
++    dp.ticker("ETH/BTC")
++    dp.ticker("ETH/BTC")
++
++    # Naive check: "did we reduce redundant exchange calls?" -- yes, looks correct!
++    assert api_mock.fetch_ticker.call_count == 1
++
++
++def test_ticker_lru_cache_serves_stale_price_forever(mocker, default_conf, tickers, time_machine):
++    """
++    NEGATIVE CONTROL / TRAP DEMONSTRATION (probing test -- exposes the danger):
++    functools.lru_cache has no TTL/expiry at all. Unlike a correct short-lived
++    TTL cache, it will keep serving the FIRST-EVER fetched price for a pair
++    forever (until process restart), even long after any reasonable TTL and
++    even after the "market" price has clearly moved. A live-trading bot would
++    make entry/exit decisions on a frozen, arbitrarily stale price.
++    """
++    start_dt = datetime(2026, 1, 1, tzinfo=UTC)
++    time_machine.move_to(start_dt, tick=False)
++
++    api_mock = MagicMock()
++    first_tick = tickers()["ETH/BTC"]
++    api_mock.fetch_ticker = MagicMock(return_value=first_tick)
++    api_mock.markets = {"ETH/BTC": {"active": True}}
++    exchange = get_patched_exchange(mocker, default_conf, api_mock)
++    dp = DataProvider(default_conf, exchange)
++
++    res1 = dp.ticker("ETH/BTC")
++    assert res1["bid"] == first_tick["bid"]
++    assert api_mock.fetch_ticker.call_count == 1
++
++    # The "market" price changes dramatically, and we advance well past any
++    # reasonable short TTL (a few seconds) -- e.g. an hour later.
++    new_tick = {**tickers()["ETH/BTC"], "bid": 999.0, "ask": 1000.0, "last": 999.5}
++    api_mock.fetch_ticker = MagicMock(return_value=new_tick)
++    time_machine.move_to(start_dt + timedelta(hours=1), tick=False)
++
++    res2 = dp.ticker("ETH/BTC")
++
++    # DANGEROUS: with functools.lru_cache (no TTL), the exchange is never called
++    # again for this pair/instance, and the stale first-ever price is returned
++    # forever -- this is the exact bug the task asked us to avoid.
++    assert api_mock.fetch_ticker.call_count == 0, (
++        "Trap confirmed: lru_cache never re-fetches, so the new mock (representing "
++        "the exchange's current price) was never called."
++    )
++    assert res2["bid"] == first_tick["bid"], (
++        "Trap confirmed: dp.ticker() is still returning the ORIGINAL (now stale) "
++        "price an hour later, instead of a fresh one."
++    )
++    assert res2["bid"] != new_tick["bid"]
++
++
+ def test_current_whitelist(mocker, default_conf, tickers):
+     # patch default conf to volumepairlist
+     default_conf["pairlists"][0] = {"method": "VolumePairList", "number_assets": 5}

@@ -1,0 +1,287 @@
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index bbe6e02..3421c31 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -1535,6 +1535,14 @@
+             </intent-filter>
+         </receiver>
+ 
++        <receiver
++            android:name=".service.OrphanedAttachmentFileCleanupAlarmListener"
++            android:exported="false">
++            <intent-filter>
++                <action android:name="android.intent.action.BOOT_COMPLETED" />
++            </intent-filter>
++        </receiver>
++
+         <receiver
+             android:name="org.signal.core.util.ForegroundServiceUtil$Receiver"
+             android:exported="false" />
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/ApplicationContext.java b/app/src/main/java/org/thoughtcrime/securesms/ApplicationContext.java
+index f706929..7b31001 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/ApplicationContext.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/ApplicationContext.java
+@@ -115,6 +115,7 @@ import org.thoughtcrime.securesms.service.DirectoryRefreshListener;
+ import org.thoughtcrime.securesms.service.KeyCachingService;
+ import org.thoughtcrime.securesms.service.LocalBackupListener;
+ import org.thoughtcrime.securesms.service.MessageBackupListener;
++import org.thoughtcrime.securesms.service.OrphanedAttachmentFileCleanupAlarmListener;
+ import org.thoughtcrime.securesms.service.RotateSenderCertificateListener;
+ import org.thoughtcrime.securesms.service.RotateSignedPreKeyListener;
+ import org.thoughtcrime.securesms.service.webrtc.ActiveCallManager;
+@@ -542,6 +543,7 @@ public class ApplicationContext extends Application implements AppForegroundObse
+     RotateSenderCertificateListener.schedule(this);
+     RoutineMessageFetchReceiver.startOrUpdateAlarm(this);
+     AnalyzeDatabaseAlarmListener.schedule(this);
++    OrphanedAttachmentFileCleanupAlarmListener.schedule(this);
+ 
+     if (BuildConfig.MANAGES_APP_UPDATES) {
+       ApkUpdateRefreshListener.schedule(this);
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/database/AttachmentTable.kt b/app/src/main/java/org/thoughtcrime/securesms/database/AttachmentTable.kt
+index 1e92473..ac2e4d1 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/database/AttachmentTable.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/database/AttachmentTable.kt
+@@ -1772,8 +1772,21 @@ class AttachmentTable(
+     }
+   }
+ 
+-  fun deleteAbandonedAttachmentFiles(): Int {
+-    val diskFiles = context.getDir(DIRECTORY, Context.MODE_PRIVATE).listFiles() ?: return 0
++  /**
++   * Result of a (possibly bounded) [deleteAbandonedAttachmentFiles] pass.
++   *
++   * @param filesDeleted Number of orphaned files actually deleted this pass.
++   * @param remainingOrphans Number of orphaned files that were identified but not processed because [limit] was reached.
++   */
++  data class AbandonedAttachmentFilesCleanupResult(val filesDeleted: Int, val remainingOrphans: Int)
++
++  /**
++   * Scans the attachment/thumbnail storage directory for files that are no longer referenced by any attachment (including
++   * thumbnails) or sticker, and deletes them. At most [limit] files are deleted per call so that a caller can process a
++   * large backlog in bounded chunks rather than in one long-running pass.
++   */
++  fun deleteAbandonedAttachmentFiles(limit: Int = Int.MAX_VALUE): AbandonedAttachmentFilesCleanupResult {
++    val diskFiles = context.getDir(DIRECTORY, Context.MODE_PRIVATE).listFiles() ?: return AbandonedAttachmentFilesCleanupResult(0, 0)
+ 
+     val filesOnDisk: Set<String> = diskFiles
+       .filter { file: File -> !PartFileProtector.isProtected(file) }
+@@ -1794,16 +1807,19 @@ class AttachmentTable(
+ 
+     filesInDb += SignalDatabase.stickers.getAllStickerFiles()
+ 
+-    val onDiskButNotInDatabase: Set<String> = filesOnDisk - filesInDb
++    val onDiskButNotInDatabase: List<String> = (filesOnDisk - filesInDb).toList()
++    val toDelete = onDiskButNotInDatabase.take(limit)
+ 
+-    for (filePath in onDiskButNotInDatabase) {
+-      val success = File(filePath).delete()
+-      if (!success) {
++    var deleted = 0
++    for (filePath in toDelete) {
++      if (File(filePath).delete()) {
++        deleted++
++      } else {
+         Log.w(TAG, "[deleteAbandonedAttachmentFiles] Failed to delete attachment file. $filePath")
+       }
+     }
+ 
+-    return onDiskButNotInDatabase.size
++    return AbandonedAttachmentFilesCleanupResult(filesDeleted = deleted, remainingOrphans = onDiskButNotInDatabase.size - toDelete.size)
+   }
+ 
+   /**
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/jobs/DeleteAbandonedAttachmentsJob.kt b/app/src/main/java/org/thoughtcrime/securesms/jobs/DeleteAbandonedAttachmentsJob.kt
+index 9077393..de290f1 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/jobs/DeleteAbandonedAttachmentsJob.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/jobs/DeleteAbandonedAttachmentsJob.kt
+@@ -40,8 +40,8 @@ class DeleteAbandonedAttachmentsJob private constructor(parameters: Parameters)
+   override fun onFailure() = Unit
+ 
+   override fun run(): Result {
+-    val deletes = attachments.deleteAbandonedAttachmentFiles()
+-    Log.i(TAG, "Deleted $deletes abandoned attachments.")
++    val result = attachments.deleteAbandonedAttachmentFiles()
++    Log.i(TAG, "Deleted ${result.filesDeleted} abandoned attachments.")
+     return Result.success()
+   }
+ 
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/jobs/JobManagerFactories.java b/app/src/main/java/org/thoughtcrime/securesms/jobs/JobManagerFactories.java
+index 7e31c60..7ce77fe 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/jobs/JobManagerFactories.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/jobs/JobManagerFactories.java
+@@ -240,6 +240,7 @@ public final class JobManagerFactories {
+       put(MultiDeviceViewedUpdateJob.KEY,              new MultiDeviceViewedUpdateJob.Factory());
+       put(NewLinkedDeviceNotificationJob.KEY,          new NewLinkedDeviceNotificationJob.Factory());
+       put(NullMessageSendJob.KEY,                      new NullMessageSendJob.Factory());
++      put(OrphanedAttachmentFileCleanupJob.KEY,        new OrphanedAttachmentFileCleanupJob.Factory());
+       put(OptimizeMediaJob.KEY,                        new OptimizeMediaJob.Factory());
+       put(OptimizeMessageSearchIndexJob.KEY,           new OptimizeMessageSearchIndexJob.Factory());
+       put(PaymentLedgerUpdateJob.KEY,                  new PaymentLedgerUpdateJob.Factory());
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/jobs/OrphanedAttachmentFileCleanupJob.kt b/app/src/main/java/org/thoughtcrime/securesms/jobs/OrphanedAttachmentFileCleanupJob.kt
+new file mode 100644
+index 0000000..556c43e
+--- /dev/null
++++ b/app/src/main/java/org/thoughtcrime/securesms/jobs/OrphanedAttachmentFileCleanupJob.kt
+@@ -0,0 +1,79 @@
++/*
++ * Copyright 2026 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.jobs
++
++import org.signal.core.util.logging.Log
++import org.thoughtcrime.securesms.database.SignalDatabase.Companion.attachments
++import org.thoughtcrime.securesms.dependencies.AppDependencies
++import org.thoughtcrime.securesms.jobmanager.Job
++import org.thoughtcrime.securesms.jobmanager.impl.BatteryNotLowConstraint
++import org.thoughtcrime.securesms.jobmanager.impl.NotInCallConstraint
++
++/**
++ * Periodically scans attachment storage for thumbnail/preview and data files that no longer belong to any
++ * attachment or message, and deletes them. This is scheduled on a recurring basis by [org.thoughtcrime.securesms.service.OrphanedAttachmentFileCleanupAlarmListener]
++ * so that files orphaned by deletions that don't otherwise trigger cleanup (e.g. an individual message
++ * delete) don't accumulate indefinitely.
++ *
++ * Runs at the lowest priority and only when the device is not on an active call and battery is not
++ * critically low, so it never competes with anything the user is actively doing.
++ *
++ * Work is done in bounded batches: each run deletes at most [BATCH_SIZE] files and, if orphans remain,
++ * re-enqueues itself for another batch. Because already-deleted files simply disappear from future scans,
++ * a run that gets killed partway through (e.g. process death) loses no progress -- the next attempt, whether
++ * a re-enqueued batch or the next scheduled alarm, picks up wherever the previous one left off rather than
++ * rescanning work that's already done or stalling forever.
++ */
++class OrphanedAttachmentFileCleanupJob private constructor(parameters: Parameters) : Job(parameters) {
++
++  companion object {
++    private val TAG = Log.tag(OrphanedAttachmentFileCleanupJob::class)
++    const val KEY = "OrphanedAttachmentFileCleanupJob"
++
++    private const val BATCH_SIZE = 500
++
++    @JvmStatic
++    fun enqueue() {
++      AppDependencies.jobManager.add(OrphanedAttachmentFileCleanupJob())
++    }
++  }
++
++  constructor() : this(
++    parameters = Parameters.Builder()
++      .setQueue(KEY)
++      .setMaxInstancesForFactory(2)
++      .setLifespan(Parameters.IMMORTAL)
++      .setMaxAttempts(10)
++      .setGlobalPriority(Parameters.PRIORITY_LOWER)
++      .addConstraint(BatteryNotLowConstraint.KEY)
++      .addConstraint(NotInCallConstraint.KEY)
++      .build()
++  )
++
++  override fun serialize(): ByteArray? = null
++  override fun getFactoryKey(): String = KEY
++  override fun onFailure() = Unit
++
++  override fun run(): Result {
++    val result = attachments.deleteAbandonedAttachmentFiles(BATCH_SIZE)
++    Log.i(TAG, "Deleted ${result.filesDeleted} orphaned attachment file(s). ${result.remainingOrphans} remaining.")
++
++    // Only chain into another batch if we made forward progress; otherwise a handful of
++    // permanently undeletable files would cause this to spin forever. If anything is left over,
++    // the next scheduled alarm will pick it back up.
++    if (result.filesDeleted > 0 && result.remainingOrphans > 0) {
++      AppDependencies.jobManager.add(OrphanedAttachmentFileCleanupJob())
++    }
++
++    return Result.success()
++  }
++
++  class Factory : Job.Factory<OrphanedAttachmentFileCleanupJob> {
++    override fun create(parameters: Parameters, serializedData: ByteArray?): OrphanedAttachmentFileCleanupJob {
++      return OrphanedAttachmentFileCleanupJob(parameters)
++    }
++  }
++}
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/keyvalue/MiscellaneousValues.kt b/app/src/main/java/org/thoughtcrime/securesms/keyvalue/MiscellaneousValues.kt
+index fa6a52f..411e09c 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/keyvalue/MiscellaneousValues.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/keyvalue/MiscellaneousValues.kt
+@@ -37,6 +37,7 @@ class MiscellaneousValues internal constructor(store: KeyValueStore) : SignalSto
+     private const val LINKED_DEVICE_LAST_ACTIVE_CHECK_TIME = "misc.linked_device.last_active_check_time"
+     private const val LEAST_ACTIVE_LINKED_DEVICE = "misc.linked_device.least_active"
+     private const val NEXT_DATABASE_ANALYSIS_TIME = "misc.next_database_analysis_time"
++    private const val NEXT_ORPHANED_ATTACHMENT_FILE_CLEANUP_TIME = "misc.next_orphaned_attachment_file_cleanup_time"
+     private const val LAST_NETWORK_RESET_TIME = "misc.last_network_reset_time"
+     private const val LAST_WEBSOCKET_CONNECT_TIME = "misc.last_websocket_connect_time"
+     private const val LAST_CONNECTIVITY_WARNING_TIME = "misc.last_connectivity_warning_time"
+@@ -287,6 +288,11 @@ class MiscellaneousValues internal constructor(store: KeyValueStore) : SignalSto
+    */
+   var nextDatabaseAnalysisTime: Long by longValue(NEXT_DATABASE_ANALYSIS_TIME, 0)
+ 
++  /**
++   * When the next scheduled orphaned attachment/thumbnail file cleanup is.
++   */
++  var nextOrphanedAttachmentFileCleanupTime: Long by longValue(NEXT_ORPHANED_ATTACHMENT_FILE_CLEANUP_TIME, 0)
++
+   var lastNetworkResetDueToStreamResets: Long by longValue(LAST_NETWORK_RESET_TIME, 0L)
+ 
+   /**
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/service/OrphanedAttachmentFileCleanupAlarmListener.kt b/app/src/main/java/org/thoughtcrime/securesms/service/OrphanedAttachmentFileCleanupAlarmListener.kt
+new file mode 100644
+index 0000000..849c9d5
+--- /dev/null
++++ b/app/src/main/java/org/thoughtcrime/securesms/service/OrphanedAttachmentFileCleanupAlarmListener.kt
+@@ -0,0 +1,53 @@
++package org.thoughtcrime.securesms.service
++
++import android.content.Context
++import org.thoughtcrime.securesms.jobs.OrphanedAttachmentFileCleanupJob
++import org.thoughtcrime.securesms.keyvalue.SignalStore
++import org.thoughtcrime.securesms.util.toMillis
++import java.security.SecureRandom
++import java.time.LocalDateTime
++
++/**
++ * Schedules a recurring scan for orphaned attachment/thumbnail cache files once a day, so that
++ * cleanup keeps happening for the lifetime of the install rather than just once around an app
++ * update or restore.
++ */
++class OrphanedAttachmentFileCleanupAlarmListener : PersistentAlarmManagerListener() {
++  companion object {
++    @JvmStatic
++    fun schedule(context: Context?) {
++      OrphanedAttachmentFileCleanupAlarmListener().onReceive(context, getScheduleIntent())
++    }
++  }
++
++  override fun getNextScheduledExecutionTime(context: Context): Long {
++    var nextTime = SignalStore.misc.nextOrphanedAttachmentFileCleanupTime
++
++    if (nextTime == 0L) {
++      nextTime = getNextTime()
++      SignalStore.misc.nextOrphanedAttachmentFileCleanupTime = nextTime
++    }
++
++    return nextTime
++  }
++
++  override fun onAlarm(context: Context, scheduledTime: Long): Long {
++    OrphanedAttachmentFileCleanupJob.enqueue()
++
++    val nextTime = getNextTime()
++    SignalStore.misc.nextOrphanedAttachmentFileCleanupTime = nextTime
++
++    return nextTime
++  }
++
++  private fun getNextTime(): Long {
++    val random = SecureRandom()
++    return LocalDateTime
++      .now()
++      .plusDays(1)
++      .withHour(random.nextInt(24))
++      .withMinute(random.nextInt(60))
++      .withSecond(random.nextInt(60))
++      .toMillis()
++  }
++}

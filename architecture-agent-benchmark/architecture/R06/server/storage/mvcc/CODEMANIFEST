@@ -1,0 +1,102 @@
+Imports:
+  - Types:
+      - Backend
+    From: server/storage/backend
+  - Types:
+      - Lessor
+    From: server/lease
+
+Usages:
+  watch_sync_states: |
+    Registered watchers live in one of two groups: "synced" (caught up to the store's current
+    revision, receiving events live as they are committed) and "unsynced" (behind, being
+    replayed from history in the background). A watcher whose delivery channel is full becomes
+    a "victim" and is retried separately rather than blocking the writer that produced the
+    event. New watch-related logic should preserve this three-way split rather than assuming a
+    single delivery path.
+
+Annotations: |
+  This cell implements etcd's multi-version concurrency control key-value layer on top of the
+  imported `Backend`: the monotonically increasing revision counter, the in-memory index
+  mapping user keys to their revision history, compaction, consistency hashing, and the watch
+  subsystem that turns committed writes into a stream of change events. It depends on `Backend`
+  for physical storage and on `Lessor` so that Put operations can attach a key to a lease and
+  so lease-driven key deletion can be wired in without this cell depending on the lease cell's
+  internals.
+
+  Use `watch_sync_states` when extending watch delivery or resync behavior.
+
+---
+
+"KV()":
+  location: kv.go
+  annotations: |
+    The core read/write contract: point-in-time reads and transactional writes over the
+    revisioned key space.
+  methods:
+    "Range(key []byte, end []byte) -> result:RangeResult, err:error": |
+      Read the current (or a historical) value(s) for `key`, or for the range up to (excluding)
+      `end` if `end` is set.
+    "Put(key []byte, value []byte, leaseID int64) -> revision:int64": |
+      Write `value` at `key`, creating a new revision; if `leaseID` is non-zero, attach the key
+      to that lease via the imported `Lessor`.
+    "DeleteRange(key []byte, end []byte) -> deleted:int64, revision:int64": |
+      Delete `key`, or every key from `key` up to (excluding) `end`, creating a new tombstone
+      revision.
+    "Read(mode ReadTxMode) -> transaction:TxnRead": |
+      Begin a read-only transaction; `mode` selects between the shared read view and a
+      non-blocking concurrent read view.
+    "Write() -> transaction:TxnWrite": |
+      Begin a read/write transaction spanning one raft-applied request.
+    "Compact(revision int64) -> err:error": |
+      Discard all revisions of all keys created before `revision`; completion is signalled
+      asynchronously in the real implementation.
+    "Restore(be Backend) -> err:error": |
+      Rebuild in-memory state (index, watchers) from `be` after a snapshot has replaced the
+      backend wholesale.
+    "Close() -> err:error": |
+      Stop background compaction/watch goroutines and release resources.
+
+"KV::WatchableKV()":
+  location: kv.go
+  annotations: |
+    A `KV` that can also be watched: every mutation applied through it is turned into change
+    events for subscribed watch streams.
+  methods:
+    "NewWatchStream() -> stream:WatchStream": |
+      Create a new independent stream on which one or more key ranges can be watched.
+
+"WatchStream()":
+  location: watcher.go
+  annotations: |
+    One consumer's set of active watches and the channel of resulting events; owned by a single
+    caller (typically one gRPC watch stream) for its lifetime.
+  methods:
+    "Watch(id int64, key []byte, end []byte, startRevision int64) -> watchID:int64, err:error": |
+      Begin watching `key` (or the range up to (excluding) `end`) starting from
+      `startRevision`, classified per `watch_sync_states` based on how far behind
+      `startRevision` is from the current revision.
+    "Cancel(id int64) -> err:error": |
+      Stop watching and release the resources for a previously registered watch.
+    "RequestProgress(id int64)": |
+      Ask for a progress notification on this watch even absent matching events.
+
+"New(be Backend, lessor Lessor, cfg StoreConfig) -> kv:WatchableKV":
+  location: watchable_store.go
+  annotations: |
+    Construct the MVCC store: creates the on-`Backend` bucket layout if absent, rebuilds the
+    in-memory revision index from existing data, and wires itself into `lessor` so that
+    lease expiry/revocation deletes the keys it owns.
+
+    `be`: imported `Backend` this store persists to.
+    `lessor`: imported `Lessor` this store attaches Put'd keys to and registers a key-deletion
+    callback with.
+    `cfg`: compaction batch size and pacing.
+
+---
+
+Author: Goga
+CreatedAt: 26/08/26
+Description: |
+  The MVCC/revision/watch layer — etcd's actual key-value data model, built on top of
+  `server/storage/backend` and `server/lease`.

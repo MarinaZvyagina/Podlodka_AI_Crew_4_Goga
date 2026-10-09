@@ -1,0 +1,178 @@
+diff --git a/api/v3rpc/rpctypes/error.go b/api/v3rpc/rpctypes/error.go
+index 781c73b..b75623b 100644
+--- a/api/v3rpc/rpctypes/error.go
++++ b/api/v3rpc/rpctypes/error.go
+@@ -65,6 +65,7 @@ var (
+ 	ErrGRPCRoleNotFound         = status.Error(codes.FailedPrecondition, "etcdserver: role name not found")
+ 	ErrGRPCRoleEmpty            = status.Error(codes.InvalidArgument, "etcdserver: role name is empty")
+ 	ErrGRPCAuthFailed           = status.Error(codes.InvalidArgument, "etcdserver: authentication failed, invalid user ID or password")
++	ErrGRPCPasswordEmpty        = status.Error(codes.InvalidArgument, "etcdserver: password is empty")
+ 	ErrGRPCPermissionNotGiven   = status.Error(codes.InvalidArgument, "etcdserver: permission not given")
+ 	ErrGRPCPermissionDenied     = status.Error(codes.PermissionDenied, "etcdserver: permission denied")
+ 	ErrGRPCRoleNotGranted       = status.Error(codes.FailedPrecondition, "etcdserver: role is not granted to the user")
+@@ -136,6 +137,7 @@ var (
+ 		ErrorDesc(ErrGRPCRoleNotFound):         ErrGRPCRoleNotFound,
+ 		ErrorDesc(ErrGRPCRoleEmpty):            ErrGRPCRoleEmpty,
+ 		ErrorDesc(ErrGRPCAuthFailed):           ErrGRPCAuthFailed,
++		ErrorDesc(ErrGRPCPasswordEmpty):        ErrGRPCPasswordEmpty,
+ 		ErrorDesc(ErrGRPCPermissionDenied):     ErrGRPCPermissionDenied,
+ 		ErrorDesc(ErrGRPCRoleNotGranted):       ErrGRPCRoleNotGranted,
+ 		ErrorDesc(ErrGRPCPermissionNotGranted): ErrGRPCPermissionNotGranted,
+@@ -203,6 +205,7 @@ var (
+ 	ErrRoleNotFound         = Error(ErrGRPCRoleNotFound)
+ 	ErrRoleEmpty            = Error(ErrGRPCRoleEmpty)
+ 	ErrAuthFailed           = Error(ErrGRPCAuthFailed)
++	ErrPasswordEmpty        = Error(ErrGRPCPasswordEmpty)
+ 	ErrPermissionDenied     = Error(ErrGRPCPermissionDenied)
+ 	ErrRoleNotGranted       = Error(ErrGRPCRoleNotGranted)
+ 	ErrPermissionNotGranted = Error(ErrGRPCPermissionNotGranted)
+diff --git a/server/auth/store.go b/server/auth/store.go
+index 49cc4d0..eee4aca 100644
+--- a/server/auth/store.go
++++ b/server/auth/store.go
+@@ -48,6 +48,7 @@ var (
+ 	ErrUserAlreadyExist     = errors.New("auth: user already exists")
+ 	ErrUserEmpty            = errors.New("auth: user name is empty")
+ 	ErrUserNotFound         = errors.New("auth: user not found")
++	ErrPasswordEmpty        = errors.New("auth: password is empty")
+ 	ErrRoleAlreadyExist     = errors.New("auth: role already exists")
+ 	ErrRoleNotFound         = errors.New("auth: role not found")
+ 	ErrRoleEmpty            = errors.New("auth: role name is empty")
+@@ -445,6 +446,9 @@ func (as *authStore) UserAdd(r *pb.AuthUserAddRequest) (*pb.AuthUserAddResponse,
+ 	var err error
+ 
+ 	if !options.NoPassword {
++		if len(r.Password) == 0 && len(r.HashedPassword) == 0 {
++			return nil, ErrPasswordEmpty
++		}
+ 		password, err = as.selectPassword(r.Password, r.HashedPassword)
+ 		if err != nil {
+ 			return nil, ErrNoPasswordUser
+@@ -509,6 +513,9 @@ func (as *authStore) UserChangePassword(r *pb.AuthUserChangePasswordRequest) (*p
+ 
+ 	// Backward compatible with old versions of etcd, user options is nil
+ 	if user.Options == nil || !user.Options.NoPassword {
++		if len(r.Password) == 0 && len(r.HashedPassword) == 0 {
++			return nil, ErrPasswordEmpty
++		}
+ 		password, err = as.selectPassword(r.Password, r.HashedPassword)
+ 		if err != nil {
+ 			return nil, ErrNoPasswordUser
+diff --git a/server/auth/store_test.go b/server/auth/store_test.go
+index fae3716..2f020fa 100644
+--- a/server/auth/store_test.go
++++ b/server/auth/store_test.go
+@@ -174,6 +174,24 @@ func TestUserAdd(t *testing.T) {
+ 	require.Truef(t, ok, "user %s should be added but it doesn't exist in rangePermCache", userName)
+ }
+ 
++func TestUserAddWithEmptyPassword(t *testing.T) {
++	as, tearDown := setupAuthStore(t)
++	defer tearDown(t)
++
++	// adding a user without opting into NoPassword and without a password must fail
++	ua := &pb.AuthUserAddRequest{Name: "no-pass-not-opted-in", Options: &authpb.UserAddOptions{NoPassword: false}}
++	_, err := as.UserAdd(ua)
++	require.ErrorIsf(t, err, ErrPasswordEmpty, "expected %v, got %v", ErrPasswordEmpty, err)
++
++	_, ok := as.rangePermCache["no-pass-not-opted-in"]
++	require.Falsef(t, ok, "user should not have been created")
++
++	// explicitly opting into NoPassword must still work
++	ua = &pb.AuthUserAddRequest{Name: "no-pass-opted-in", Options: &authpb.UserAddOptions{NoPassword: true}}
++	_, err = as.UserAdd(ua)
++	require.NoError(t, err)
++}
++
+ func TestRecover(t *testing.T) {
+ 	as, tearDown := setupAuthStore(t)
+ 	defer as.Close()
+@@ -309,6 +327,28 @@ func TestUserChangePassword(t *testing.T) {
+ 	}
+ }
+ 
++func TestUserChangePasswordToEmpty(t *testing.T) {
++	as, tearDown := setupAuthStore(t)
++	defer tearDown(t)
++
++	// changing to a blank password must be rejected for a regular (password-protected) user
++	_, err := as.UserChangePassword(&pb.AuthUserChangePasswordRequest{Name: "foo"})
++	require.ErrorIsf(t, err, ErrPasswordEmpty, "expected %v, got %v", ErrPasswordEmpty, err)
++
++	// the original password must still work
++	ctx := context.WithValue(context.WithValue(t.Context(), AuthenticateParamIndex{}, uint64(1)), AuthenticateParamSimpleTokenPrefix{}, "dummy")
++	_, err = as.Authenticate(ctx, "foo", "bar")
++	require.NoError(t, err)
++
++	// a passwordless account must keep working exactly as before
++	username := "nopass-changepw"
++	_, err = as.UserAdd(&pb.AuthUserAddRequest{Name: username, Options: &authpb.UserAddOptions{NoPassword: true}})
++	require.NoError(t, err)
++
++	_, err = as.UserChangePassword(&pb.AuthUserChangePasswordRequest{Name: username})
++	require.NoError(t, err)
++}
++
+ func TestRoleAdd(t *testing.T) {
+ 	as, tearDown := setupAuthStore(t)
+ 	defer tearDown(t)
+diff --git a/server/etcdserver/api/v3rpc/util.go b/server/etcdserver/api/v3rpc/util.go
+index 3caeec6..0a8053e 100644
+--- a/server/etcdserver/api/v3rpc/util.go
++++ b/server/etcdserver/api/v3rpc/util.go
+@@ -81,6 +81,7 @@ var toGRPCErrorMap = map[error]error{
+ 	auth.ErrRoleNotFound:         rpctypes.ErrGRPCRoleNotFound,
+ 	auth.ErrRoleEmpty:            rpctypes.ErrGRPCRoleEmpty,
+ 	auth.ErrAuthFailed:           rpctypes.ErrGRPCAuthFailed,
++	auth.ErrPasswordEmpty:        rpctypes.ErrGRPCPasswordEmpty,
+ 	auth.ErrPermissionNotGiven:   rpctypes.ErrGRPCPermissionNotGiven,
+ 	auth.ErrPermissionDenied:     rpctypes.ErrGRPCPermissionDenied,
+ 	auth.ErrRoleNotGranted:       rpctypes.ErrGRPCRoleNotGranted,
+diff --git a/server/etcdserver/v3_server.go b/server/etcdserver/v3_server.go
+index a357705..b66a17f 100644
+--- a/server/etcdserver/v3_server.go
++++ b/server/etcdserver/v3_server.go
+@@ -889,6 +889,9 @@ func (s *EtcdServer) Authenticate(ctx context.Context, r *pb.AuthenticateRequest
+ 
+ func (s *EtcdServer) UserAdd(ctx context.Context, r *pb.AuthUserAddRequest) (*pb.AuthUserAddResponse, error) {
+ 	if r.Options == nil || !r.Options.NoPassword {
++		if r.Password == "" {
++			return nil, auth.ErrPasswordEmpty
++		}
+ 		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(r.Password), s.authStore.BcryptCost())
+ 		if err != nil {
+ 			return nil, err
+diff --git a/tests/common/user_test.go b/tests/common/user_test.go
+index dc8e648..439ae74 100644
+--- a/tests/common/user_test.go
++++ b/tests/common/user_test.go
+@@ -51,11 +51,13 @@ func TestUserAdd_Simple(t *testing.T) {
+ 			noPassword: true,
+ 		},
+ 		{
+-			// Can create a user with no password, but not restricted to CN auth
+-			name:       "no_password_without_noPassword_set",
+-			username:   "foo",
+-			password:   "",
+-			noPassword: false,
++			// Creating a user with a blank password must be rejected unless the
++			// account is explicitly opted into passwordless (NoPassword) mode.
++			name:          "no_password_without_noPassword_set",
++			username:      "foo",
++			password:      "",
++			noPassword:    false,
++			expectedError: "password",
+ 		},
+ 		{
+ 			name:     "regular_user_with_password",
+@@ -199,6 +201,10 @@ func TestUserChangePassword(t *testing.T) {
+ 				err = cc.UserChangePass(ctx, user, newPassword)
+ 				require.NoErrorf(t, err, "user password change should succeed")
+ 
++				// Changing a regular (password-protected) user's password to blank must be rejected.
++				err = cc.UserChangePass(ctx, user, "")
++				assert.ErrorContains(t, err, "password")
++
+ 				err = cc.UserChangePass(ctx, "non-existent-user", newPassword)
+ 				assert.ErrorContains(t, err, "user name not found")
+ 			})

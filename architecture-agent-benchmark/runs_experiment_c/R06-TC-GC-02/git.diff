@@ -1,0 +1,351 @@
+diff --git a/server/etcdserver/api/v3rpc/audit.go b/server/etcdserver/api/v3rpc/audit.go
+new file mode 100644
+index 000000000..ca0e4ec2e
+--- /dev/null
++++ b/server/etcdserver/api/v3rpc/audit.go
+@@ -0,0 +1,194 @@
++// Copyright 2025 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package v3rpc
++
++import (
++	"bytes"
++	"context"
++	"strings"
++	"time"
++
++	"go.uber.org/zap"
++	"google.golang.org/grpc"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/server/v3/etcdserver"
++)
++
++// kvServiceMethodPrefix identifies every RPC exposed by the KV service. Any
++// method registered under this prefix -- present today or added in the
++// future -- is subject to audit logging without requiring the handler to be
++// instrumented individually.
++const kvServiceMethodPrefix = "/etcdserverpb.KV/"
++
++// unauthenticatedCaller is recorded as the caller identity when auth is
++// disabled or no identity could be established for the request.
++const unauthenticatedCaller = "unauthenticated"
++
++// maxAuditKeysLogged bounds how many keys/ranges are rendered for a
++// transaction request, so a pathologically large Txn cannot blow up the
++// audit log.
++const maxAuditKeysLogged = 64
++
++// newAuditUnaryInterceptor returns a gRPC unary interceptor that produces a
++// uniform audit record -- caller identity, operation kind, key/range,
++// duration, and outcome -- for every request handled by the KV service. It
++// only observes the request/response and never mutates either, so it has no
++// effect on functional behavior.
++func newAuditUnaryInterceptor(s *etcdserver.EtcdServer) grpc.UnaryServerInterceptor {
++	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
++		if !strings.HasPrefix(info.FullMethod, kvServiceMethodPrefix) {
++			return handler(ctx, req)
++		}
++
++		startTime := time.Now()
++		resp, err := handler(ctx, req)
++
++		if lg := s.Logger(); lg != nil {
++			logAuditRecord(s, lg, ctx, info, req, time.Since(startTime), err)
++		}
++		return resp, err
++	}
++}
++
++func logAuditRecord(s *etcdserver.EtcdServer, lg *zap.Logger, ctx context.Context, info *grpc.UnaryServerInfo, req any, duration time.Duration, opErr error) {
++	caller := unauthenticatedCaller
++	// AuthInfoFromCtx returns (nil, nil) when auth is disabled or the
++	// request carries no token, in which case the caller is reported as
++	// unauthenticated rather than failing the audit record.
++	if authInfo, err := s.AuthInfoFromCtx(ctx); err == nil && authInfo != nil && authInfo.Username != "" {
++		caller = authInfo.Username
++	}
++
++	operation, key, rangeEnd := auditOperationDetails(info.FullMethod, req)
++
++	outcome := "success"
++	if opErr != nil {
++		outcome = "failure"
++	}
++
++	fields := []zap.Field{
++		zap.String("caller", caller),
++		zap.String("operation", operation),
++		zap.ByteString("key", key),
++		zap.Duration("duration", duration),
++		zap.String("outcome", outcome),
++	}
++	if len(rangeEnd) > 0 {
++		fields = append(fields, zap.ByteString("range-end", rangeEnd))
++	}
++	if opErr != nil {
++		fields = append(fields, zap.Error(opErr))
++	}
++
++	lg.Named("audit").Info("kv request", fields...)
++}
++
++// auditOperationDetails derives a human-readable operation kind together
++// with the key or key range affected by the request. It is driven by the
++// gRPC method name and by structural interfaces (GetKey/GetRangeEnd)
++// implemented by generated protobuf types, so newly added KV request types
++// are covered automatically as long as they follow that established
++// convention; unrecognized methods still produce an audit record, just
++// without a mapped operation kind.
++func auditOperationDetails(fullMethod string, req any) (operation string, key, rangeEnd []byte) {
++	method := fullMethod
++	if idx := strings.LastIndex(fullMethod, "/"); idx >= 0 {
++		method = fullMethod[idx+1:]
++	}
++	operation = auditOperationKind(method)
++
++	if txn, ok := req.(*pb.TxnRequest); ok {
++		return operation, auditTxnKeySummary(txn), nil
++	}
++
++	if k, ok := req.(interface{ GetKey() []byte }); ok {
++		key = k.GetKey()
++	}
++	if re, ok := req.(interface{ GetRangeEnd() []byte }); ok {
++		rangeEnd = re.GetRangeEnd()
++	}
++	return operation, key, rangeEnd
++}
++
++func auditOperationKind(method string) string {
++	switch method {
++	case "Range", "RangeStream":
++		return "read"
++	case "Put":
++		return "write"
++	case "DeleteRange":
++		return "delete"
++	case "Txn":
++		return "transaction"
++	case "Compact":
++		return "compact"
++	default:
++		// Any future KV method not yet mapped to a canonical kind is
++		// still audited, identified by its raw method name.
++		return strings.ToLower(method)
++	}
++}
++
++// auditTxnKeySummary walks every compare and request op in a (possibly
++// nested) transaction and renders the keys/ranges it touches.
++func auditTxnKeySummary(txn *pb.TxnRequest) []byte {
++	var keys [][]byte
++
++	var collect func(t *pb.TxnRequest)
++	collect = func(t *pb.TxnRequest) {
++		for _, c := range t.GetCompare() {
++			if len(keys) >= maxAuditKeysLogged {
++				return
++			}
++			keys = append(keys, auditRangeKey(c.GetKey(), c.GetRangeEnd()))
++		}
++		for _, ops := range [][]*pb.RequestOp{t.GetSuccess(), t.GetFailure()} {
++			for _, op := range ops {
++				if len(keys) >= maxAuditKeysLogged {
++					return
++				}
++				switch o := op.GetRequest().(type) {
++				case *pb.RequestOp_RequestRange:
++					keys = append(keys, auditRangeKey(o.RequestRange.GetKey(), o.RequestRange.GetRangeEnd()))
++				case *pb.RequestOp_RequestPut:
++					keys = append(keys, o.RequestPut.GetKey())
++				case *pb.RequestOp_RequestDeleteRange:
++					keys = append(keys, auditRangeKey(o.RequestDeleteRange.GetKey(), o.RequestDeleteRange.GetRangeEnd()))
++				case *pb.RequestOp_RequestTxn:
++					collect(o.RequestTxn)
++				}
++			}
++		}
++	}
++	collect(txn)
++
++	summary := bytes.Join(keys, []byte(","))
++	if len(keys) >= maxAuditKeysLogged {
++		summary = append(summary, []byte(",...(truncated)")...)
++	}
++	return summary
++}
++
++func auditRangeKey(key, rangeEnd []byte) []byte {
++	if len(rangeEnd) == 0 {
++		return key
++	}
++	out := make([]byte, 0, len(key)+len(rangeEnd)+1)
++	out = append(out, key...)
++	out = append(out, '-')
++	out = append(out, rangeEnd...)
++	return out
++}
+diff --git a/server/etcdserver/api/v3rpc/audit_test.go b/server/etcdserver/api/v3rpc/audit_test.go
+new file mode 100644
+index 000000000..8bb7d3799
+--- /dev/null
++++ b/server/etcdserver/api/v3rpc/audit_test.go
+@@ -0,0 +1,133 @@
++// Copyright 2025 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package v3rpc
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++)
++
++func TestAuditOperationDetails(t *testing.T) {
++	tests := []struct {
++		name          string
++		fullMethod    string
++		req           any
++		wantOperation string
++		wantKey       string
++		wantRangeEnd  string
++	}{
++		{
++			name:          "range is a read",
++			fullMethod:    "/etcdserverpb.KV/Range",
++			req:           &pb.RangeRequest{Key: []byte("a"), RangeEnd: []byte("z")},
++			wantOperation: "read",
++			wantKey:       "a",
++			wantRangeEnd:  "z",
++		},
++		{
++			name:          "put is a write",
++			fullMethod:    "/etcdserverpb.KV/Put",
++			req:           &pb.PutRequest{Key: []byte("foo"), Value: []byte("bar")},
++			wantOperation: "write",
++			wantKey:       "foo",
++		},
++		{
++			name:          "delete range is a delete",
++			fullMethod:    "/etcdserverpb.KV/DeleteRange",
++			req:           &pb.DeleteRangeRequest{Key: []byte("foo"), RangeEnd: []byte("fop")},
++			wantOperation: "delete",
++			wantKey:       "foo",
++			wantRangeEnd:  "fop",
++		},
++		{
++			name:          "compact has no key",
++			fullMethod:    "/etcdserverpb.KV/Compact",
++			req:           &pb.CompactionRequest{Revision: 5},
++			wantOperation: "compact",
++		},
++		{
++			name:       "unmapped future method is still audited",
++			fullMethod: "/etcdserverpb.KV/SomeNewMethod",
++			req:        &pb.PutRequest{Key: []byte("foo")},
++			// falls back to the lowercased method name rather than being dropped
++			wantOperation: "somenewmethod",
++			wantKey:       "foo",
++		},
++		{
++			name:       "txn summarizes keys across success and failure branches",
++			fullMethod: "/etcdserverpb.KV/Txn",
++			req: &pb.TxnRequest{
++				Compare: []*pb.Compare{{Key: []byte("c1")}},
++				Success: []*pb.RequestOp{
++					{Request: &pb.RequestOp_RequestPut{RequestPut: &pb.PutRequest{Key: []byte("s1")}}},
++				},
++				Failure: []*pb.RequestOp{
++					{Request: &pb.RequestOp_RequestDeleteRange{RequestDeleteRange: &pb.DeleteRangeRequest{Key: []byte("f1"), RangeEnd: []byte("f2")}}},
++				},
++			},
++			wantOperation: "transaction",
++			wantKey:       "c1,s1,f1-f2",
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			operation, key, rangeEnd := auditOperationDetails(tt.fullMethod, tt.req)
++			assert.Equal(t, tt.wantOperation, operation)
++			assert.Equal(t, tt.wantKey, string(key))
++			assert.Equal(t, tt.wantRangeEnd, string(rangeEnd))
++		})
++	}
++}
++
++func TestAuditTxnKeySummaryNested(t *testing.T) {
++	nested := &pb.TxnRequest{
++		Success: []*pb.RequestOp{
++			{Request: &pb.RequestOp_RequestPut{RequestPut: &pb.PutRequest{Key: []byte("inner")}}},
++		},
++	}
++	outer := &pb.TxnRequest{
++		Success: []*pb.RequestOp{
++			{Request: &pb.RequestOp_RequestTxn{RequestTxn: nested}},
++		},
++	}
++
++	assert.Equal(t, "inner", string(auditTxnKeySummary(outer)))
++}
++
++func TestAuditTxnKeySummaryTruncatesLargeTxns(t *testing.T) {
++	txn := &pb.TxnRequest{}
++	for i := 0; i < maxAuditKeysLogged+10; i++ {
++		txn.Success = append(txn.Success, &pb.RequestOp{
++			Request: &pb.RequestOp_RequestPut{RequestPut: &pb.PutRequest{Key: []byte("k")}},
++		})
++	}
++
++	summary := string(auditTxnKeySummary(txn))
++	assert.Contains(t, summary, "...(truncated)")
++}
++
++func TestNonKVMethodsAreNotAudited(t *testing.T) {
++	operation, key, rangeEnd := auditOperationDetails("/etcdserverpb.Lease/LeaseGrant", &pb.LeaseGrantRequest{})
++	// auditOperationDetails itself has no service-prefix guard (that lives in
++	// the interceptor), but it should still degrade gracefully for methods
++	// with no key-shaped fields instead of panicking.
++	assert.Equal(t, "leasegrant", operation)
++	assert.Empty(t, key)
++	assert.Empty(t, rangeEnd)
++}
+diff --git a/server/etcdserver/api/v3rpc/grpc.go b/server/etcdserver/api/v3rpc/grpc.go
+index 91863e294..a462896c5 100644
+--- a/server/etcdserver/api/v3rpc/grpc.go
++++ b/server/etcdserver/api/v3rpc/grpc.go
+@@ -52,6 +52,7 @@ func Server(s *etcdserver.EtcdServer, tls *tls.Config, interceptor grpc.UnarySer
+ 
+ 	chainUnaryInterceptors := []grpc.UnaryServerInterceptor{
+ 		newLogUnaryInterceptor(s),
++		newAuditUnaryInterceptor(s),
+ 		serverMetrics.UnaryServerInterceptor(),
+ 		newUnaryInterceptor(s),
+ 	}

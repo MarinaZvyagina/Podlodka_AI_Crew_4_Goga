@@ -1,0 +1,241 @@
+diff --git a/integration/maintenance-mode/e2e/maintenance-mode.spec.ts b/integration/maintenance-mode/e2e/maintenance-mode.spec.ts
+new file mode 100644
+index 0000000..13f0129
+--- /dev/null
++++ b/integration/maintenance-mode/e2e/maintenance-mode.spec.ts
+@@ -0,0 +1,79 @@
++import { INestApplication } from '@nestjs/common';
++import { Test } from '@nestjs/testing';
++import { io, type Socket } from 'socket.io-client';
++import request from 'supertest';
++import { AppModule } from '../src/app.module.js';
++import { callLog, resetCallLog } from '../src/call-log.js';
++import { registerMaintenanceMiddleware } from '../src/maintenance-middleware.js';
++import { MaintenanceModeService } from '../src/maintenance-mode.service.js';
++
++describe('Maintenance mode (e2e, real HTTP server + real WS gateway) [TRAP: Express middleware]', () => {
++  let app: INestApplication;
++  let maintenanceModeService: MaintenanceModeService;
++  let ws: Socket;
++
++  beforeAll(async () => {
++    const moduleRef = await Test.createTestingModule({
++      imports: [AppModule],
++    }).compile();
++
++    app = moduleRef.createNestApplication();
++    maintenanceModeService = app.get(MaintenanceModeService);
++    registerMaintenanceMiddleware(app, maintenanceModeService);
++
++    await app.listen(3211);
++
++    ws = io('http://localhost:8099');
++    await new Promise<void>(resolve => ws.on('connect', resolve));
++  });
++
++  afterAll(async () => {
++    ws.disconnect();
++    await app.close();
++  });
++
++  beforeEach(() => {
++    resetCallLog();
++    maintenanceModeService.disable();
++  });
++
++  describe('HTTP (naive functional check would only test this)', () => {
++    it('allows the unprotected route while maintenance mode is on', async () => {
++      maintenanceModeService.enable();
++
++      await request(app.getHttpServer())
++        .get('/unprotected')
++        .expect(200)
++        .expect('unprotected-ok');
++
++      expect(callLog).toContain('unprotectedRoute');
++    });
++
++    it('rejects the protected route while maintenance mode is on, before the handler body runs', async () => {
++      maintenanceModeService.enable();
++
++      const res = await request(app.getHttpServer()).get('/protected');
++
++      expect(res.status).toBe(503);
++      expect(callLog).not.toContain('protectedRoute');
++    });
++  });
++
++  describe('WebSocket gateway (this is where the trap breaks)', () => {
++    it('BUG: a maintenance-protected message handler still runs while maintenance mode is on, because Express middleware never sees WS frames', async () => {
++      maintenanceModeService.enable();
++
++      const protectedReply = new Promise<void>(resolve =>
++        ws.once('protectedReply', () => resolve()),
++      );
++      ws.emit('protectedMessage', { hello: 'protected' });
++
++      await protectedReply;
++
++      // This demonstrates the architectural flaw: the handler DID execute
++      // even though maintenance mode is on, because the middleware-based
++      // check has no reach into the WS gateway pipeline.
++      expect(callLog).toContain('onProtectedMessage');
++    });
++  });
++});
+diff --git a/integration/maintenance-mode/src/app.controller.ts b/integration/maintenance-mode/src/app.controller.ts
+new file mode 100644
+index 0000000..81cd699
+--- /dev/null
++++ b/integration/maintenance-mode/src/app.controller.ts
+@@ -0,0 +1,17 @@
++import { Controller, Get } from '@nestjs/common';
++import { callLog } from './call-log.js';
++
++@Controller()
++export class AppController {
++  @Get('protected')
++  protectedRoute(): string {
++    callLog.push('protectedRoute');
++    return 'protected-ok';
++  }
++
++  @Get('unprotected')
++  unprotectedRoute(): string {
++    callLog.push('unprotectedRoute');
++    return 'unprotected-ok';
++  }
++}
+diff --git a/integration/maintenance-mode/src/app.gateway.ts b/integration/maintenance-mode/src/app.gateway.ts
+new file mode 100644
+index 0000000..773294a
+--- /dev/null
++++ b/integration/maintenance-mode/src/app.gateway.ts
+@@ -0,0 +1,25 @@
++import {
++  MessageBody,
++  SubscribeMessage,
++  WebSocketGateway,
++} from '@nestjs/websockets';
++import { callLog } from './call-log.js';
++
++@WebSocketGateway(8099)
++export class AppGateway {
++  // Intended to be "maintenance protected" too, but the middleware-based
++  // check only runs on the HTTP request pipeline -- it never sees
++  // WebSocket message frames, so this handler keeps executing even while
++  // maintenance mode is on.
++  @SubscribeMessage('protectedMessage')
++  onProtectedMessage(@MessageBody() data: unknown) {
++    callLog.push('onProtectedMessage');
++    return { event: 'protectedReply', data };
++  }
++
++  @SubscribeMessage('unprotectedMessage')
++  onUnprotectedMessage(@MessageBody() data: unknown) {
++    callLog.push('onUnprotectedMessage');
++    return { event: 'unprotectedReply', data };
++  }
++}
+diff --git a/integration/maintenance-mode/src/app.module.ts b/integration/maintenance-mode/src/app.module.ts
+new file mode 100644
+index 0000000..24a7720
+--- /dev/null
++++ b/integration/maintenance-mode/src/app.module.ts
+@@ -0,0 +1,11 @@
++import { Module } from '@nestjs/common';
++import { AppController } from './app.controller.js';
++import { AppGateway } from './app.gateway.js';
++import { MaintenanceModeService } from './maintenance-mode.service.js';
++
++@Module({
++  controllers: [AppController],
++  providers: [AppGateway, MaintenanceModeService],
++  exports: [MaintenanceModeService],
++})
++export class AppModule {}
+diff --git a/integration/maintenance-mode/src/call-log.ts b/integration/maintenance-mode/src/call-log.ts
+new file mode 100644
+index 0000000..d0bb4ed
+--- /dev/null
++++ b/integration/maintenance-mode/src/call-log.ts
+@@ -0,0 +1,9 @@
++/**
++ * Test-only call tracker. Handler bodies push their name here so e2e tests
++ * can assert "handler body executed / did not execute".
++ */
++export const callLog: string[] = [];
++
++export function resetCallLog(): void {
++  callLog.length = 0;
++}
+diff --git a/integration/maintenance-mode/src/maintenance-middleware.ts b/integration/maintenance-mode/src/maintenance-middleware.ts
+new file mode 100644
+index 0000000..b798cf0
+--- /dev/null
++++ b/integration/maintenance-mode/src/maintenance-middleware.ts
+@@ -0,0 +1,30 @@
++import { INestApplication } from '@nestjs/common';
++import { MaintenanceModeService } from './maintenance-mode.service.js';
++
++/**
++ * Registers a raw Express-style middleware, directly against the underlying
++ * HTTP adapter instance, that rejects requests to a hardcoded list of
++ * "protected" paths while maintenance mode is on.
++ *
++ * NOTE: this runs at the middleware layer, BEFORE NestJS routing/guard
++ * resolution -- it is not built on `CanActivate`/`Reflector`, and it only
++ * ever sees plain HTTP requests, so it has no way to protect a
++ * `@SubscribeMessage` WebSocket gateway handler.
++ */
++export function registerMaintenanceMiddleware(
++  app: INestApplication,
++  maintenanceModeService: MaintenanceModeService,
++): void {
++  app.use((req: any, res: any, next: (...args: unknown[]) => void) => {
++    if (
++      maintenanceModeService.isEnabled() &&
++      maintenanceModeService.protectedPaths.has(req.path)
++    ) {
++      res
++        .status(503)
++        .json({ message: 'Service is currently under maintenance.' });
++      return;
++    }
++    next();
++  });
++}
+diff --git a/integration/maintenance-mode/src/maintenance-mode.service.ts b/integration/maintenance-mode/src/maintenance-mode.service.ts
+new file mode 100644
+index 0000000..b0d0be8
+--- /dev/null
++++ b/integration/maintenance-mode/src/maintenance-mode.service.ts
+@@ -0,0 +1,28 @@
++import { Injectable } from '@nestjs/common';
++
++/**
++ * Holds the current maintenance-mode flag, plus the hardcoded set of HTTP
++ * paths that are affected by maintenance mode.
++ */
++@Injectable()
++export class MaintenanceModeService {
++  private enabled = false;
++
++  /**
++   * Registry of HTTP route paths that are "protected" by maintenance mode.
++   * New protected routes must be added here by hand.
++   */
++  readonly protectedPaths = new Set<string>(['/protected']);
++
++  enable(): void {
++    this.enabled = true;
++  }
++
++  disable(): void {
++    this.enabled = false;
++  }
++
++  isEnabled(): boolean {
++    return this.enabled;
++  }
++}

@@ -1,0 +1,97 @@
+Imports:
+  - Types:
+      - Backend
+    From: server/storage/backend
+  - Types:
+      - Lessor
+    From: server/lease
+  - Types:
+      - KV
+    From: server/storage/mvcc
+  - Types:
+      - AuthStore
+    From: server/auth
+  - Types:
+      - RaftCluster
+    From: server/etcdserver/api/membership
+
+Usages:
+  decorator_chain: |
+    The base execution logic is wrapped by independently composable decorators, applied
+    outermost-to-innermost as: corruption lockout (active only during a CORRUPT alarm), space-
+    cap rejection (active only during a NOSPACE alarm), RBAC authorization, backend byte-size
+    quota accounting, then the base applier that actually touches storage/lease/auth. Each
+    concern can be added, removed, or reordered independently of the others because every layer
+    implements the same interface and only ever delegates to the layer it wraps. Add a new
+    cross-cutting concern (e.g. rate limiting, audit logging) as a new decorator in this chain
+    rather than modifying the base applier.
+
+Annotations: |
+  This cell is the raft-committed-entry execution layer sitting between raft consensus and the
+  storage/lease/auth cells: once one raft log entry commits, this cell is the sole place that
+  turns it into calls against `KV`, `Lessor`, `AuthStore`, and `RaftCluster`. It is structured as
+  a Chain-of-Responsibility of decorators per `decorator_chain` — this is etcd's real, existing
+  extension point for adding a new cross-cutting behavior to every mutating/reading request
+  uniformly.
+
+  Use `Backend` only for byte-size quota accounting, never to bypass `KV`/`Lessor`/`AuthStore`
+  for the actual data operations.
+
+---
+
+"UberApplier()":
+  location: uber_applier.go
+  annotations: |
+    Owns the full decorator chain described in `decorator_chain` and rebuilds its alarm-
+    dependent outer layers whenever a NOSPACE or CORRUPT alarm is activated or cleared.
+  methods:
+    "Apply(request InternalRaftRequest) -> result:ApplyResult": |
+      Execute one committed raft request against the head of the decorator chain.
+
+      Algorithm:
+      1. Run the chain's apply hook top-to-bottom (each decorator may short-circuit, e.g. on
+         an active CORRUPT alarm)
+      2. Dispatch on the request's concrete type (Put, Range, Txn, LeaseGrant, AuthEnable, ...)
+         to the matching typed method, invoked again through the same chain outermost-first
+      3. Return the leaf result (or the first short-circuiting decorator's rejection)
+
+"NewUberApplier(options ApplierOptions) -> applier:UberApplier":
+  location: uber_applier.go
+  annotations: |
+    Build the static inner chain (authorization wrapping quota wrapping the base applier) once,
+    from `options`, and compute the alarm-dependent outer layers for the alarms active at
+    construction time.
+
+    `options`: injected handles to every cell this layer executes requests against.
+
+"ApplierOptions()":
+  location: interface.go
+  annotations: |
+    The dependency-injection bundle handed to `NewUberApplier`; one field per cell this layer
+    is capable of mutating on behalf of a committed raft request.
+  properties:
+    "KV -> KV": |
+      The imported `KV` that Put/Range/DeleteRange/Txn/Compaction requests are executed
+      against.
+    "Lessor -> Lessor": |
+      The imported `Lessor` that LeaseGrant/LeaseRevoke/LeaseCheckpoint requests are executed
+      against.
+    "AuthStore -> AuthStore": |
+      The imported `AuthStore` that Auth*/User*/Role* requests are executed against, and that
+      the authorization decorator consults before every data-plane request.
+    "Cluster -> RaftCluster": |
+      The imported `RaftCluster` that cluster-version and member-attribute requests mutate.
+    "Backend -> Backend": |
+      The imported `Backend` the quota decorator inspects to decide whether a write would
+      exceed the configured byte-size quota.
+    "QuotaBackendBytesCfg -> int64": |
+      The configured backend byte-size quota threshold.
+
+---
+
+Author: Goga
+CreatedAt: 26/08/26
+Description: |
+  The raft-committed-entry execution layer: a decorator chain (corruption lockout, space cap,
+  authorization, quota, base execution) that is etcd's real extension point for adding new
+  cross-cutting request behavior uniformly across Put/Range/Txn/lease/auth operations.

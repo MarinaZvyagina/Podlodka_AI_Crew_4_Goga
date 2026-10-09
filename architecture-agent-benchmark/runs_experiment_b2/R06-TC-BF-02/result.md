@@ -1,0 +1,105 @@
+# R06-TC-BF-02
+
+Condition: goga_forced_workflow
+Functional success: False
+Full architecture conformance: False
+ACR: 0.4
+Dangerous success: False
+Goga engagement signal: False
+Cost: $1.4404664999999996
+Duration: 275261ms, turns: 46
+
+## Agent's own summary
+
+Confirmed exactly as hypothesized: read-only `Txn` bypasses raft/`UberApplier` via `s.doSerialize()` too. Now producing the trace report.
+
+# Trace Report
+
+## Call Flow
+```
+gRPC client
+ └─ grpc.Server (server/etcdserver/api/v3rpc/grpc.go:Server())
+     ├─ chainUnaryInterceptors: [newLogUnaryInterceptor, serverMetrics.UnaryServerInterceptor, newUnaryInterceptor]  (interceptor.go)
+     ├─ chainStreamInterceptors: [serverMetrics.StreamServerInterceptor, newStreamInterceptor]
+     └─ pb.RegisterKVServer(grpcServer, NewQuotaKVServer(s))
+          └─ quotaKVServer{ NewKVServer(s), quotaAlarmer }        (quota.go)
+               └─ kvServer{ hdr, kv: s (RaftKV), aa, maxTxnOps }  (key.go)
+
+kvServer.Range(ctx, r)          → s.kv.Range(ctx, r)              → EtcdServer.Range          (v3_server.go:106)
+kvServer.RangeStream(r, rs)     → s.kv.RangeStream(r, wrapped rs) → EtcdServer.RangeStream     (v3_server.go:157)
+kvServer.Put(ctx, r)            → s.kv.Put(ctx, r)                → EtcdServer.Put             (v3_server.go:295)
+kvServer.DeleteRange(ctx, r)    → s.kv.DeleteRange(ctx, r)        → EtcdServer.DeleteRange     (v3_server.go:310)
+kvServer.Txn(ctx, r)            → s.kv.Txn(ctx, r)                → EtcdServer.Txn             (v3_server.go:325)
+
+EtcdServer.Range / RangeStream / read-only-Txn:
+  → s.doSerialize(ctx, chk, get) → get() → txn.Range/txn.Txn(..., s.KV(), ...)   [NEVER touches s.raftRequest / UberApplier]
+
+EtcdServer.Put / DeleteRange / write-Txn:
+  → s.raftRequest(ctx, &pb.InternalRaftRequest{...})
+     → s.processInternalRaftRequestOnce(ctx, r)
+        → raft commit → s.uberApplier.Apply(...) → apply.UberApplier decorator chain (corrupt → capped → auth → quota → base) → dispatch() → applyV3.Put/DeleteRange/Txn
+```
+
+## Data Flow
+- **Identity**: gRPC metadata (bearer token, `rpctypes.TokenFieldNameGRPC`) → `EtcdServer.AuthInfoFromCtx(ctx)` → `AuthStore.AuthInfoFromCtx(ctx)` → `*auth.AuthInfo{Username, Revision}` or `(nil, nil)` when auth disabled/no token. This call is side-effect-free and already invoked independently multiple times per request elsewhere (`v3_server.go:580,612,757,1036,1072`), so a new caller does not change existing behavior.
+- **Key/range**: carried on the request struct itself (`RangeRequest.Key/RangeEnd`, `PutRequest.Key`, `DeleteRangeRequest.Key/RangeEnd`); `TxnRequest` carries no single key — keys live inside `Compare`/`Success`/`Failure` sub-ops (already extracted today only for tracing via `firstCompareKey`/`firstOpKey` helpers in `v3_server.go`).
+- **Duration/outcome**: today computed independently and repeatedly at multiple layers (`newLogUnaryInterceptor` in interceptor.go; `txn.WarnOfExpensiveRequest`/`WarnOfExpensiveReadOnlyRangeRequest`/`WarnOfExpensiveReadOnlyTxnRequest` in v3_server.go and uber_applier.go dispatch). No existing single record combines identity + op-kind + key + duration + outcome in one place.
+
+## Manifest Algorithm Mapping
+- `server/etcdserver/apply/CODEMANIFEST` → `decorator_chain` usage: describes the corrupt→capped→auth→quota→base chain and names "audit logging" as an example new decorator. Code mapping confirms this chain executes only for requests reaching `dispatch()` inside `uber_applier.go`, i.e. only requests that went through `s.raftRequest()`. Trace confirms `Range`, `RangeStream`, and read-only `Txn` never reach this function — manifest guidance, if followed literally, produces incomplete coverage.
+- `server/etcdserver/api/v3rpc/CODEMANIFEST` (to be read at Planning step) — no existing algorithm documents a per-KV-request audit trail; `NewQuotaKVServer`'s decorator (`quotaKVServer`) is the only precedent for a cross-cutting concern wrapping the KV service surface, and it only overrides `Put`/`Txn` (not `Range`), so it is not itself a template for "every request type."
+
+## Cross-Cell Traversals
+
+| Source Cell | Target Cell | Type | Path |
+|---|---|---|---|
+| `server/etcdserver/api/v3rpc` | `server/etcdserver` | call | `kvServer.{Range,RangeStream,Put,DeleteRange,Txn}` → `EtcdServer.*` (via `RaftKV`/`etcdserver.Server` interfaces) |
+| `server/etcdserver/api/v3rpc` | `server/etcdserver` | call (planned) | new interceptor will call `EtcdServer.AuthInfoFromCtx(ctx)` and `EtcdServer.Logger()` — both already-exported members of the existing `Imports: EtcdServer` from `server/etcdserver` |
+| `server/etcdserver` | `server/etcdserver/apply` | call | `s.raftRequest` → `UberApplier.Apply` — writes only, confirmed not traversed by reads |
+| `server/etcdserver` | `server/storage/mvcc` | call | `s.KV().Range/...` — direct read path, bypasses `apply` cell entirely |
+
+## Inconsistencies
+
+| Type | Location | Expected | Actual |
+|---|---|---|---|
+| manifest description not matching code | `server/etcdserver/apply/CODEMANIFEST` `decorator_chain` usage | Implies this chain is "etcd's real extension point for adding new cross-cutting behavior... uniformly across Put/Range/Txn" | `Range` and read-only `Txn` never enter this chain (verified: `v3_server.go:106,352`) — the chain only sees `Range` when nested inside a *write* `Txn`'s compare/success ops applied via raft, never for a standalone client `Range`/read-only-`Txn` RPC |
+
+This inconsistency will be flagged for manifest correction (wording fix only, scoped to `decorator_chain` usage text) during Manifest Reconciliation — not treated as a code bug, since the apply chain's actual behavior for writes is correct and unchanged.
+
+## Trace Graph
+```
+                    ┌───────────────────────────────────────────┐
+                    │      grpc.Server (v3rpc/grpc.go)           │
+                    │  unary/stream interceptor chain            │
+                    │  ★ new audit interceptor added HERE ★      │
+                    └───────────────┬─────────────────────────────┘
+                                     │  wraps ALL KV-service RPCs uniformly
+                    ┌────────────────▼────────────────┐
+                    │  quotaKVServer → kvServer         │
+                    └───┬──────┬───────┬───────┬────────┘
+                Range/RangeStream Put DeleteRange  Txn
+                        │        │       │         │
+               ┌────────▼──┐  ┌──▼───────▼─┐   ┌───▼────────────┐
+               │ doSerialize│  │ raftRequest │   │ readOnly?       │
+               │ → s.KV()   │  │ → apply.    │   │ yes→doSerialize │
+               │ (bypasses  │  │  UberApplier│   │ no →raftRequest │
+               │  apply)    │  │  decorator  │   └─────────────────┘
+               └────────────┘  │  chain      │
+                                └─────────────┘
+```
+
+## Confirmed Root Cause (of the coverage gap that motivates this change)
+No layer today records a unified audit trail because request handling forks into two structurally different paths immediately below the gRPC KV service surface — a direct local-read path (`doSerialize`/`s.KV()`) and a raft-commit path (`raftRequest`/`UberApplier`) — and every existing cross-cutting mechanism (quota, apply decorators, `WarnOfExpensive*`) was added to only one fork at a time. The only point structurally guaranteed to see both forks, for both current and any future KV RPC, is the gRPC interceptor layer in `server/etcdserver/api/v3rpc`, because it sits above the fork.
+
+## Confidence Level
+**HIGH** — every claim above is backed by direct code reads (`v3_server.go`, `uber_applier.go`, `grpc.go`, `interceptor.go`, `quota.go`, `key.go`, `txn.go`, `store.go`), not inference. The fork point (`doSerialize` vs `raftRequest`) is unambiguous and consistently confirmed across `Range`, `RangeStream`, and readonly-`Txn`.
+
+## Breaking Change Assessment
+1. Will existing function call with same arguments produce different behavior? **NO** — new interceptor only wraps `handler(ctx, req)`; return value passed through unmodified.
+2. Will existing file paths change? **NO** — new file added (`server/etcdserver/api/v3rpc/audit.go` or similar); no existing file moved/renamed.
+3. Will output format change? **NO** — gRPC response messages are untouched; audit output is a new, separate log line, not part of any RPC response.
+4. Will return value semantics change? **NO** — identical `(resp, err)` / stream error returned to gRPC runtime.
+5. Will manifest-defined guarantees be altered? **NO** for `v3rpc`'s existing documented behavior (nothing currently documents audit logging there, so nothing is invalidated); the only manifest text touched is `apply/CODEMANIFEST`'s `decorator_chain` usage, and only to correct its scope description — not a change to `apply`'s actual contract or algorithm.
+6. Will existing tests break? **NO** expected — no existing test asserts on interceptor ordering count, log call count, or absence of an "audit" log entry; will be verified empirically at Testing step by running the v3rpc package tests.
+
+No YES answers → not a breaking change → pipeline continues.

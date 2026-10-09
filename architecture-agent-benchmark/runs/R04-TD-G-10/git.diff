@@ -1,0 +1,321 @@
+diff --git a/packages/excalidraw/actions/actionSnapToGrid.test.tsx b/packages/excalidraw/actions/actionSnapToGrid.test.tsx
+new file mode 100644
+index 0000000..1a92a26
+--- /dev/null
++++ b/packages/excalidraw/actions/actionSnapToGrid.test.tsx
+@@ -0,0 +1,134 @@
++import { pointFrom } from "@excalidraw/math";
++
++import { Excalidraw } from "../index";
++import { API } from "../tests/helpers/api";
++import { Keyboard, UI } from "../tests/helpers/ui";
++import { render } from "../tests/test-utils";
++
++import { actionSnapToGrid } from "./actionSnapToGrid";
++
++const { h } = window;
++
++describe("snap to grid action", () => {
++  it("snaps position and size of the selected element to the grid", async () => {
++    await render(
++      <Excalidraw
++        initialData={{ elements: [] }}
++        handleKeyboardGlobally={true}
++      />,
++    );
++
++    const rect = API.createElement({
++      type: "rectangle",
++      x: 11,
++      y: 22,
++      width: 33,
++      height: 44,
++    });
++    API.setElements([rect]);
++    API.setSelectedElements([rect]);
++
++    API.executeAction(actionSnapToGrid);
++
++    const el = h.elements.find((el) => el.id === rect.id)!;
++    expect(el.x % h.state.gridSize).toBe(0);
++    expect(el.y % h.state.gridSize).toBe(0);
++    expect(el.width % h.state.gridSize).toBe(0);
++    expect(el.height % h.state.gridSize).toBe(0);
++  });
++
++  it("applies to every shape when nothing is selected, snapping each independently", async () => {
++    await render(
++      <Excalidraw
++        initialData={{ elements: [] }}
++        handleKeyboardGlobally={true}
++      />,
++    );
++
++    const rect1 = API.createElement({
++      type: "rectangle",
++      x: 11,
++      y: 22,
++      width: 33,
++      height: 44,
++    });
++    const rect2 = API.createElement({
++      type: "rectangle",
++      x: 108,
++      y: 130,
++      width: 15,
++      height: 15,
++    });
++    API.setElements([rect1, rect2]);
++    API.setSelectedElements([]);
++
++    API.executeAction(actionSnapToGrid);
++
++    const el1 = h.elements.find((el) => el.id === rect1.id)!;
++    const el2 = h.elements.find((el) => el.id === rect2.id)!;
++
++    expect(el1.x % h.state.gridSize).toBe(0);
++    expect(el1.y % h.state.gridSize).toBe(0);
++    expect(el2.x % h.state.gridSize).toBe(0);
++    expect(el2.y % h.state.gridSize).toBe(0);
++
++    // each shape snapped independently, not as a single group: the two
++    // shapes' relative offset (originally 97,108, not a multiple of the
++    // grid) should change once each shape rounds to its own nearest line
++    expect([el2.x - el1.x, el2.y - el1.y]).not.toEqual([97, 108]);
++  });
++
++  it("undoes the snap in a single step", async () => {
++    await render(
++      <Excalidraw
++        initialData={{ elements: [] }}
++        handleKeyboardGlobally={true}
++      />,
++    );
++
++    const rect = UI.createElement("rectangle", {
++      x: 11,
++      y: 22,
++      width: 33,
++      height: 44,
++    });
++
++    API.executeAction(actionSnapToGrid);
++
++    const snapped = h.elements.find((el) => el.id === rect.id)!;
++    expect(snapped.x).not.toBe(11);
++
++    Keyboard.undo();
++
++    const reverted = h.elements.find((el) => el.id === rect.id)!;
++    expect(reverted.x).toBe(11);
++    expect(reverted.y).toBe(22);
++    expect(reverted.width).toBe(33);
++    expect(reverted.height).toBe(44);
++  });
++
++  it("leaves a perfectly horizontal line's zero height untouched", async () => {
++    await render(
++      <Excalidraw
++        initialData={{ elements: [] }}
++        handleKeyboardGlobally={true}
++      />,
++    );
++
++    const line = API.createElement({
++      type: "line",
++      x: 11,
++      y: 22,
++      width: 33,
++      height: 0,
++      points: [pointFrom(0, 0), pointFrom(33, 0)],
++    });
++    API.setElements([line]);
++    API.setSelectedElements([line]);
++
++    API.executeAction(actionSnapToGrid);
++
++    const el = h.elements.find((el) => el.id === line.id)!;
++    expect(el.height).toBe(0);
++  });
++});
+diff --git a/packages/excalidraw/actions/actionSnapToGrid.ts b/packages/excalidraw/actions/actionSnapToGrid.ts
+new file mode 100644
+index 0000000..0e71b5f
+--- /dev/null
++++ b/packages/excalidraw/actions/actionSnapToGrid.ts
+@@ -0,0 +1,109 @@
++import { getGridPoint } from "@excalidraw/common";
++
++import {
++  CaptureUpdateAction,
++  getBoundTextElement,
++  getNonDeletedElements,
++  isBoundToContainer,
++  resizeSingleElement,
++  updateBoundElements,
++} from "@excalidraw/element";
++
++import type {
++  ExcalidrawElement,
++  NonDeletedExcalidrawElement,
++} from "@excalidraw/element/types";
++
++import { getSelectedElements } from "../scene";
++
++import { gridIcon } from "../components/icons";
++
++import { register } from "./register";
++
++import type { AppClassProperties, AppState, NullableGridSize } from "../types";
++
++const snapElementsToGrid = (
++  elements: readonly ExcalidrawElement[],
++  appState: Readonly<AppState>,
++  app: AppClassProperties,
++): readonly ExcalidrawElement[] => {
++  const gridSize = appState.gridSize as NullableGridSize;
++  if (!gridSize) {
++    return elements;
++  }
++
++  const nonDeletedElements = getNonDeletedElements(elements);
++  const selectedElements = getSelectedElements(nonDeletedElements, appState);
++
++  // each shape snaps independently based on its own position/size, so we
++  // never treat the selection as a single group
++  const targets = (
++    selectedElements.length ? selectedElements : nonDeletedElements
++  ).filter((element) => !element.locked && !isBoundToContainer(element));
++
++  const elementsMap = app.scene.getNonDeletedElementsMap();
++
++  // snap size first so the position snap below has the final say on where
++  // the (now grid-sized) top-left corner ends up
++  targets.forEach((element) => {
++    const nextWidth = getSnappedDimension(element.width, gridSize);
++    const nextHeight = getSnappedDimension(element.height, gridSize);
++
++    if (nextWidth !== element.width || nextHeight !== element.height) {
++      resizeSingleElement(
++        nextWidth,
++        nextHeight,
++        element,
++        element,
++        elementsMap,
++        app.scene,
++        "nw",
++      );
++    }
++  });
++
++  targets.forEach((element) => {
++    const [nextX, nextY] = getGridPoint(element.x, element.y, gridSize);
++    if (nextX === element.x && nextY === element.y) {
++      return;
++    }
++
++    const dx = nextX - element.x;
++    const dy = nextY - element.y;
++
++    app.scene.mutateElement(element, { x: nextX, y: nextY });
++
++    const boundTextElement = getBoundTextElement(element, elementsMap);
++    if (boundTextElement) {
++      app.scene.mutateElement(boundTextElement, {
++        x: boundTextElement.x + dx,
++        y: boundTextElement.y + dy,
++      });
++    }
++
++    updateBoundElements(element as NonDeletedExcalidrawElement, app.scene, {
++      simultaneouslyUpdated: targets as NonDeletedExcalidrawElement[],
++    });
++  });
++
++  return elements;
++};
++
++// a dimension of exactly 0 (e.g. a perfectly horizontal/vertical line or
++// arrow) is left untouched instead of being inflated to a full grid cell
++const getSnappedDimension = (value: number, gridSize: number): number =>
++  value === 0 ? 0 : Math.max(gridSize, Math.round(value / gridSize) * gridSize);
++
++export const actionSnapToGrid = register({
++  name: "snapToGrid",
++  label: "labels.snapToGrid",
++  icon: gridIcon,
++  trackEvent: { category: "element" },
++  perform: (elements, appState, _, app) => {
++    return {
++      elements: snapElementsToGrid(elements, appState, app),
++      appState,
++      captureUpdate: CaptureUpdateAction.IMMEDIATELY,
++    };
++  },
++});
+diff --git a/packages/excalidraw/actions/index.ts b/packages/excalidraw/actions/index.ts
+index 6d2321b..631049f 100644
+--- a/packages/excalidraw/actions/index.ts
++++ b/packages/excalidraw/actions/index.ts
+@@ -69,6 +69,8 @@ export {
+ 
+ export { actionFlipHorizontal, actionFlipVertical } from "./actionFlip";
+ 
++export { actionSnapToGrid } from "./actionSnapToGrid";
++
+ export {
+   actionCopy,
+   actionCut,
+diff --git a/packages/excalidraw/actions/types.ts b/packages/excalidraw/actions/types.ts
+index 4f7cbd3..69485d6 100644
+--- a/packages/excalidraw/actions/types.ts
++++ b/packages/excalidraw/actions/types.ts
+@@ -115,6 +115,7 @@ export type ActionName =
+   | "distributeVertically"
+   | "flipHorizontal"
+   | "flipVertical"
++  | "snapToGrid"
+   | "deselect"
+   | "viewMode"
+   | "exportWithDarkMode"
+diff --git a/packages/excalidraw/components/App.tsx b/packages/excalidraw/components/App.tsx
+index d0c75ad..2aa20dd 100644
+--- a/packages/excalidraw/components/App.tsx
++++ b/packages/excalidraw/components/App.tsx
+@@ -313,6 +313,7 @@ import {
+   actionSelectAll,
+   actionSendBackward,
+   actionSendToBack,
++  actionSnapToGrid,
+   actionToggleGridMode,
+   actionToggleStats,
+   actionToggleZenMode,
+@@ -13585,6 +13586,7 @@ class App extends React.Component<AppProps, AppState> {
+         actionSelectAll,
+         actionUnlockAllElements,
+         CONTEXT_MENU_SEPARATOR,
++        actionSnapToGrid,
+         actionToggleGridMode,
+         actionToggleObjectsSnapMode,
+         actionToggleArrowBinding,
+@@ -13645,6 +13647,8 @@ class App extends React.Component<AppProps, AppState> {
+       actionFlipHorizontal,
+       actionFlipVertical,
+       CONTEXT_MENU_SEPARATOR,
++      actionSnapToGrid,
++      CONTEXT_MENU_SEPARATOR,
+       actionToggleLinearEditor,
+       CONTEXT_MENU_SEPARATOR,
+       actionLink,
+diff --git a/packages/excalidraw/locales/en.json b/packages/excalidraw/locales/en.json
+index 4a6fa1d..0e6fca1 100644
+--- a/packages/excalidraw/locales/en.json
++++ b/packages/excalidraw/locales/en.json
+@@ -130,6 +130,7 @@
+     "distributeVertically": "Distribute vertically",
+     "flipHorizontal": "Flip horizontal",
+     "flipVertical": "Flip vertical",
++    "snapToGrid": "Snap to grid",
+     "viewMode": "View mode",
+     "share": "Share",
+     "showStroke": "Show stroke color picker",

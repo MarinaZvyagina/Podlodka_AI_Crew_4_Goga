@@ -1,0 +1,129 @@
+Imports:
+  - Types:
+      - ParsedConfigs
+    From: lib/promrelabel
+  - Types:
+      - SDConfig
+    From: lib/promscrape/discovery/kubernetes
+
+Usages:
+  registry_dispatch: |
+    ScrapeConfig embeds one []SDConfig-shaped slice field per discovery provider (e.g.
+    ConsulSDConfigs []consul.SDConfig, KubernetesSDConfigs []kubernetes.SDConfig,
+    EC2SDConfigs []ec2.SDConfig — ~22 provider fields plus native FileSDConfigs/StaticConfigs).
+    Every provider except kubernetes and http implements a shared targetLabelsGetter interface
+    (GetLabels(baseDir string) ([]Labels, error)), dispatched uniformly by one generic driver,
+    getScrapeWorkGeneric. Kubernetes and http instead get MustStart/MustStop lifecycle calls at
+    config load/unload time because they run persistent watch/poll loops rather than
+    one-shot lookups. Each provider also contributes its own SDCheckInterval flag, used to give
+    its scraperGroup an independent polling cadence.
+
+Annotations: |
+  This cell is the Prometheus-compatible service-discovery and scraping engine: it loads a YAML
+  scrape config, drives each configured discovery provider on its own interval, turns discovered
+  target label sets into fully-resolved `ScrapeWork` units (post-relabeling), and runs the actual
+  periodic HTTP scrapes, pushing decoded samples onward via a caller-supplied callback.
+
+  Use `registry_dispatch` to understand how a new discovery provider under
+  lib/promscrape/discovery/ plugs into this cell — this cell never imports every provider's full
+  type, only what the registry dispatch and `ScrapeConfig` struct require.
+
+  Use `SDConfig` from Imports (kubernetes exemplar) and `ParsedConfigs` from Imports (compiled
+  relabel rules attached to every `ScrapeWork`) to see the two real cross-cell dependencies of
+  this cell.
+
+---
+
+"Init(pushData: PushDataFunc)":
+  location: scraper.go
+  annotations: |
+    Load the configured scrape config (-promscrape.config) and start one goroutine per
+    discovery-provider type, each polling getScrapeWork on its own SDCheckInterval and
+    diffing against its previous target set to start/stop individual per-target scrapers.
+
+    `pushData`: callback invoked with a WriteRequest for every batch of scraped samples —
+    this is the sole boundary between this cell and whatever stores the data (in this
+    repository, app/vmagent's or app/vminsert's remote-write/self-scrape push path)
+
+    Algorithm:
+    1. Load and validate the scrape config
+    2. For each configured discovery-provider type, start a scraper group polling it on its own
+       interval (see `registry_dispatch`)
+    3. On each poll, diff the newly discovered `ScrapeWork` set against the previous one and
+       start/stop individual target scrapers accordingly
+    4. Each running target scraper periodically calls its own HTTP client, applies relabeling,
+       and invokes `pushData`
+
+"Stop()":
+  location: scraper.go
+  annotations: |
+    Signal every running scraper group and target scraper to stop, and wait for them to exit.
+
+"CheckConfig() -> err:error":
+  location: scraper.go
+  annotations: |
+    Validate the configured scrape config file without starting any scraping (used by the
+    -promscrape.config.dryRun startup check).
+
+"WriteConfigData(w: io.Writer)":
+  location: scraper.go
+  annotations: |
+    Write the raw bytes of the last successfully loaded scrape config to `w` (used by the
+    /config and /api/v1/status/config debug endpoints).
+
+"ScrapeConfig(jobName: string, kubernetesSDConfigs: []SDConfig)":
+  location: config.go
+  annotations: |
+    One job_name entry from the scrape config file: its own relabel rules plus every
+    discovery-provider block configured for that job.
+
+    Use `SDConfig` from Imports as the representative shape of each of the ~22 provider slice
+    fields this type carries (`registry_dispatch` lists the rest by name).
+
+"ScrapeWork(scrapeURL: string, scrapeInterval: time.Duration, scrapeTimeout: time.Duration, labels: Labels, relabelConfigs: ParsedConfigs, metricRelabelConfigs: ParsedConfigs)":
+  location: scrapework.go
+  annotations: |
+    Immutable, fully-resolved unit of scrape work: one target, post service-discovery and
+    post target-relabeling, ready to be scraped on `scrapeInterval`.
+
+    `relabelConfigs`: compiled rules already applied to produce this target's final `labels`
+    `metricRelabelConfigs`: compiled rules applied to each scraped sample's own labels at scrape
+    time (via `ParsedConfigs`'s own Apply method, imported from lib/promrelabel)
+  methods:
+    "Job() -> job:string": |
+      Return this target's resolved job label value.
+
+"WriteTargetResponse(w: HTTPResponseWriter, r: HTTPRequest) -> err:error":
+  location: targetstatus.go
+  annotations: |
+    Serve the /target_response debug endpoint: scrape one target on demand and return its raw
+    response body, bypassing the normal push pipeline.
+
+"WriteHumanReadableTargetsStatus(w: HTTPResponseWriter, r: HTTPRequest)":
+  location: targetstatus.go
+  annotations: |
+    Serve the human-readable /targets status page listing every known target, its health, and
+    its resolved labels.
+
+"WriteServiceDiscovery(w: HTTPResponseWriter, r: HTTPRequest)":
+  location: targetstatus.go
+  annotations: |
+    Serve the /service-discovery endpoint: for every target, show both its pre-relabeling
+    discovered labels and its post-relabeling final labels, for troubleshooting relabel rules.
+
+"WriteAPIV1Targets(w: io.Writer, state: string, scrapePool: string)":
+  location: targetstatus.go
+  annotations: |
+    Serve the Prometheus-API-compatible /api/v1/targets endpoint.
+
+    `state`: filter by active/dropped/empty (both)
+
+---
+
+Author: Goga
+CreatedAt: 26/08/26
+Description: |
+  Service-discovery and scraping engine. Sourced by direct reading of scraper.go, scrapework.go,
+  config.go, client.go, targetstatus.go, and by grepping config.go's ScrapeConfig struct and its
+  getXxxSDScrapeWork dispatch methods to confirm the real (non-reflective, static-composition)
+  registry pattern described in `registry_dispatch`.

@@ -1,0 +1,220 @@
+Imports:
+  - Types:
+      - Table
+    From: lib/mergeset
+
+Usages:
+  god_package: |
+    This is VictoriaMetrics's largest and most tightly-coupled package: ~14,100 non-test lines
+    across 31 files (index_db.go alone is 3,482 lines, storage.go 2,687), with a test suite
+    (~22,700 lines) larger than the production source of most other lib/ packages combined. Only
+    22 top-level types are exported; the real complexity sits below the export boundary in
+    unexported table/partition/indexDB layers that reach directly into each other's internals
+    rather than through accessor abstractions (Storage -> table -> partitionWrapper.pt ->
+    partition.idb -> indexDB, all raw field access). Both table and partition carry a field
+    back-pointing to the owning Storage, annotated in the real source with
+    "// TODO(@rtm0): Do not depend on Storage" — an acknowledged, unfixed layering inversion.
+    indexDB additionally keeps a whole parallel legacy dual-index subsystem alive alongside the
+    current per-partition index for backward-compatible migration, and Storage/table/partition
+    each independently start and manage their own background merge/retention goroutines rather
+    than sharing one lifecycle mechanism. Two of the package's per-item caches
+    (metric_id_cache.go and date_metric_id_cache.go) are near-copy-paste of each other. None of
+    this is idealized away in this cell's documentation — it reflects the real, messy shape of
+    the code as of this pinned commit.
+
+Annotations: |
+  This cell is VictoriaMetrics's core time-series storage engine: it owns ingestion (AddRows),
+  the inverted index (tag/label -> metric ID lookups), on-disk columnar block storage, and the
+  streaming query iterator (`Search`) that app/vmselect's query path consumes. Every top-level
+  app/* binary in this repository (vmstorage, vminsert, vmselect, the single-node
+  victoria-metrics binary) depends on this cell directly or via app/vmstorage; it has no
+  outbound dependency on any app/* package.
+
+  Use `god_package` before extending this cell — changes here have the widest blast radius of
+  any package in the repository.
+
+  Use `Table` from Imports to understand how the inverted index is actually persisted: indexDB
+  (an internal, unexported layer of this cell) is a domain-specific layer of tag-filter and
+  per-day/global index logic built entirely on top of one `Table` instance from lib/mergeset,
+  which knows nothing about tags or metric IDs.
+
+---
+
+"Storage(path: string, opts: OpenOptions)":
+  location: storage.go
+  annotations: |
+    Top-level facade for one on-disk time-series database instance. Obtained via the
+    MustOpenStorage factory. Internally owns exactly one table, which shards data into
+    calendar-month partitions, each with its own inverted index — see `god_package` for the
+    real (messier) internal shape this facade sits in front of.
+  methods:
+    "AddRows(mrs: []MetricRow, precisionBits: uint8)": |
+      Ingest a batch of raw samples: resolve or assign each row's `TSID`, append to the active
+      partition's raw-row buffer, and register new metric names in the index as needed. Panics
+      (does not return an error) on unrecoverable failures, consistent with this method's real
+      signature having no return value.
+
+      `precisionBits`: controls lossy rounding of stored float values for compression
+    "RegisterMetricNames(qt: QueryTracer, mrs: []MetricRow)": |
+      Ensure every metric name in `mrs` exists in the index without ingesting any samples for
+      it (used to pre-warm the index ahead of a future write). No return value.
+    "SearchTSIDs(qt: QueryTracer, tfss: []TagFilters, tr: TimeRange, maxMetrics: int, deadline: uint64) -> tsids:[]TSID, err:error": |
+      Resolve every `TagFilters` (OR'd, AND'd internally per filter) matching series within
+      `tr` to their `TSID`s, capped at `maxMetrics`.
+    "SearchMetricNames(qt: QueryTracer, tfss: []TagFilters, tr: TimeRange, maxMetrics: int, deadline: uint64) -> names:[]string, err:error": |
+      Same matching as SearchTSIDs, returning marshaled `MetricName` strings instead.
+    "SearchLabelNames(qt: QueryTracer, tfss: []TagFilters, tr: TimeRange, maxLabelNames: int, maxMetrics: int, deadline: uint64) -> names:[]string, err:error": |
+      Enumerate distinct label names appearing on series matching `tfss` within `tr`, resolving
+      at most `maxMetrics` series while scanning.
+    "SearchLabelValues(qt: QueryTracer, labelName: string, tfss: []TagFilters, tr: TimeRange, maxLabelValues: int, maxMetrics: int, deadline: uint64) -> values:[]string, err:error": |
+      Enumerate distinct values of `labelName` appearing on series matching `tfss` within `tr`,
+      resolving at most `maxMetrics` series while scanning.
+    "DeleteSeries(qt: QueryTracer, tfss: []TagFilters, maxMetrics: int) -> deleted:int, err:error": |
+      Mark every series matching `tfss` as deleted (tombstoned in the index; underlying blocks
+      are reclaimed on a later merge), returning the count removed.
+    "GetSeriesCount(deadline: uint64) -> count:uint64, err:error": |
+      Return the total number of distinct (non-deleted) series currently indexed.
+    "GetTSDBStatus(qt: QueryTracer, tfss: []TagFilters, date: uint64, focusLabel: string, topN: int, maxMetrics: int, deadline: uint64) -> status:TSDBStatus, err:error": |
+      Compute cardinality-diagnostic statistics (top label names/values by series count) for one
+      day, optionally focused on one label.
+    "MustCreateSnapshot() -> path:string": |
+      Create a consistent, hard-linked point-in-time snapshot of the whole storage instance and
+      return its path.
+    "IsReadOnly() -> readOnly:bool": |
+      Report whether the instance has switched itself to read-only (e.g. due to a free-disk-space
+      limit being hit).
+    "DebugFlush()": |
+      Force all buffered in-memory data across every partition to become immediately searchable
+      (tests/admin endpoints only).
+    "UpdateMetrics(m: Metrics)": |
+      Populate `m` with the storage instance's current size/throughput/cache counters.
+    "MustClose()": |
+      Stop all background goroutines across storage/table/partition/indexDB layers and release
+      resources.
+
+"OpenOptions(retention: time.Duration, futureRetention: time.Duration, maxHourlySeries: int, maxDailySeries: int, disablePerDayIndex: bool)":
+  location: storage.go
+  annotations: |
+    Startup configuration passed to the `Storage` factory. Not mutable after open; changing
+    retention or series-limit settings requires reopening the instance.
+
+"MetricRow(metricNameRaw: []byte, timestamp: int64, value: float64)":
+  location: storage.go
+  annotations: |
+    One raw ingested sample as it crosses from app/vminsert/app/vmagent into this cell.
+  methods:
+    "Marshal(dst: []byte) -> data:[]byte": |
+      Append this row's binary encoding to `dst`.
+    "UnmarshalX(src: []byte) -> tail:[]byte, err:error": |
+      Decode one row from the front of `src`, returning the remaining unparsed bytes.
+    "CopyFrom(src: MetricRow)": |
+      Deep-copy another row's fields into this one (avoids an allocation on the hot ingestion
+      path).
+
+"MetricName(metricGroup: []byte, tags: []Tag)":
+  location: metric_name.go
+  annotations: |
+    Canonical, sorted representation of a series' identity: its metric name plus all label
+    (Tag) key/value pairs. Sync.Pool-backed (GetMetricName/PutMetricName) since it is
+    constructed on every ingested row.
+  methods:
+    "AddTag(key: string, value: string)": |
+      Append one label; tags must be (re-)sorted via the Marshal method before use as an index key.
+    "RemoveTag(key: string)": |
+      Remove the label named `key`, if present.
+    "GetTagValue(key: string) -> value:[]byte": |
+      Look up one label's value, or nil if absent.
+    "Marshal(dst: []byte) -> data:[]byte": |
+      Sort tags and append the canonical binary encoding to `dst` — this encoding is the actual
+      index key used throughout the inverted index.
+    "Unmarshal(src: []byte) -> err:error": |
+      Decode a `MetricName` previously produced by its own Marshal method.
+
+"TSID(metricGroupID: uint64, jobID: uint32, instanceID: uint32, metricID: uint64)":
+  location: tsid.go
+  annotations: |
+    Fixed-width (24-byte), fully-ordered on-disk key identifying one series. Sorted first by
+    `metricGroupID`, then `jobID`, then `instanceID`, then `metricID`, so that series sharing a
+    metric name/job/instance sort contiguously — the layout blocks and searches are built around.
+  methods:
+    "Marshal(dst: []byte) -> data:[]byte": |
+      Append the 24-byte binary encoding to `dst`.
+    "Unmarshal(src: []byte) -> tail:[]byte": |
+      Decode from the front of `src`, returning the remaining bytes.
+    "Less(b: TSID) -> isLess:bool": |
+      Total ordering comparison used throughout merge/search heap implementations.
+
+"TagFilters()":
+  location: tag_filters.go
+  annotations: |
+    Public, mutable builder for one AND-combined set of label matchers used as a query's filter.
+    The actual regexp-optimization/matching logic (literal vs. regexp vs. negated matching,
+    common-prefix extraction) lives in an unexported per-filter type with a process-global
+    regexp cache — not part of this cell's public contract.
+  methods:
+    "Add(key: []byte, value: []byte, isNegative: bool, isRegexp: bool) -> err:error": |
+      Append one matcher: key=value (or key!=value, key=~value, key!~value depending on
+      `isNegative`/`isRegexp`).
+
+"Search()":
+  location: search.go
+  annotations: |
+    Public streaming query iterator over matching blocks, consumed by app/vmselect's
+    query-execution path. Internally cascades through unexported per-tier iterators
+    (table -> partition -> part), each merging its children's results via its own
+    container/heap-based merge.
+  properties:
+    "MetricBlockRef -> MetricBlockRef": |
+      The lazy block reference at the iterator's current position, valid after a successful
+      call to the NextMetricBlock method.
+  methods:
+    "Init(qt: QueryTracer, storage: Storage, tfss: []TagFilters, tr: TimeRange, maxMetrics: int, deadline: uint64) -> matched:int": |
+      Begin a new search: resolve matching `TSID`s for `tfss` within `tr`, capped at
+      `maxMetrics`, returning the number matched.
+    "NextMetricBlock() -> found:bool": |
+      Advance to the next matching block; false once exhausted.
+    "Error() -> err:error": |
+      Report any error encountered during iteration.
+    "MustClose()": |
+      Release resources held by this search.
+
+"Block(tsid: TSID, timestamps: []int64, values: []int64, scale: int16, precisionBits: uint8)":
+  location: block.go
+  annotations: |
+    One decoded columnar chunk of (timestamp, value) pairs for a single series, as read from or
+    about to be written to a part.
+  methods:
+    "Init(tsid: TSID, timestamps: []int64, values: []int64, scale: int16, precisionBits: uint8)": |
+      Reset this Block to represent a fresh, not-yet-encoded chunk of raw samples.
+    "MarshalData(timestampsBlockOffset: uint64, valuesBlockOffset: uint64) -> timestampsData:[]byte, valuesData:[]byte": |
+      Compress and encode this block's timestamps/values columns for on-disk storage.
+    "UnmarshalData() -> err:error": |
+      Decompress and decode this block's stored columns back into timestamps/values.
+    "AppendRowsWithTimeRangeFilter(dstTimestamps: []int64, dstValues: []float64, tr: TimeRange) -> timestamps:[]int64, values:[]float64": |
+      Append only the rows within `tr` from this (already-decoded) block onto the destination
+      slices.
+
+"SearchQuery(start: int64, end: int64, tagFilterss: [][]TagFilter, maxMetrics: int)":
+  location: search.go
+  annotations: |
+    Wire-format query DSL carried across the vminsert/vmselect RPC boundary describing a time
+    range plus one or more OR'd, AND-combined TagFilter sets.
+  methods:
+    "Marshal(dst: []byte) -> data:[]byte": |
+      Append this query's binary encoding to `dst`.
+    "Unmarshal(src: []byte) -> err:error": |
+      Decode a `SearchQuery` previously produced by its own Marshal method.
+
+---
+
+Author: Goga
+CreatedAt: 26/08/26
+Description: |
+  Core time-series storage engine and the repository's confirmed "god package": 22 exported
+  top-level types front an unexported table/partition/indexDB layer with acknowledged
+  (TODO-commented), unresolved circular coupling back to Storage, a live legacy dual-index
+  migration path, and two independently-implemented near-duplicate per-item caches — see
+  `god_package` for specifics. Documented as-is rather than idealized, per this forest's scope
+  rule. Sourced by direct reading of storage.go, index_db.go, table.go, partition.go, block.go,
+  search.go, tag_filters.go, metric_name.go, tsid.go and a repository-wide grep of reverse
+  dependents.

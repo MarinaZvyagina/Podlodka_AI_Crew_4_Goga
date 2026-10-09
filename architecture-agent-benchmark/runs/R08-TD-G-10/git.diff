@@ -1,0 +1,302 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModel.kt b/app/src/main/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModel.kt
+index bafbb3f..479a944 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModel.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModel.kt
+@@ -148,6 +148,7 @@ class ContactSearchViewModel(
+ 
+   override fun onCleared() {
+     disposables.clear()
++    searchRepository.close()
+   }
+ 
+   fun setFastScrollEnabled(enabled: Boolean) {
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+index f47eddb..1fec194 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+@@ -13,11 +13,13 @@ import androidx.annotation.VisibleForTesting;
+ import androidx.annotation.WorkerThread;
+ 
+ import org.signal.core.util.CursorUtil;
++import org.signal.core.util.LRUCache;
+ import org.signal.core.util.concurrent.SignalExecutors;
+ import org.signal.core.util.logging.Log;
+ import org.thoughtcrime.securesms.conversation.MessageStyler;
+ import org.thoughtcrime.securesms.database.BodyAdjustment;
+ import org.thoughtcrime.securesms.database.BodyRangeUtil;
++import org.thoughtcrime.securesms.database.DatabaseObserver;
+ import org.thoughtcrime.securesms.database.GroupTable;
+ import org.thoughtcrime.securesms.database.MentionTable;
+ import org.thoughtcrime.securesms.database.MentionUtil;
+@@ -61,6 +63,7 @@ public class SearchRepository {
+   private static final String TAG = Log.tag(SearchRepository.class);
+ 
+   private static final int MAX_SNIPPET_SIZE = 100;
++  private static final int RESULT_CACHE_SIZE = 20;
+ 
+   private final Context           context;
+   private final String            noteToSelfTitle;
+@@ -72,6 +75,19 @@ public class SearchRepository {
+ 
+   private final Executor serialExecutor;
+ 
++  /**
++   * Repeating an identical search (same query text, same filters) is common -- e.g. clearing a
++   * search by accident and retyping it, or leaving and returning to the chat list. These caches
++   * let a repeated search skip straight to a previous result instead of re-running the underlying
++   * FTS/thread queries. They're invalidated wholesale on any conversation-list-affecting change
++   * (message insert/edit/delete, thread delete, etc.) so a later identical search never returns
++   * stale results.
++   */
++  private final Map<MessageCacheKey, MessageSearchResult> messageResultCache = Collections.synchronizedMap(new LRUCache<>(RESULT_CACHE_SIZE));
++  private final Map<ThreadCacheKey, ThreadSearchResult>   threadResultCache  = Collections.synchronizedMap(new LRUCache<>(RESULT_CACHE_SIZE));
++  private final DatabaseObserver.Observer                 cacheInvalidationObserver = this::invalidateResultCaches;
++  private volatile boolean                                cacheInvalidationObserverRegistered;
++
+   public SearchRepository(@NonNull String noteToSelfTitle) {
+     this.context           = AppDependencies.getApplication().getApplicationContext();
+     this.noteToSelfTitle   = noteToSelfTitle;
+@@ -85,6 +101,14 @@ public class SearchRepository {
+ 
+   @WorkerThread
+   public @NonNull ThreadSearchResult queryThreadsSync(@NonNull String query, boolean unreadOnly) {
++    ensureCacheInvalidationObserverRegistered();
++
++    ThreadCacheKey    cacheKey = new ThreadCacheKey(query, unreadOnly);
++    ThreadSearchResult cached  = threadResultCache.get(cacheKey);
++    if (cached != null) {
++      return cached;
++    }
++
+     SignalTrace.beginSection("ConversationListSearch-Threads");
+     try {
+       long                      start  = System.currentTimeMillis();
+@@ -92,7 +116,9 @@ public class SearchRepository {
+ 
+       Log.d(TAG, "[threads] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new ThreadSearchResult(result, query);
++      ThreadSearchResult searchResult = new ThreadSearchResult(result, query);
++      threadResultCache.put(cacheKey, searchResult);
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -100,6 +126,14 @@ public class SearchRepository {
+ 
+   @WorkerThread
+   public @NonNull MessageSearchResult queryMessagesSync(@NonNull String query, @NonNull SearchFilter filter) {
++    ensureCacheInvalidationObserverRegistered();
++
++    MessageCacheKey     cacheKey = new MessageCacheKey(query, filter);
++    MessageSearchResult cached   = messageResultCache.get(cacheKey);
++    if (cached != null) {
++      return cached;
++    }
++
+     SignalTrace.beginSection("ConversationListSearch-Messages");
+     try {
+       long start = System.currentTimeMillis();
+@@ -111,12 +145,45 @@ public class SearchRepository {
+ 
+       Log.d(TAG, "[messages] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new MessageSearchResult(combined, query);
++      MessageSearchResult searchResult = new MessageSearchResult(combined, query);
++      messageResultCache.put(cacheKey, searchResult);
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+   }
+ 
++  /**
++   * Stops listening for database changes. Must be called once this repository's owner (e.g. a
++   * ViewModel) is no longer in use, or the registered observer will leak.
++   */
++  public void close() {
++    synchronized (this) {
++      if (cacheInvalidationObserverRegistered) {
++        AppDependencies.getDatabaseObserver().unregisterObserver(cacheInvalidationObserver);
++        cacheInvalidationObserverRegistered = false;
++      }
++    }
++  }
++
++  private void ensureCacheInvalidationObserverRegistered() {
++    if (cacheInvalidationObserverRegistered) {
++      return;
++    }
++
++    synchronized (this) {
++      if (!cacheInvalidationObserverRegistered) {
++        AppDependencies.getDatabaseObserver().registerConversationListObserver(cacheInvalidationObserver);
++        cacheInvalidationObserverRegistered = true;
++      }
++    }
++  }
++
++  private void invalidateResultCaches() {
++    messageResultCache.clear();
++    threadResultCache.clear();
++  }
++
+   public void query(@NonNull String query, long threadId, @NonNull Callback<List<MessageResult>> callback) {
+     if (TextUtils.isEmpty(query)) {
+       callback.onResult(Collections.emptyList());
+@@ -485,4 +552,50 @@ public class SearchRepository {
+   public interface ModelBuilder<T> {
+     T build(@NonNull Cursor cursor);
+   }
++
++  private static final class MessageCacheKey {
++    private final String       query;
++    private final SearchFilter filter;
++
++    MessageCacheKey(@NonNull String query, @NonNull SearchFilter filter) {
++      this.query  = query;
++      this.filter = filter;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++      if (this == o) return true;
++      if (!(o instanceof MessageCacheKey)) return false;
++      MessageCacheKey other = (MessageCacheKey) o;
++      return query.equals(other.query) && filter.equals(other.filter);
++    }
++
++    @Override
++    public int hashCode() {
++      return Objects.hash(query, filter);
++    }
++  }
++
++  private static final class ThreadCacheKey {
++    private final String  query;
++    private final boolean unreadOnly;
++
++    ThreadCacheKey(@NonNull String query, boolean unreadOnly) {
++      this.query      = query;
++      this.unreadOnly = unreadOnly;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++      if (this == o) return true;
++      if (!(o instanceof ThreadCacheKey)) return false;
++      ThreadCacheKey other = (ThreadCacheKey) o;
++      return unreadOnly == other.unreadOnly && query.equals(other.query);
++    }
++
++    @Override
++    public int hashCode() {
++      return Objects.hash(query, unreadOnly);
++    }
++  }
+ }
+diff --git a/app/src/test/java/org/thoughtcrime/securesms/search/SearchRepositoryCacheTest.kt b/app/src/test/java/org/thoughtcrime/securesms/search/SearchRepositoryCacheTest.kt
+new file mode 100644
+index 0000000..a56ed3d
+--- /dev/null
++++ b/app/src/test/java/org/thoughtcrime/securesms/search/SearchRepositoryCacheTest.kt
+@@ -0,0 +1,99 @@
++/*
++ * Copyright 2026 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.search
++
++import android.app.Application
++import assertk.assertThat
++import assertk.assertions.hasSize
++import assertk.assertions.isNotSameAs
++import assertk.assertions.isSameAs
++import io.mockk.Runs
++import io.mockk.every
++import io.mockk.just
++import io.mockk.mockk
++import io.mockk.slot
++import org.junit.Rule
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import org.thoughtcrime.securesms.database.DatabaseObserver
++import org.thoughtcrime.securesms.dependencies.AppDependencies
++import org.thoughtcrime.securesms.testutil.RecipientTestRule
++
++/**
++ * Exercises the query-result caching added to [SearchRepository]: an identical repeated search
++ * should skip re-querying the database, and a search term must never return stale results after
++ * a conversation-list-affecting database change.
++ */
++@RunWith(RobolectricTestRunner::class)
++@Config(manifest = Config.NONE, application = Application::class)
++class SearchRepositoryCacheTest {
++
++  @get:Rule
++  val recipients = RecipientTestRule()
++
++  @Test
++  fun `repeated identical message search returns the cached result`() {
++    val alice = recipients.createRecipient("Alice Android")
++    recipients.insertOutgoingMessage(alice, body = "hello needle world")
++
++    val repository = SearchRepository("Note to Self")
++
++    val first = repository.queryMessagesSync("needle", SearchFilter.EMPTY)
++    assertThat(first.results).hasSize(1)
++
++    val second = repository.queryMessagesSync("needle", SearchFilter.EMPTY)
++    assertThat(second).isSameAs(first)
++
++    repository.close()
++  }
++
++  @Test
++  fun `message search cache is invalidated by a conversation list change`() {
++    val alice = recipients.createRecipient("Alice Android")
++    recipients.insertOutgoingMessage(alice, body = "hello needle world")
++
++    val observerSlot = slot<DatabaseObserver.Observer>()
++    val mockDatabaseObserver = mockk<DatabaseObserver>(relaxed = true)
++    every { AppDependencies.databaseObserver } returns mockDatabaseObserver
++    every { mockDatabaseObserver.registerConversationListObserver(capture(observerSlot)) } just Runs
++
++    val repository = SearchRepository("Note to Self")
++
++    val first = repository.queryMessagesSync("needle", SearchFilter.EMPTY)
++    assertThat(first.results).hasSize(1)
++
++    recipients.insertOutgoingMessage(alice, body = "another needle message")
++    observerSlot.captured.onChanged()
++
++    val second = repository.queryMessagesSync("needle", SearchFilter.EMPTY)
++    assertThat(second).isNotSameAs(first)
++    assertThat(second.results).hasSize(2)
++
++    repository.close()
++  }
++
++  @Test
++  fun `repeated identical thread search returns the cached result, unrelated query is independent`() {
++    val alice = recipients.createRecipient("Alice Android")
++    recipients.insertOutgoingMessage(alice, body = "hi")
++
++    val repository = SearchRepository("Note to Self")
++
++    val first = repository.queryThreadsSync("Alice", false)
++    assertThat(first.results).hasSize(1)
++
++    val second = repository.queryThreadsSync("Alice", false)
++    assertThat(second).isSameAs(first)
++
++    val third = repository.queryThreadsSync("Bob", false)
++    assertThat(third).isNotSameAs(first)
++    assertThat(third.results).hasSize(0)
++
++    repository.close()
++  }
++}

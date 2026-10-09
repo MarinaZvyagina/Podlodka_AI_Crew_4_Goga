@@ -1,0 +1,411 @@
+diff --git a/server/proxy/grpcproxy/cache/store.go b/server/proxy/grpcproxy/cache/store.go
+index 9ddd2370b..07f34d61d 100644
+--- a/server/proxy/grpcproxy/cache/store.go
++++ b/server/proxy/grpcproxy/cache/store.go
+@@ -34,7 +34,22 @@ var (
+ )
+ 
+ type Cache interface {
+-	Add(req *pb.RangeRequest, resp *pb.RangeResponse)
++	// StartRead registers req's key range as in-flight and returns a token
++	// identifying it; pass the token to the matching Add or Abort call once
++	// the read completes.
++	//
++	// This closes the race between a slow read and a concurrent write to
++	// the same range: without it, a write's Invalidate call could run
++	// before the read's response is inserted into the cache (since it
++	// isn't in the reverse index yet), so the write would never trigger
++	// eviction and the stale response would be cached indefinitely. With
++	// the token, an Invalidate that overlaps an in-flight read marks it so
++	// the eventual Add is skipped instead of caching stale data.
++	StartRead(req *pb.RangeRequest) uint64
++	Add(token uint64, req *pb.RangeRequest, resp *pb.RangeResponse)
++	// Abort releases the in-flight registration for a read that will not
++	// produce a response to cache, e.g. because the backend call failed.
++	Abort(token uint64)
+ 	Get(req *pb.RangeRequest) (*pb.RangeResponse, error)
+ 	Compact(revision int64)
+ 	Invalidate(key []byte, endkey []byte)
+@@ -52,11 +67,22 @@ func keyFunc(req *pb.RangeRequest) string {
+ 	return string(b)
+ }
+ 
++// rangeInterval returns the key interval covered by a range request.
++func rangeInterval(key, rangeEnd []byte) adt.Interval {
++	if len(rangeEnd) != 0 {
++		return adt.NewStringAffineInterval(string(key), string(rangeEnd))
++	}
++	return adt.NewStringAffinePoint(string(key))
++}
++
+ func NewCache(maxCacheEntries int) Cache {
+ 	return &cache{
+-		lru:          lru.New(maxCacheEntries),
+-		cachedRanges: adt.NewIntervalTree(),
+-		compactedRev: -1,
++		lru:           lru.New(maxCacheEntries),
++		cachedRanges:  adt.NewIntervalTree(),
++		pendingRanges: adt.NewIntervalTree(),
++		pendingIvl:    make(map[uint64]adt.Interval),
++		dirty:         make(map[uint64]struct{}),
++		compactedRev:  -1,
+ 	}
+ }
+ 
+@@ -70,16 +96,93 @@ type cache struct {
+ 	// a reverse index for cache invalidation
+ 	cachedRanges adt.IntervalTree
+ 
++	// pendingRanges and pendingIvl track reads that have started fetching a
++	// response from the backend but have not yet been committed to the
++	// cache, keyed by an opaque token from StartRead.
++	pendingRanges adt.IntervalTree
++	pendingIvl    map[uint64]adt.Interval
++	// dirty holds tokens of in-flight reads that raced with an Invalidate
++	// call overlapping their range; their eventual Add becomes a no-op.
++	dirty     map[uint64]struct{}
++	nextToken uint64
++
+ 	compactedRev int64
+ }
+ 
++// StartRead registers req's key range as in-flight. See the Cache interface for details.
++func (c *cache) StartRead(req *pb.RangeRequest) uint64 {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	// a request pinned to a historical revision is immutable and can never
++	// be invalidated, so it does not need in-flight tracking.
++	if req.Revision != 0 {
++		return 0
++	}
++
++	c.nextToken++
++	token := c.nextToken
++
++	ivl := rangeInterval(req.Key, req.RangeEnd)
++	c.pendingIvl[token] = ivl
++	if iv := c.pendingRanges.Find(ivl); iv == nil {
++		c.pendingRanges.Insert(ivl, map[uint64]struct{}{token: {}})
++	} else {
++		val := iv.Val.(map[uint64]struct{})
++		val[token] = struct{}{}
++		iv.Val = val
++	}
++	return token
++}
++
++// finishPending clears the in-flight registration for token and reports
++// whether it was invalidated while in-flight. Callers must hold c.mu.
++func (c *cache) finishPending(token uint64) bool {
++	if token == 0 {
++		return false
++	}
++
++	if ivl, ok := c.pendingIvl[token]; ok {
++		delete(c.pendingIvl, token)
++		if iv := c.pendingRanges.Find(ivl); iv != nil {
++			val := iv.Val.(map[uint64]struct{})
++			delete(val, token)
++			if len(val) == 0 {
++				c.pendingRanges.Delete(ivl)
++			} else {
++				iv.Val = val
++			}
++		}
++	}
++
++	_, invalidated := c.dirty[token]
++	delete(c.dirty, token)
++	return invalidated
++}
++
++// Abort releases the in-flight registration for a read that will not produce
++// a response to cache.
++func (c *cache) Abort(token uint64) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.finishPending(token)
++}
++
+ // Add adds the response of a request to the cache if its revision is larger than the compacted revision of the cache.
+-func (c *cache) Add(req *pb.RangeRequest, resp *pb.RangeResponse) {
++func (c *cache) Add(token uint64, req *pb.RangeRequest, resp *pb.RangeResponse) {
+ 	key := keyFunc(req)
+ 
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+ 
++	// A concurrent write landed on this range while the read was still in
++	// flight. That write's Invalidate call found nothing to evict (this
++	// response was not in the cache yet), so caching it now would leave a
++	// stale entry with no future write to trigger its removal.
++	if c.finishPending(token) {
++		return
++	}
++
+ 	if req.Revision > c.compactedRev {
+ 		c.lru.Add(key, resp)
+ 	}
+@@ -89,17 +192,8 @@ func (c *cache) Add(req *pb.RangeRequest, resp *pb.RangeResponse) {
+ 		return
+ 	}
+ 
+-	var (
+-		iv  *adt.IntervalValue
+-		ivl adt.Interval
+-	)
+-	if len(req.RangeEnd) != 0 {
+-		ivl = adt.NewStringAffineInterval(string(req.Key), string(req.RangeEnd))
+-	} else {
+-		ivl = adt.NewStringAffinePoint(string(req.Key))
+-	}
+-
+-	iv = c.cachedRanges.Find(ivl)
++	ivl := rangeInterval(req.Key, req.RangeEnd)
++	iv := c.cachedRanges.Find(ivl)
+ 
+ 	if iv == nil {
+ 		val := map[string]struct{}{key: {}}
+@@ -135,17 +229,9 @@ func (c *cache) Invalidate(key, endkey []byte) {
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+ 
+-	var (
+-		ivs []*adt.IntervalValue
+-		ivl adt.Interval
+-	)
+-	if len(endkey) == 0 {
+-		ivl = adt.NewStringAffinePoint(string(key))
+-	} else {
+-		ivl = adt.NewStringAffineInterval(string(key), string(endkey))
+-	}
++	ivl := rangeInterval(key, endkey)
+ 
+-	ivs = c.cachedRanges.Stab(ivl)
++	ivs := c.cachedRanges.Stab(ivl)
+ 	for _, iv := range ivs {
+ 		keys := iv.Val.(map[string]struct{})
+ 		for key := range keys {
+@@ -154,6 +240,17 @@ func (c *cache) Invalidate(key, endkey []byte) {
+ 	}
+ 	// delete after removing all keys since it is destructive to 'ivs'
+ 	c.cachedRanges.Delete(ivl)
++
++	// Any read still in flight for an overlapping range may be about to
++	// cache a response that predates this write; mark it so its Add is
++	// skipped once it completes instead of caching stale data.
++	pivs := c.pendingRanges.Stab(ivl)
++	for _, piv := range pivs {
++		tokens := piv.Val.(map[uint64]struct{})
++		for t := range tokens {
++			c.dirty[t] = struct{}{}
++		}
++	}
+ }
+ 
+ // Compact invalidate all caching response before the given rev.
+diff --git a/server/proxy/grpcproxy/cache/store_test.go b/server/proxy/grpcproxy/cache/store_test.go
+new file mode 100644
+index 000000000..e41985126
+--- /dev/null
++++ b/server/proxy/grpcproxy/cache/store_test.go
+@@ -0,0 +1,121 @@
++// Copyright 2026 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package cache
++
++import (
++	"errors"
++	"testing"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++)
++
++func TestCacheAddGet(t *testing.T) {
++	c := NewCache(DefaultMaxEntries)
++	req := &pb.RangeRequest{Key: []byte("foo"), Serializable: true}
++	resp := &pb.RangeResponse{}
++
++	token := c.StartRead(req)
++	c.Add(token, req, resp)
++
++	got, err := c.Get(req)
++	if err != nil {
++		t.Fatalf("expected cache hit, got error: %v", err)
++	}
++	if got != resp {
++		t.Fatalf("expected cached response to be returned")
++	}
++}
++
++func TestCacheInvalidateEvictsExistingEntry(t *testing.T) {
++	c := NewCache(DefaultMaxEntries)
++	req := &pb.RangeRequest{Key: []byte("foo"), Serializable: true}
++	resp := &pb.RangeResponse{}
++
++	token := c.StartRead(req)
++	c.Add(token, req, resp)
++
++	c.Invalidate([]byte("foo"), nil)
++
++	if _, err := c.Get(req); err == nil {
++		t.Fatalf("expected cache miss after invalidate")
++	}
++}
++
++// TestCacheRaceBetweenReadAndWrite ensures that a write which is invalidated
++// while a read for the same range is still in flight is not silently lost:
++// without tracking in-flight reads, the write's Invalidate call would find
++// nothing to evict (the read hasn't been cached yet) and the read would go
++// on to cache an already-stale response with no future trigger to remove it.
++func TestCacheRaceBetweenReadAndWrite(t *testing.T) {
++	c := NewCache(DefaultMaxEntries)
++	req := &pb.RangeRequest{Key: []byte("foo"), Serializable: true}
++	staleResp := &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: 1}}
++
++	// Simulate a read that started (e.g. fetching from the backend) before
++	// a concurrent write to the same key was applied and invalidated.
++	token := c.StartRead(req)
++
++	// The concurrent write happens and invalidates the range; at this
++	// point nothing is cached yet, so this is a no-op against the lru, but
++	// it must still mark the in-flight read as dirty.
++	c.Invalidate([]byte("foo"), nil)
++
++	// The read completes and tries to cache its now-stale response.
++	c.Add(token, req, staleResp)
++
++	if _, err := c.Get(req); err == nil {
++		t.Fatalf("expected stale response raced by a concurrent write to not be cached")
++	}
++}
++
++func TestCacheAbortReleasesInFlightRead(t *testing.T) {
++	c := NewCache(DefaultMaxEntries)
++	req := &pb.RangeRequest{Key: []byte("foo"), Serializable: true}
++
++	token := c.StartRead(req)
++	c.Abort(token)
++
++	// A later write to the same range should not find any stale
++	// bookkeeping left behind by the aborted read.
++	c.Invalidate([]byte("foo"), nil)
++
++	resp := &pb.RangeResponse{}
++	token2 := c.StartRead(req)
++	c.Add(token2, req, resp)
++
++	got, err := c.Get(req)
++	if err != nil {
++		t.Fatalf("expected cache hit after unrelated aborted read, got error: %v", err)
++	}
++	if got != resp {
++		t.Fatalf("expected cached response to be returned")
++	}
++}
++
++func TestCacheCompactedRevision(t *testing.T) {
++	c := NewCache(DefaultMaxEntries)
++	req := &pb.RangeRequest{Key: []byte("foo"), Revision: 5}
++	resp := &pb.RangeResponse{}
++
++	token := c.StartRead(req)
++	c.Add(token, req, resp)
++
++	c.Compact(10)
++
++	_, err := c.Get(req)
++	if !errors.Is(err, ErrCompacted) {
++		t.Fatalf("expected ErrCompacted, got %v", err)
++	}
++}
+diff --git a/server/proxy/grpcproxy/kv.go b/server/proxy/grpcproxy/kv.go
+index 3110c1e10..d70bc4922 100644
+--- a/server/proxy/grpcproxy/kv.go
++++ b/server/proxy/grpcproxy/kv.go
+@@ -45,31 +45,42 @@ func NewKvProxy(c *clientv3.Client) (pb.KVServer, <-chan struct{}) {
+ }
+ 
+ func (p *kvProxy) Range(ctx context.Context, r *pb.RangeRequest) (*pb.RangeResponse, error) {
+-	if r.Serializable {
+-		resp, err := p.cache.Get(r)
+-		switch {
+-		case err == nil:
+-			cacheHits.Inc()
+-			return resp, nil
+-		case errors.Is(err, cache.ErrCompacted):
+-			cacheHits.Inc()
+-			return nil, err
+-		}
++	// Cache entries are always keyed as serializable (see below): a cached
++	// response was already read through this proxy, which invalidates the
++	// cache on every write it forwards, so it is just as fresh as a live
++	// read for a linearizable caller too. Look it up under that key
++	// regardless of the consistency level the caller asked for.
++	lookup := r
++	if !r.Serializable {
++		// TODO(fuweid): consider using shadow copy here
++		clone := proto.Clone(r).(*pb.RangeRequest)
++		clone.Serializable = true
++		lookup = clone
++	}
+ 
+-		cachedMisses.Inc()
++	resp, err := p.cache.Get(lookup)
++	switch {
++	case err == nil:
++		cacheHits.Inc()
++		return resp, nil
++	case errors.Is(err, cache.ErrCompacted):
++		cacheHits.Inc()
++		return nil, err
+ 	}
+ 
+-	resp, err := p.kv.Do(ctx, RangeRequestToOp(r))
++	cachedMisses.Inc()
++
++	// A miss behaves exactly as an uncached proxy would: the request is
++	// forwarded upstream with its original consistency level untouched.
++	token := p.cache.StartRead(lookup)
++	respOp, err := p.kv.Do(ctx, RangeRequestToOp(r))
+ 	if err != nil {
++		p.cache.Abort(token)
+ 		return nil, err
+ 	}
+ 
+-	// cache linearizable as serializable
+-	// TODO(fuweid): consider using shadow copy here
+-	req := proto.Clone(r).(*pb.RangeRequest)
+-	req.Serializable = true
+-	gresp := (*pb.RangeResponse)(resp.Get())
+-	p.cache.Add(req, gresp)
++	gresp := (*pb.RangeResponse)(respOp.Get())
++	p.cache.Add(token, lookup, gresp)
+ 	cacheKeys.Set(float64(p.cache.Size()))
+ 
+ 	return gresp, nil
+@@ -106,7 +117,10 @@ func (p *kvProxy) txnToCache(reqs []*pb.RequestOp, resps []*pb.ResponseOp) {
+ 		case *pb.ResponseOp_ResponseRange:
+ 			req := *(reqs[i].GetRequestRange())
+ 			req.Serializable = true
+-			p.cache.Add(&req, tv.ResponseRange)
++			// The txn already completed atomically on the backend, so
++			// there is no separate in-flight window to protect here (no
++			// token from StartRead).
++			p.cache.Add(0, &req, tv.ResponseRange)
+ 		}
+ 	}
+ }

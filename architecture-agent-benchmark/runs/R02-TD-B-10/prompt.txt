@@ -1,0 +1,12 @@
+The command that reports disk usage information shells out to the system `df` utility every
+single time it's called. States and higher-level tooling that check free space more than once in
+the course of a single Salt run — for example: check space before starting a large file
+operation, do the work, then check again afterward to confirm it succeeded — end up re-running
+`df` and re-parsing its output every time, even when nothing relevant on the system changed in
+between those calls.
+
+Make repeated calls to this command, within the same Salt run and with the same arguments,
+return quickly instead of re-running `df` every time. Results must not go stale between separate,
+independent Salt runs — a later, unrelated run must still see up-to-date disk usage, not a
+number left over from an earlier run. The command's existing return format and call signature
+must not change.

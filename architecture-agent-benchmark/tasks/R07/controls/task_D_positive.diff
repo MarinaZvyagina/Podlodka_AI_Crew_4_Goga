@@ -1,0 +1,419 @@
+diff --git a/data/build.gradle.kts b/data/build.gradle.kts
+index 632bfbf..fe93c4a 100644
+--- a/data/build.gradle.kts
++++ b/data/build.gradle.kts
+@@ -43,4 +43,8 @@ dependencies {
+     implementation(libs.kotlinx.datetime)
+ 
+     api(libs.bundles.sqldelight)
++
++    testImplementation(libs.bundles.test)
++    testImplementation(libs.kotlinx.coroutines.test)
++    testRuntimeOnly(libs.junit.platform.launcher)
+ }
+diff --git a/data/src/main/java/tachiyomi/data/source/SourcePagingSource.kt b/data/src/main/java/tachiyomi/data/source/SourcePagingSource.kt
+index bc9ea3f..1b5844b 100644
+--- a/data/src/main/java/tachiyomi/data/source/SourcePagingSource.kt
++++ b/data/src/main/java/tachiyomi/data/source/SourcePagingSource.kt
+@@ -15,38 +15,77 @@ class SourceSearchPagingSource(
+     private val query: String,
+     private val filters: FilterList,
+     networkToLocalManga: NetworkToLocalManga,
+-) : BaseSourcePagingSource(source, networkToLocalManga) {
+-    override suspend fun requestNextPage(currentPage: Int): MangasPage {
++    searchCache: SourceSearchCache,
++) : BaseSourcePagingSource(
++    source,
++    networkToLocalManga,
++    searchCache,
++    searchCache.key(source.id, MODE, query, filters),
++) {
++    override suspend fun fetchPage(currentPage: Int): MangasPage {
+         return source.getSearchManga(currentPage, query, filters)
+     }
++
++    companion object {
++        private const val MODE = "search"
++    }
+ }
+ 
+ class SourcePopularPagingSource(
+     source: Source,
+     networkToLocalManga: NetworkToLocalManga,
+-) : BaseSourcePagingSource(source, networkToLocalManga) {
+-    override suspend fun requestNextPage(currentPage: Int): MangasPage {
++    searchCache: SourceSearchCache,
++) : BaseSourcePagingSource(
++    source,
++    networkToLocalManga,
++    searchCache,
++    searchCache.key(source.id, MODE),
++) {
++    override suspend fun fetchPage(currentPage: Int): MangasPage {
+         return source.getPopularManga(currentPage)
+     }
++
++    companion object {
++        private const val MODE = "popular"
++    }
+ }
+ 
+ class SourceLatestPagingSource(
+     source: Source,
+     networkToLocalManga: NetworkToLocalManga,
+-) : BaseSourcePagingSource(source, networkToLocalManga) {
+-    override suspend fun requestNextPage(currentPage: Int): MangasPage {
++    searchCache: SourceSearchCache,
++) : BaseSourcePagingSource(
++    source,
++    networkToLocalManga,
++    searchCache,
++    searchCache.key(source.id, MODE),
++) {
++    override suspend fun fetchPage(currentPage: Int): MangasPage {
+         return source.getLatestUpdates(currentPage)
+     }
++
++    companion object {
++        private const val MODE = "latest"
++    }
+ }
+ 
+ abstract class BaseSourcePagingSource(
+     protected val source: Source,
+     private val networkToLocalManga: NetworkToLocalManga,
++    private val searchCache: SourceSearchCache,
++    private val cacheKey: SourceSearchCache.Key,
+ ) : SourcePagingSource() {
+ 
+     private val seenManga = hashSetOf<String>()
+ 
+-    abstract suspend fun requestNextPage(currentPage: Int): MangasPage
++    /** Fetches [currentPage] from the underlying [source], bypassing the cache. */
++    abstract suspend fun fetchPage(currentPage: Int): MangasPage
++
++    /** Returns [currentPage], serving it from [searchCache] when a fresh-enough entry exists. */
++    private suspend fun requestNextPage(currentPage: Int): MangasPage {
++        searchCache.getPage(cacheKey, currentPage)?.let { return it }
++        return fetchPage(currentPage).also { searchCache.putPage(cacheKey, currentPage, it) }
++    }
+ 
+     override suspend fun load(params: LoadParams<Long>): LoadResult<Long, Manga> {
+         val page = params.key ?: 1
+diff --git a/data/src/main/java/tachiyomi/data/source/SourceRepositoryImpl.kt b/data/src/main/java/tachiyomi/data/source/SourceRepositoryImpl.kt
+index f6c88b2..f16987e 100644
+--- a/data/src/main/java/tachiyomi/data/source/SourceRepositoryImpl.kt
++++ b/data/src/main/java/tachiyomi/data/source/SourceRepositoryImpl.kt
+@@ -27,6 +27,7 @@ class SourceRepositoryImpl(
+     private val sourceManager: SourceManager,
+     private val database: Database,
+     private val networkToLocalManga: NetworkToLocalManga,
++    private val searchCache: SourceSearchCache,
+ ) : SourceRepository {
+ 
+     override fun getSources(): Flow<List<DomainSource>> {
+@@ -85,15 +86,21 @@ class SourceRepositoryImpl(
+         query: String,
+         filterList: FilterList,
+     ): SourcePagingSource {
+-        return SourceSearchPagingSource(sourceManager.getOrStub(sourceId), query, filterList, networkToLocalManga)
++        return SourceSearchPagingSource(
++            sourceManager.getOrStub(sourceId),
++            query,
++            filterList,
++            networkToLocalManga,
++            searchCache,
++        )
+     }
+ 
+     override fun getPopular(sourceId: Long): SourcePagingSource {
+-        return SourcePopularPagingSource(sourceManager.getOrStub(sourceId), networkToLocalManga)
++        return SourcePopularPagingSource(sourceManager.getOrStub(sourceId), networkToLocalManga, searchCache)
+     }
+ 
+     override fun getLatest(sourceId: Long): SourcePagingSource {
+-        return SourceLatestPagingSource(sourceManager.getOrStub(sourceId), networkToLocalManga)
++        return SourceLatestPagingSource(sourceManager.getOrStub(sourceId), networkToLocalManga, searchCache)
+     }
+ 
+     private fun mapSourceToDomainSource(source: Source): DomainSource = DomainSource(
+diff --git a/data/src/main/java/tachiyomi/data/source/SourceSearchCache.kt b/data/src/main/java/tachiyomi/data/source/SourceSearchCache.kt
+new file mode 100644
+index 0000000..b46076a
+--- /dev/null
++++ b/data/src/main/java/tachiyomi/data/source/SourceSearchCache.kt
+@@ -0,0 +1,91 @@
++package tachiyomi.data.source
++
++import dev.zacsweers.metro.AppScope
++import dev.zacsweers.metro.Inject
++import dev.zacsweers.metro.SingleIn
++import eu.kanade.tachiyomi.source.model.Filter
++import eu.kanade.tachiyomi.source.model.FilterList
++import eu.kanade.tachiyomi.source.model.MangasPage
++import java.util.concurrent.ConcurrentHashMap
++
++/**
++ * Caches the results of source listing/search requests (popular, latest, and text search)
++ * for a short period of time so that repeating an identical request shortly after doesn't
++ * hit the network again.
++ *
++ * This mirrors the role [eu.kanade.tachiyomi.data.cache.CoverCache] plays for manga covers: a
++ * small, dedicated, injectable data-layer class rather than ad hoc state kept on a ViewModel, so
++ * that every consumer of source search/listing (the browse screen, migration search, etc.)
++ * benefits transparently.
++ *
++ * Entries are keyed per (source, listing mode, query, filters, page) so that paginating through a
++ * cached search still fetches/serves each page independently, and expire after [ttlMillis] so
++ * results are never served indefinitely stale.
++ */
++@Inject
++@SingleIn(AppScope::class)
++class SourceSearchCache {
++
++    /** Overridable for tests; defaults to the wall clock. */
++    internal var nowProvider: () -> Long = System::currentTimeMillis
++
++    /** Overridable for tests; defaults to [DEFAULT_TTL_MILLIS]. */
++    internal var ttlMillis: Long = DEFAULT_TTL_MILLIS
++
++    data class Key(
++        val sourceId: Long,
++        val mode: String,
++        val query: String,
++        val filters: List<Filter<*>>,
++    )
++
++    private data class Entry(val pages: MutableMap<Int, MangasPage>, val cachedAt: Long)
++
++    private val entries = ConcurrentHashMap<Key, Entry>()
++
++    fun key(sourceId: Long, mode: String, query: String = "", filters: FilterList = FilterList()): Key {
++        // FilterList.equals() always returns false (it's @Stable for Compose), so the key must
++        // compare the underlying filter list instead, which has well-defined structural equality.
++        return Key(sourceId, mode, query, filters.list)
++    }
++
++    /** Returns the cached page, or null if absent/expired (network fetch is required). */
++    fun getPage(key: Key, page: Int): MangasPage? {
++        val entry = entries[key] ?: return null
++        if (isExpired(entry)) {
++            entries.remove(key, entry)
++            return null
++        }
++        return entry.pages[page]
++    }
++
++    /** Stores a freshly-fetched page for [key], resetting the entry's TTL clock if it was stale. */
++    fun putPage(key: Key, page: Int, mangasPage: MangasPage) {
++        val entry = entries.compute(key) { _, existing ->
++            if (existing == null || isExpired(existing)) {
++                Entry(mutableMapOf(), nowProvider())
++            } else {
++                existing
++            }
++        }!!
++        entry.pages[page] = mangasPage
++    }
++
++    /** Forces the next request for [key] to hit the network again. */
++    fun invalidate(key: Key) {
++        entries.remove(key)
++    }
++
++    /** Clears every cached listing/search result, e.g. on a global data refresh. */
++    fun clear() {
++        entries.clear()
++    }
++
++    private fun isExpired(entry: Entry): Boolean {
++        return nowProvider() - entry.cachedAt >= ttlMillis
++    }
++
++    companion object {
++        const val DEFAULT_TTL_MILLIS = 10 * 60 * 1000L // 10 minutes
++    }
++}
+diff --git a/data/src/test/java/tachiyomi/data/source/SourceSearchCacheTest.kt b/data/src/test/java/tachiyomi/data/source/SourceSearchCacheTest.kt
+new file mode 100644
+index 0000000..f3ffef1
+--- /dev/null
++++ b/data/src/test/java/tachiyomi/data/source/SourceSearchCacheTest.kt
+@@ -0,0 +1,177 @@
++package tachiyomi.data.source
++
++import androidx.paging.PagingSource
++import eu.kanade.tachiyomi.source.Source
++import eu.kanade.tachiyomi.source.model.FilterList
++import eu.kanade.tachiyomi.source.model.MangasPage
++import eu.kanade.tachiyomi.source.model.SManga
++import io.kotest.matchers.shouldBe
++import io.mockk.coEvery
++import io.mockk.every
++import io.mockk.mockk
++import kotlinx.coroutines.test.runTest
++import org.junit.jupiter.api.Test
++import tachiyomi.domain.manga.interactor.NetworkToLocalManga
++import tachiyomi.domain.manga.model.Manga
++
++/**
++ * Covers the caching behavior added to [SourceRepositoryImpl]'s search/popular/latest paging
++ * sources via [SourceSearchCache]: a repeated, identical request shortly afterward must not hit
++ * the underlying [Source] again, an expired entry (or an explicit invalidate) must, and
++ * pagination across multiple pages of a cached search must keep returning the right page.
++ */
++class SourceSearchCacheTest {
++
++    private fun sManga(tag: String) = SManga.create().apply {
++        url = "url-$tag"
++        title = "Title $tag"
++    }
++
++    private fun page(tag: String, hasNextPage: Boolean = false) =
++        MangasPage(mangas = listOf(sManga(tag)), hasNextPage = hasNextPage)
++
++    private fun fakeSource(callCounter: IntArray, id: Long = 1L): Source {
++        val source = mockk<Source>()
++        every { source.id } returns id
++        coEvery { source.getSearchManga(any(), any(), any()) } answers {
++            callCounter[0]++
++            page("search")
++        }
++        coEvery { source.getPopularManga(any()) } answers {
++            callCounter[0]++
++            page("popular")
++        }
++        coEvery { source.getLatestUpdates(any()) } answers {
++            callCounter[0]++
++            page("latest")
++        }
++        return source
++    }
++
++    private fun passthroughNetworkToLocalManga(): NetworkToLocalManga {
++        val networkToLocalManga = mockk<NetworkToLocalManga>()
++        coEvery { networkToLocalManga(any<List<Manga>>()) } answers { firstArg() }
++        return networkToLocalManga
++    }
++
++    private suspend fun PagingSource<Long, Manga>.refresh() =
++        load(PagingSource.LoadParams.Refresh(key = null, loadSize = 25, placeholdersEnabled = false))
++            as PagingSource.LoadResult.Page<Long, Manga>
++
++    private suspend fun PagingSource<Long, Manga>.append(key: Long) =
++        load(PagingSource.LoadParams.Append(key = key, loadSize = 25, placeholdersEnabled = false))
++            as PagingSource.LoadResult.Page<Long, Manga>
++
++    @Test
++    fun `repeating an identical search shortly after reuses the cached result`() = runTest {
++        val callCounter = intArrayOf(0)
++        val source = fakeSource(callCounter)
++        val networkToLocalManga = passthroughNetworkToLocalManga()
++        val cache = SourceSearchCache()
++
++        repeat(2) {
++            SourceSearchPagingSource(source, "one piece", FilterList(), networkToLocalManga, cache).refresh()
++        }
++
++        callCounter[0] shouldBe 1
++    }
++
++    @Test
++    fun `repeating an identical popular listing shortly after reuses the cached result`() = runTest {
++        val callCounter = intArrayOf(0)
++        val source = fakeSource(callCounter)
++        val networkToLocalManga = passthroughNetworkToLocalManga()
++        val cache = SourceSearchCache()
++
++        repeat(2) {
++            SourcePopularPagingSource(source, networkToLocalManga, cache).refresh()
++        }
++
++        callCounter[0] shouldBe 1
++    }
++
++    @Test
++    fun `a different query for the same source is not served from another entry's cache`() = runTest {
++        val callCounter = intArrayOf(0)
++        val source = fakeSource(callCounter)
++        val networkToLocalManga = passthroughNetworkToLocalManga()
++        val cache = SourceSearchCache()
++
++        SourceSearchPagingSource(source, "one piece", FilterList(), networkToLocalManga, cache).refresh()
++        SourceSearchPagingSource(source, "bleach", FilterList(), networkToLocalManga, cache).refresh()
++
++        callCounter[0] shouldBe 2
++    }
++
++    @Test
++    fun `a call after the cache expires hits the network again`() = runTest {
++        val callCounter = intArrayOf(0)
++        val source = fakeSource(callCounter)
++        val networkToLocalManga = passthroughNetworkToLocalManga()
++        val cache = SourceSearchCache()
++        var now = 0L
++        cache.nowProvider = { now }
++
++        SourceSearchPagingSource(source, "one piece", FilterList(), networkToLocalManga, cache).refresh()
++
++        // Still within the TTL window: served from cache.
++        now += cache.ttlMillis - 1
++        SourceSearchPagingSource(source, "one piece", FilterList(), networkToLocalManga, cache).refresh()
++        callCounter[0] shouldBe 1
++
++        // Past the TTL window: cache entry is stale, network is hit again.
++        now += 2
++        SourceSearchPagingSource(source, "one piece", FilterList(), networkToLocalManga, cache).refresh()
++        callCounter[0] shouldBe 2
++    }
++
++    @Test
++    fun `an explicit invalidate forces a fresh fetch`() = runTest {
++        val callCounter = intArrayOf(0)
++        val source = fakeSource(callCounter)
++        val networkToLocalManga = passthroughNetworkToLocalManga()
++        val cache = SourceSearchCache()
++
++        SourceSearchPagingSource(source, "one piece", FilterList(), networkToLocalManga, cache).refresh()
++        cache.invalidate(cache.key(source.id, "search", "one piece", FilterList()))
++        SourceSearchPagingSource(source, "one piece", FilterList(), networkToLocalManga, cache).refresh()
++
++        callCounter[0] shouldBe 2
++    }
++
++    @Test
++    fun `paginating through a cached search still returns the correct page each time`() = runTest {
++        val callCounter = intArrayOf(0)
++        val source = mockk<Source>()
++        every { source.id } returns 1L
++        coEvery { source.getSearchManga(1, any(), any()) } answers {
++            callCounter[0]++
++            page("page1", hasNextPage = true)
++        }
++        coEvery { source.getSearchManga(2, any(), any()) } answers {
++            callCounter[0]++
++            page("page2", hasNextPage = false)
++        }
++        val networkToLocalManga = passthroughNetworkToLocalManga()
++        val cache = SourceSearchCache()
++
++        val firstSession = SourceSearchPagingSource(source, "one piece", FilterList(), networkToLocalManga, cache)
++        val firstPage = firstSession.refresh()
++        val secondPage = firstSession.append(firstPage.nextKey!!)
++
++        callCounter[0] shouldBe 2
++        firstPage.data.single().url shouldBe "url-page1"
++        secondPage.data.single().url shouldBe "url-page2"
++
++        // Simulate navigating away and back: a brand-new PagingSource/session for the identical
++        // query, shortly after, must be served entirely from the cache, page by page, with no
++        // extra network calls.
++        val secondSession = SourceSearchPagingSource(source, "one piece", FilterList(), networkToLocalManga, cache)
++        val firstPageAgain = secondSession.refresh()
++        val secondPageAgain = secondSession.append(firstPageAgain.nextKey!!)
++
++        callCounter[0] shouldBe 2
++        firstPageAgain.data.single().url shouldBe "url-page1"
++        secondPageAgain.data.single().url shouldBe "url-page2"
++    }
++}

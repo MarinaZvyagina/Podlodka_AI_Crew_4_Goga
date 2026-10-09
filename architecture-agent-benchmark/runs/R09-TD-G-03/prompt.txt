@@ -1,0 +1,12 @@
+## Ticket: Confirm to the user when they copy the page address
+
+The address bar has a "Copy Address" action (reachable today as an
+accessibility action on the address bar) that copies the current page's URL
+to the clipboard. Right now it does this silently — there's no feedback
+telling the user it actually worked.
+
+Please add a brief confirmation message after the address is copied, similar
+to the confirmation we already show the user for other quick actions in the
+browser (for example, when they bookmark a page). It should appear right
+after the address is copied and go away on its own after a short delay; no
+user action should be required to dismiss it.

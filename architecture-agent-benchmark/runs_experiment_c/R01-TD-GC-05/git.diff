@@ -1,0 +1,85 @@
+diff --git a/freqtrade/exchange/exchange.py b/freqtrade/exchange/exchange.py
+index 17a0ca1..f4d1887 100644
+--- a/freqtrade/exchange/exchange.py
++++ b/freqtrade/exchange/exchange.py
+@@ -241,6 +241,10 @@ class Exchange:
+         # Shouldn't be too high either, as it'll freeze UI updates in case of open orders.
+         self._exit_rate_cache: FtTTLCache = FtTTLCache(maxsize=100, ttl=300)
+         self._entry_rate_cache: FtTTLCache = FtTTLCache(maxsize=100, ttl=300)
++        # Very short-lived cache for single-pair ticker fetches, to deduplicate
++        # near-simultaneous requests (e.g. entry and exit logic asking for the same
++        # pair's price within the same bot iteration) without risking stale prices.
++        self._fetch_ticker_cache: FtTTLCache = FtTTLCache(maxsize=100, ttl=2)
+ 
+         # Holds candles
+         self._klines: dict[PairWithTimeframe, DataFrame] = {}
+@@ -2163,10 +2167,16 @@ class Exchange:
+ 
+     @retrier
+     def fetch_ticker(self, pair: str) -> Ticker:
++        with self._cache_lock:
++            cached_ticker = self._fetch_ticker_cache.get(pair)
++        if cached_ticker is not None:
++            return cached_ticker
+         try:
+             if pair not in self.markets or self.markets[pair].get("active", False) is False:
+                 raise ExchangeError(f"Pair {pair} not available")
+             data: Ticker = self._api.fetch_ticker(pair)
++            with self._cache_lock:
++                self._fetch_ticker_cache[pair] = data
+             return data
+         except ccxt.DDoSProtection as e:
+             raise DDosProtection(e) from e
+diff --git a/tests/exchange/test_exchange.py b/tests/exchange/test_exchange.py
+index 7594d95..a4a6d96 100644
+--- a/tests/exchange/test_exchange.py
++++ b/tests/exchange/test_exchange.py
+@@ -2507,6 +2507,39 @@ def test_fetch_ticker(default_conf, mocker, exchange_name):
+         exchange.fetch_ticker(pair="XRP/ETH")
+ 
+ 
++@pytest.mark.parametrize("exchange_name", EXCHANGES)
++def test_fetch_ticker_cached(default_conf, mocker, exchange_name, time_machine):
++    api_mock = MagicMock()
++    tick1 = {"symbol": "ETH/BTC", "bid": 0.00001098, "ask": 0.00001099, "last": 0.0001}
++    tick2 = {"symbol": "ETH/BTC", "bid": 0.5, "ask": 1, "last": 42}
++    api_mock.fetch_ticker = MagicMock(return_value=tick1)
++    exchange = get_patched_exchange(mocker, default_conf, api_mock, exchange=exchange_name)
++
++    start_dt = datetime(2023, 12, 1, 0, 10, 0, tzinfo=UTC)
++    time_machine.move_to(start_dt, tick=False)
++
++    ticker = exchange.fetch_ticker(pair="ETH/BTC")
++    assert ticker == tick1
++    assert api_mock.fetch_ticker.call_count == 1
++
++    # A different pair is not affected by the cache
++    exchange.fetch_ticker(pair="LTC/BTC")
++    assert api_mock.fetch_ticker.call_count == 2
++
++    # Repeated request for the same pair a moment later reuses the cached result
++    api_mock.fetch_ticker = MagicMock(return_value=tick2)
++    time_machine.move_to(start_dt + timedelta(seconds=1), tick=False)
++    ticker = exchange.fetch_ticker(pair="ETH/BTC")
++    assert ticker == tick1
++    assert api_mock.fetch_ticker.call_count == 0
++
++    # Once the short cache TTL has elapsed, the exchange is queried again
++    time_machine.move_to(start_dt + timedelta(seconds=3), tick=False)
++    ticker = exchange.fetch_ticker(pair="ETH/BTC")
++    assert ticker == tick2
++    assert api_mock.fetch_ticker.call_count == 1
++
++
+ @pytest.mark.parametrize("exchange_name", EXCHANGES)
+ def test___now_is_time_to_refresh(default_conf, mocker, exchange_name, time_machine):
+     exchange = get_patched_exchange(mocker, default_conf, exchange=exchange_name)
+@@ -3650,6 +3683,8 @@ def test_get_rates_testing_entry(
+     assert api_mock.fetch_ticker.call_count == 0
+     # Running a 2nd time with Refresh on!
+     caplog.clear()
++    # Simulate the short-lived ticker cache having expired since the last real fetch
++    exchange._fetch_ticker_cache.clear()
+ 
+     assert exchange.get_rates("ETH/BTC", refresh=True, is_short=False)[0] == expected
+     assert not log_has("Using cached buy rate for ETH/BTC.", caplog)

@@ -1,0 +1,118 @@
+task_id: R01-TB
+repository: freqtrade/freqtrade
+commit: 936f28e28cbcd4e9e146cbc076c54933517a92eb
+category: cross_module_feature
+
+functional_requirements:
+  - "A new configurable limit (per-strategy config, analogous to existing risk-sizing config) that caps
+     the fraction of tradable capital that may be committed, in aggregate, to currently-open trades that
+     share the same underlying/base currency (using pair base-currency, e.g. via
+     Exchange.get_pair_base_currency, freqtrade/exchange/exchange.py line 581, or the already-persisted
+     Trade.base_currency / LocalTrade.safe_base_currency field, freqtrade/persistence/trade_model.py
+     lines 407 and 571-576)."
+  - "When opening a new trade would push combined open exposure to that base currency above the
+     configured limit, the trade must either be rejected (skipped) or sized down to fit under the limit —
+     mirroring how existing stake-amount bounds (min_stake/max_stake) already reject or clamp trade size."
+  - "The rule must produce IDENTICAL accept/reject/resize decisions for the same strategy+config+market
+     data whether the run is live/dry-run (freqtrade/freqtradebot.py entry path, execute_entry() around
+     line 895 and the stake-amount computation around lines 1029-1119) or backtesting
+     (freqtrade/optimize/backtesting.py's own, separate entry-sizing logic, roughly lines 1029-1220,
+     which independently calls self.wallets.get_trade_stake_amount / self.exchange.get_min_pair_stake_amount
+     / self.exchange.get_max_pair_stake_amount just like freqtradebot.py does)."
+  - "The rejection/resizing reason must be observable through the same channel other entry-sizing
+     decisions already use (e.g., existing log messages / RPC notifications around trade entry), not a
+     silent no-op."
+
+architectural_constraints:
+  - "The exposure-limit computation must live in a location shared by both the live orchestrator
+     (freqtrade/freqtradebot.py) and the backtest engine (freqtrade/optimize/backtesting.py) — the natural
+     home is freqtrade/wallets.py::Wallets, which both already depend on for
+     get_available_stake_amount()/get_trade_stake_amount()/validate_stake_amount() (wallets.py lines
+     301-460), OR an equivalently shared helper called from both call sites. It must NOT be implemented
+     as two independently-written, hand-duplicated blocks of exposure-checking logic, one inside
+     freqtradebot.py and a differently-written one inside backtesting.py."
+  - "Currently open positions must be read through the existing Trade/LocalTrade abstraction
+     (freqtrade/persistence/trade_model.py — LocalTrade.get_open_trades() line 1565, or
+     Trade.get_trades_proxy()) which both live trading (DB-backed Trade rows) and backtesting (in-memory
+     LocalTrade objects) already share, rather than the new code re-deriving 'currently open trades' from
+     exchange balances, order state, or a bespoke in-memory list kept only in one of the two engines."
+  - "freqtrade/strategy/interface.py (IStrategy, the user-facing strategy base class) may read the new
+     config value if useful for the strategy's own hooks (e.g. custom_stake_amount), but core enforcement
+     of the cap must not be pushed entirely into user-authored strategy code — the bot must enforce it
+     itself so it applies even to strategies that don't implement anything special."
+  - "freqtrade/optimize/backtesting.py must not gain a new import of live-only exchange/network code paths
+     to determine currency grouping; it already has access to Exchange.get_pair_base_currency() and the
+     pair/market metadata it needs without hitting the network."
+
+required_existing_abstractions:
+  - "Wallets — freqtrade/wallets.py (get_available_stake_amount, get_trade_stake_amount, validate_stake_amount, lines 301-460)"
+  - "LocalTrade.get_open_trades() / Trade.get_trades_proxy() — freqtrade/persistence/trade_model.py"
+  - "Exchange.get_pair_base_currency() — freqtrade/exchange/exchange.py line 581"
+
+allowed_dependencies:
+  - "freqtrade/wallets.py may gain new logic that reads from freqtrade/persistence (already a dependency)
+     and from freqtrade/exchange (already a dependency, Wallets already takes an Exchange instance in
+     __init__, wallets.py line 39)."
+
+forbidden_dependencies:
+  - "freqtrade/optimize/backtesting.py must not import new logic directly duplicated from
+     freqtrade/freqtradebot.py (or vice versa) to implement this — that would create/entrench exactly the
+     kind of live-vs-backtest behavioral drift the task explicitly warns against."
+  - "freqtrade/strategy/interface.py must not gain a new import of freqtrade/exchange.Exchange for this
+     feature — strategies already reach exchange data only through self.dp (DataProvider)."
+
+expected_extension_points: []
+
+public_api_constraints:
+  - "Any new per-strategy config key should be additive (new optional key with a safe default / disabled
+     by default) — must not change the meaning or default behavior of existing stake_amount,
+     max_open_trades, or tradable_balance_ratio settings for strategies that don't opt in."
+
+functional_check_command: >
+  Two-part check mirroring existing test structure: (1) tests/freqtradebot/test_freqtradebot.py-style test
+  that opens/simulates trades in multiple pairs sharing a base currency via execute_entry() and asserts a
+  trade that would breach the configured cap is rejected or resized; (2) an equivalent
+  tests/optimize/test_backtesting.py-style test running the same strategy/config through
+  Backtesting.backtest_one_period (or the relevant entry path) over synthetic OHLCV data for the same
+  pairs, asserting the same accept/reject/resize outcome as (1) for equivalent trade sequences/timing.
+
+architecture_check_command: "See architecture_checks below."
+
+architecture_checks:
+  - id: AC1
+    description: "Exposure-limit logic is implemented once, in a module shared by both live and backtest engines, not duplicated."
+    method: "git diff --stat; identify the module containing the new exposure-calculation function (expected: freqtrade/wallets.py, or a new small shared module under freqtrade/ imported by both). Then grep freqtradebot.py and backtesting.py for calls into that single function/class rather than independent inline implementations."
+    expected_result_if_correct: "Exactly one implementation of the exposure calculation, imported and called from both freqtrade/freqtradebot.py and freqtrade/optimize/backtesting.py."
+    expected_result_if_trap: "Two separately written blocks of similar-but-not-identical exposure-checking logic, one inline in freqtradebot.py's execute_entry() and one inline in backtesting.py's entry-sizing method."
+  - id: AC2
+    description: "Backtesting was actually wired up, not just live/dry-run."
+    method: "grep -rn '<new function/method name>' freqtrade/optimize/backtesting.py — must find at least one call site in the trade-entry path (near the existing calls to self.wallets.get_trade_stake_amount / self.exchange.get_min_pair_stake_amount around backtesting.py lines 1085-1119)."
+    expected_result_if_correct: "New exposure check called from backtesting.py's entry-sizing logic."
+    expected_result_if_trap: "New exposure check only called from freqtrade/freqtradebot.py; backtesting.py diff is empty or unrelated — the feature silently does nothing in backtests, contradicting the explicit functional requirement."
+  - id: AC3
+    description: "Open-position lookup goes through the shared Trade/LocalTrade abstraction, not a bespoke per-engine tracker."
+    method: "grep -n 'get_open_trades\\|get_trades_proxy' around the new code in both freqtradebot.py/wallets.py and backtesting.py; confirm both paths route through LocalTrade/Trade rather than backtesting.py maintaining its own separate currency-exposure ledger disconnected from freqtradebot.py's."
+    expected_result_if_correct: "Both call paths compute exposure from LocalTrade.get_open_trades()/Trade.get_trades_proxy() (directly or via the shared Wallets method)."
+    expected_result_if_trap: "backtesting.py accumulates exposure in a hand-rolled dict/counter maintained independently of Trade/LocalTrade state, risking drift from the trades the backtest engine actually recorded."
+  - id: AC4
+    description: "No new direct Exchange dependency was added to the strategy layer."
+    method: "grep -n 'import' freqtrade/strategy/interface.py | grep -i exchange — compare against the base commit's imports (should be unchanged: only freqtrade.exchange's timeframe_to_* helper functions, no Exchange class import)."
+    expected_result_if_correct: "No new Exchange import in freqtrade/strategy/interface.py."
+    expected_result_if_trap: "freqtrade/strategy/interface.py imports Exchange directly and reads exposure/balance data itself instead of going through self.dp or config."
+  - id: AC5
+    description: "Consistency: running the equivalent scenario through both engines yields the same accept/reject outcome."
+    method: "Manual/automated cross-check: construct one fixed sequence of would-be trades across two pairs sharing a base currency, feed it through both the live execute_entry() path (mocked exchange) and the backtest entry path with equivalent timing, compare pass/fail decisions."
+    expected_result_if_correct: "Identical accept/reject/resize decisions between the two engines for the same inputs."
+    expected_result_if_trap: "Divergent outcomes — e.g., live rejects the over-exposed trade but backtest silently allows it (or vice versa) — the 'Dangerous Success' case for this task: functionally each path can be made to pass its own isolated test while being architecturally inconsistent."
+
+notes_for_positive_negative_control: >
+  Correct: exposure-limit logic added to freqtrade/wallets.py (or an equivalently shared helper), reading
+  open positions via LocalTrade.get_open_trades()/Trade.get_trades_proxy(), called from both
+  freqtradebot.py's execute_entry() stake-amount computation and backtesting.py's equivalent entry-sizing
+  code, using Exchange.get_pair_base_currency() for grouping. A functional-pass/architecture-fail
+  ("dangerous success") implementation would add the cap check only inside freqtradebot.py's execute_entry
+  (or duplicate similar-looking but subtly different logic separately in both files) — a live/dry-run test
+  suite would pass cleanly (the feature clearly works when trading live), while backtests using the same
+  strategy and config would silently ignore the cap entirely, which is very unlikely to be caught by a
+  narrow, single-engine functional test but is exactly the kind of behavioral drift between backtest and
+  live that the task prompt explicitly calls out as a known failure mode.

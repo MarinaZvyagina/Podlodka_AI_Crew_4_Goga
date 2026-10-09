@@ -1,0 +1,435 @@
+diff --git a/integration/hello-world/e2e/request-id-fastify.spec.ts b/integration/hello-world/e2e/request-id-fastify.spec.ts
+new file mode 100644
+index 0000000..7bd7075
+--- /dev/null
++++ b/integration/hello-world/e2e/request-id-fastify.spec.ts
+@@ -0,0 +1,74 @@
++import { Controller, Get, Module } from '@nestjs/common';
++import {
++  REQUEST_ID_HEADER,
++  RequestIdModule,
++  RequestIdStorage,
++} from '@nestjs/core';
++import {
++  FastifyAdapter,
++  NestFastifyApplication,
++} from '@nestjs/platform-fastify';
++import { Test } from '@nestjs/testing';
++
++const UUID_V4 =
++  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
++
++@Controller()
++class RequestIdController {
++  @Get('request-id')
++  getRequestId() {
++    return { requestId: RequestIdStorage.get() };
++  }
++}
++
++@Module({
++  imports: [RequestIdModule],
++  controllers: [RequestIdController],
++})
++class RequestIdTestModule {}
++
++describe('RequestIdModule (FastifyAdapter)', () => {
++  let app: NestFastifyApplication;
++
++  beforeEach(async () => {
++    app = (
++      await Test.createTestingModule({
++        imports: [RequestIdTestModule],
++      }).compile()
++    ).createNestApplication<NestFastifyApplication>(new FastifyAdapter());
++
++    await app.init();
++    await app.getHttpAdapter().getInstance().ready();
++  });
++
++  afterEach(async () => {
++    await app.close();
++  });
++
++  it('generates and returns a request id header when the caller sends none', async () => {
++    const response = await app.inject({ method: 'GET', url: '/request-id' });
++
++    expect(response.headers[REQUEST_ID_HEADER]).toMatch(UUID_V4);
++  });
++
++  it('reuses the caller-supplied request id instead of generating a new one', async () => {
++    const response = await app.inject({
++      method: 'GET',
++      url: '/request-id',
++      headers: { [REQUEST_ID_HEADER]: 'caller-supplied-id' },
++    });
++
++    expect(response.headers[REQUEST_ID_HEADER]).toBe('caller-supplied-id');
++  });
++
++  it('exposes the same request id to application code as is sent on the response header', async () => {
++    const response = await app.inject({
++      method: 'GET',
++      url: '/request-id',
++      headers: { [REQUEST_ID_HEADER]: 'traced-across-the-chain' },
++    });
++
++    expect(response.headers[REQUEST_ID_HEADER]).toBe('traced-across-the-chain');
++    expect(response.json().requestId).toBe('traced-across-the-chain');
++  });
++});
+diff --git a/integration/hello-world/e2e/request-id.spec.ts b/integration/hello-world/e2e/request-id.spec.ts
+new file mode 100644
+index 0000000..7990748
+--- /dev/null
++++ b/integration/hello-world/e2e/request-id.spec.ts
+@@ -0,0 +1,66 @@
++import { Controller, Get, INestApplication, Module } from '@nestjs/common';
++import {
++  REQUEST_ID_HEADER,
++  RequestIdModule,
++  RequestIdStorage,
++} from '@nestjs/core';
++import { Test } from '@nestjs/testing';
++import request from 'supertest';
++
++const UUID_V4 =
++  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
++
++@Controller()
++class RequestIdController {
++  @Get('request-id')
++  getRequestId() {
++    return { requestId: RequestIdStorage.get() };
++  }
++}
++
++@Module({
++  imports: [RequestIdModule],
++  controllers: [RequestIdController],
++})
++class RequestIdTestModule {}
++
++describe('RequestIdModule', () => {
++  let app: INestApplication;
++
++  beforeEach(async () => {
++    app = await Test.createTestingModule({
++      imports: [RequestIdTestModule],
++    })
++      .compile()
++      .then(module => module.createNestApplication());
++
++    await app.init();
++  });
++
++  afterEach(async () => {
++    await app.close();
++  });
++
++  it('generates and returns a request id header when the caller sends none', async () => {
++    const response = await request(app.getHttpServer()).get('/request-id');
++
++    expect(response.headers[REQUEST_ID_HEADER]).toMatch(UUID_V4);
++  });
++
++  it('reuses the caller-supplied request id instead of generating a new one', async () => {
++    const response = await request(app.getHttpServer())
++      .get('/request-id')
++      .set(REQUEST_ID_HEADER, 'caller-supplied-id');
++
++    expect(response.headers[REQUEST_ID_HEADER]).toBe('caller-supplied-id');
++  });
++
++  it('exposes the same request id to application code as is sent on the response header', async () => {
++    const response = await request(app.getHttpServer())
++      .get('/request-id')
++      .set(REQUEST_ID_HEADER, 'traced-across-the-chain');
++
++    expect(response.headers[REQUEST_ID_HEADER]).toBe('traced-across-the-chain');
++    expect(response.body.requestId).toBe('traced-across-the-chain');
++  });
++});
+diff --git a/packages/core/middleware/index.ts b/packages/core/middleware/index.ts
+index 2d7a031..9abe17d 100644
+--- a/packages/core/middleware/index.ts
++++ b/packages/core/middleware/index.ts
+@@ -1 +1,4 @@
+ export * from './builder.js';
++export * from './request-id.middleware.js';
++export * from './request-id.module.js';
++export * from './request-id.storage.js';
+diff --git a/packages/core/middleware/request-id.middleware.ts b/packages/core/middleware/request-id.middleware.ts
+new file mode 100644
+index 0000000..199d400
+--- /dev/null
++++ b/packages/core/middleware/request-id.middleware.ts
+@@ -0,0 +1,54 @@
++import { randomUUID } from 'crypto';
++import { Injectable, type NestMiddleware } from '@nestjs/common';
++import { RequestIdStorage } from './request-id.storage.js';
++
++/**
++ * Name of the header used to read/write the correlation id.
++ * Header lookups are performed against the lower-cased form since Node
++ * normalizes incoming header names to lower case on both the Express and
++ * Fastify adapters (the latter runs connect-style middleware against the
++ * raw `http.IncomingMessage`/`http.ServerResponse` via `@fastify/middie`).
++ */
++export const REQUEST_ID_HEADER = 'x-request-id';
++
++interface RawRequest {
++  headers: Record<string, string | string[] | undefined>;
++}
++
++interface RawResponse {
++  setHeader(name: string, value: string): unknown;
++}
++
++/**
++ * Ensures every response carries a `X-Request-Id` header, reusing the id
++ * supplied by the caller (if any) so a single id can be traced across a
++ * chain of internal calls, and generating a new one otherwise.
++ *
++ * The resolved id is also stashed in `RequestIdStorage` for the duration
++ * of the request, so application code can retrieve it without parsing it
++ * back out of the response.
++ *
++ * Works identically regardless of the underlying HTTP adapter (Express or
++ * Fastify) because it only relies on the connect-style `(req, res, next)`
++ * signature and the plain `headers` object / `setHeader` method that both
++ * adapters expose to global middleware.
++ *
++ * @publicApi
++ */
++@Injectable()
++export class RequestIdMiddleware implements NestMiddleware<
++  RawRequest,
++  RawResponse
++> {
++  use(req: RawRequest, res: RawResponse, next: (error?: any) => void): void {
++    const requestId = this.getIncomingRequestId(req) ?? randomUUID();
++    res.setHeader(REQUEST_ID_HEADER, requestId);
++    RequestIdStorage.run(requestId, () => next());
++  }
++
++  private getIncomingRequestId(req: RawRequest): string | undefined {
++    const header = req.headers?.[REQUEST_ID_HEADER];
++    const value = Array.isArray(header) ? header[0] : header;
++    return value?.trim() || undefined;
++  }
++}
+diff --git a/packages/core/middleware/request-id.module.ts b/packages/core/middleware/request-id.module.ts
+new file mode 100644
+index 0000000..3ef19c5
+--- /dev/null
++++ b/packages/core/middleware/request-id.module.ts
+@@ -0,0 +1,21 @@
++import {
++  Module,
++  type MiddlewareConsumer,
++  type NestModule,
++} from '@nestjs/common';
++import { RequestIdMiddleware } from './request-id.middleware.js';
++
++/**
++ * Registers `RequestIdMiddleware` for every route of the application.
++ * Import this module once (typically in the root module) to guarantee
++ * that all HTTP responses carry a correlation id, on either the Express
++ * or Fastify adapter.
++ *
++ * @publicApi
++ */
++@Module({})
++export class RequestIdModule implements NestModule {
++  configure(consumer: MiddlewareConsumer) {
++    consumer.apply(RequestIdMiddleware).forRoutes('*');
++  }
++}
+diff --git a/packages/core/middleware/request-id.storage.ts b/packages/core/middleware/request-id.storage.ts
+new file mode 100644
+index 0000000..d366089
+--- /dev/null
++++ b/packages/core/middleware/request-id.storage.ts
+@@ -0,0 +1,37 @@
++import { AsyncLocalStorage } from 'async_hooks';
++
++export interface RequestIdStore {
++  requestId: string;
++}
++
++/**
++ * Provides access to the correlation/request id of the request currently
++ * being handled, from anywhere in application code (services, handlers,
++ * interceptors, etc.) without needing a reference to the underlying
++ * request or response object.
++ *
++ * Backed by `AsyncLocalStorage`, so the value follows the request's
++ * asynchronous execution context regardless of which HTTP adapter
++ * (Express or Fastify) is serving the request.
++ *
++ * @publicApi
++ */
++export class RequestIdStorage {
++  private static readonly storage = new AsyncLocalStorage<RequestIdStore>();
++
++  /**
++   * Runs `callback` within an async context carrying the given request id.
++   */
++  public static run<T>(requestId: string, callback: () => T): T {
++    return this.storage.run({ requestId }, callback);
++  }
++
++  /**
++   * Returns the request id associated with the current async execution
++   * context, or `undefined` if called outside of a request (or before the
++   * `RequestIdMiddleware` has run).
++   */
++  public static get(): string | undefined {
++    return this.storage.getStore()?.requestId;
++  }
++}
+diff --git a/packages/core/test/middleware/request-id.middleware.spec.ts b/packages/core/test/middleware/request-id.middleware.spec.ts
+new file mode 100644
+index 0000000..8a38120
+--- /dev/null
++++ b/packages/core/test/middleware/request-id.middleware.spec.ts
+@@ -0,0 +1,76 @@
++import {
++  REQUEST_ID_HEADER,
++  RequestIdMiddleware,
++} from '../../middleware/request-id.middleware.js';
++import { RequestIdStorage } from '../../middleware/request-id.storage.js';
++
++describe('RequestIdMiddleware', () => {
++  let middleware: RequestIdMiddleware;
++
++  beforeEach(() => {
++    middleware = new RequestIdMiddleware();
++  });
++
++  const createRes = () => ({
++    headers: {} as Record<string, string>,
++    setHeader(name: string, value: string) {
++      this.headers[name] = value;
++    },
++  });
++
++  it('should generate a new id and set it on the response when none was supplied', () => {
++    const req = { headers: {} };
++    const res = createRes();
++    const next = vi.fn();
++
++    middleware.use(req, res, next);
++
++    expect(res.headers[REQUEST_ID_HEADER]).toBeDefined();
++    expect(typeof res.headers[REQUEST_ID_HEADER]).toBe('string');
++    expect(next).toHaveBeenCalledTimes(1);
++  });
++
++  it('should reuse the incoming request id instead of generating a new one', () => {
++    const req = { headers: { [REQUEST_ID_HEADER]: 'incoming-id' } };
++    const res = createRes();
++    const next = vi.fn();
++
++    middleware.use(req, res, next);
++
++    expect(res.headers[REQUEST_ID_HEADER]).toBe('incoming-id');
++  });
++
++  it('should use the first value when the incoming header is duplicated', () => {
++    const req = { headers: { [REQUEST_ID_HEADER]: ['first-id', 'second-id'] } };
++    const res = createRes();
++    const next = vi.fn();
++
++    middleware.use(req, res, next);
++
++    expect(res.headers[REQUEST_ID_HEADER]).toBe('first-id');
++  });
++
++  it('should generate a new id when the incoming header is blank', () => {
++    const req = { headers: { [REQUEST_ID_HEADER]: '   ' } };
++    const res = createRes();
++    const next = vi.fn();
++
++    middleware.use(req, res, next);
++
++    expect(res.headers[REQUEST_ID_HEADER].trim()).not.toBe('');
++    expect(res.headers[REQUEST_ID_HEADER]).not.toBe('   ');
++  });
++
++  it('should make the resolved id available through RequestIdStorage while next() runs', () => {
++    const req = { headers: { [REQUEST_ID_HEADER]: 'traced-id' } };
++    const res = createRes();
++    let observedDuringNext: string | undefined;
++
++    middleware.use(req, res, () => {
++      observedDuringNext = RequestIdStorage.get();
++    });
++
++    expect(observedDuringNext).toBe('traced-id');
++    expect(RequestIdStorage.get()).toBeUndefined();
++  });
++});
+diff --git a/packages/core/test/middleware/request-id.module.spec.ts b/packages/core/test/middleware/request-id.module.spec.ts
+new file mode 100644
+index 0000000..c757019
+--- /dev/null
++++ b/packages/core/test/middleware/request-id.module.spec.ts
+@@ -0,0 +1,16 @@
++import { RequestIdMiddleware } from '../../middleware/request-id.middleware.js';
++import { RequestIdModule } from '../../middleware/request-id.module.js';
++
++describe('RequestIdModule', () => {
++  it('should apply RequestIdMiddleware to every route', () => {
++    const module = new RequestIdModule();
++    const forRoutes = vi.fn();
++    const apply = vi.fn().mockReturnValue({ forRoutes });
++    const consumer = { apply } as any;
++
++    module.configure(consumer);
++
++    expect(apply).toHaveBeenCalledWith(RequestIdMiddleware);
++    expect(forRoutes).toHaveBeenCalledWith('*');
++  });
++});
+diff --git a/packages/core/test/middleware/request-id.storage.spec.ts b/packages/core/test/middleware/request-id.storage.spec.ts
+new file mode 100644
+index 0000000..f5895b9
+--- /dev/null
++++ b/packages/core/test/middleware/request-id.storage.spec.ts
+@@ -0,0 +1,34 @@
++import { RequestIdStorage } from '../../middleware/request-id.storage.js';
++
++describe('RequestIdStorage', () => {
++  it('should return undefined outside of a run() context', () => {
++    expect(RequestIdStorage.get()).toBeUndefined();
++  });
++
++  it('should expose the id passed to run() while the callback executes', () => {
++    RequestIdStorage.run('abc-123', () => {
++      expect(RequestIdStorage.get()).toBe('abc-123');
++    });
++  });
++
++  it('should isolate ids across concurrent async contexts', async () => {
++    const observed: string[] = [];
++
++    await Promise.all([
++      RequestIdStorage.run('first', async () => {
++        await new Promise(resolve => setTimeout(resolve, 10));
++        observed.push(RequestIdStorage.get()!);
++      }),
++      RequestIdStorage.run('second', async () => {
++        observed.push(RequestIdStorage.get()!);
++      }),
++    ]);
++
++    expect(observed.sort()).toEqual(['first', 'second']);
++  });
++
++  it('should not leak the id once run() has completed', () => {
++    RequestIdStorage.run('temporary', () => {});
++    expect(RequestIdStorage.get()).toBeUndefined();
++  });
++});

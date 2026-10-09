@@ -1,0 +1,359 @@
+diff --git a/changelog/69900.added.md b/changelog/69900.added.md
+new file mode 100644
+index 0000000..f9e0dba
+--- /dev/null
++++ b/changelog/69900.added.md
+@@ -0,0 +1,6 @@
++Added a ``beacons.status`` execution module function that reports, per
++configured beacon, the epoch time it last fired and the error (if any)
++raised by that last run. A beacon that has not fired yet reports
++``last_fired`` and ``last_error`` as ``None`` rather than a stale or
++made-up value. Status is tracked live in the running minion process, so it
++requires no new probe cycle, no log parsing, and no minion restart.
+diff --git a/salt/beacons/__init__.py b/salt/beacons/__init__.py
+index 625511d..9f54720 100644
+--- a/salt/beacons/__init__.py
++++ b/salt/beacons/__init__.py
+@@ -6,6 +6,7 @@ import copy
+ import logging
+ import re
+ import sys
++import time
+ 
+ import salt.utils.event
+ import salt.utils.minion
+@@ -18,13 +19,16 @@ class Beacon:
+     This class is used to evaluate and execute on the beacon system
+     """
+ 
+-    def __init__(self, opts, functions, interval_map=None):
++    def __init__(self, opts, functions, interval_map=None, beacon_status=None):
+         import salt.loader
+ 
+         self.opts = opts
+         self.functions = functions
+         self.beacons = salt.loader.beacons(opts, functions)
+         self.interval_map = interval_map or dict()
++        # Tracks, per configured beacon name, the epoch time it last fired
++        # and the error (if any) produced by that last run.
++        self.beacon_status = beacon_status or dict()
+ 
+     def _close_beacon(self, name):
+         """
+@@ -201,6 +205,10 @@ class Beacon:
+                             "beacon_name": beacon_name,
+                         }
+                     )
++                self.beacon_status[mod] = {
++                    "last_fired": time.time(),
++                    "last_error": error,
++                }
+                 if not error:
+                     for data in raw:
+                         tag = "salt/beacon/{}/{}/".format(self.opts["id"], mod)
+@@ -352,6 +360,38 @@ class Beacon:
+ 
+         return True
+ 
++    def list_beacon_status(self, name=None):
++        """
++        Return the last fired time and last error for configured beacons.
++
++        A beacon that is configured but has not fired yet is reported with
++        ``last_fired`` and ``last_error`` both set to ``None``, rather than
++        being omitted or given a made-up value.
++        """
++        if name:
++            status = {
++                name: self.beacon_status.get(
++                    name, {"last_fired": None, "last_error": None}
++                )
++            }
++        else:
++            status = {}
++            for mod in self._get_beacons():
++                if mod == "enabled":
++                    continue
++                status[mod] = self.beacon_status.get(
++                    mod, {"last_fired": None, "last_error": None}
++                )
++
++        # Fire the complete event back along with the beacon status
++        with salt.utils.event.get_event("minion", opts=self.opts) as evt:
++            evt.fire_event(
++                {"complete": True, "beacon_status": status},
++                tag="/salt/minion/minion_beacon_status_complete",
++            )
++
++        return True
++
+     def validate_beacon(self, name, beacon_data):
+         """
+         Return available beacon functions
+diff --git a/salt/minion.py b/salt/minion.py
+index 81c828d..4fd0b89 100644
+--- a/salt/minion.py
++++ b/salt/minion.py
+@@ -4006,12 +4006,20 @@ class Minion(MinionBase):
+         prev_interval_map = {}
+         if hasattr(self, "beacons") and hasattr(self.beacons, "interval_map"):
+             prev_interval_map = self.beacons.interval_map
++        # Preserve the beacon_status so last-fired/last-error history isn't
++        # lost on refresh
++        prev_beacon_status = {}
++        if hasattr(self, "beacons") and hasattr(self.beacons, "beacon_status"):
++            prev_beacon_status = self.beacons.beacon_status
+         # Close existing beacon modules to release resources (e.g. inotify fds)
+         # before replacing the Beacon instance.
+         if hasattr(self, "beacons"):
+             self.beacons.close_beacons()
+         self.beacons = salt.beacons.Beacon(
+-            self.opts, self.functions, interval_map=prev_interval_map
++            self.opts,
++            self.functions,
++            interval_map=prev_interval_map,
++            beacon_status=prev_beacon_status,
+         )
+ 
+     def matchers_refresh(self):
+@@ -4176,6 +4184,7 @@ class Minion(MinionBase):
+                 "validate_beacon",
+                 {"name": name, "beacon_data": beacon_data},
+             ),
++            "status": ("list_beacon_status", {"name": name}),
+             "reset": ("reset", {}),
+         }
+ 
+diff --git a/salt/modules/beacons.py b/salt/modules/beacons.py
+index e482abc..278da61 100644
+--- a/salt/modules/beacons.py
++++ b/salt/modules/beacons.py
+@@ -123,6 +123,69 @@ def list_available(return_yaml=True, **kwargs):
+         return {"beacons": {}}
+ 
+ 
++def status(name=None, return_yaml=True, **kwargs):
++    """
++    Return the last time each configured beacon fired and whether that
++    last run raised an error. This reflects live beacon activity in the
++    running minion process, without needing to wait for another probe
++    cycle, read log files, or restart the minion.
++
++    :param name:            Name of a specific beacon to return status for.
++                            If not passed, status is returned for every
++                            currently configured beacon.
++
++    :param return_yaml:     Whether to return YAML formatted output,
++                           default ``True``
++
++    :return:                Dictionary, keyed by beacon name, of
++                           ``last_fired`` (epoch time of the last execution)
++                           and ``last_error`` (the error raised by the last
++                           execution, or ``None`` if it succeeded). A beacon
++                           that has not fired yet has both fields set to
++                           ``None``.
++
++    CLI Example:
++
++    .. code-block:: bash
++
++        salt '*' beacons.status
++        salt '*' beacons.status name=inotify
++
++    """
++    beacon_status = None
++
++    try:
++        with salt.utils.event.get_event(
++            "minion", opts=__opts__, listen=True
++        ) as event_bus:
++            res = __salt__["event.fire"](
++                {"func": "status", "name": name}, "manage_beacons"
++            )
++            if res:
++                event_ret = event_bus.get_event(
++                    tag="/salt/minion/minion_beacon_status_complete",
++                    wait=kwargs.get("timeout", default_event_wait),
++                )
++                log.debug("event_ret %s", event_ret)
++                if event_ret and event_ret["complete"]:
++                    beacon_status = event_ret["beacon_status"]
++    except KeyError:
++        # Effectively a no-op, since we can't really return without an event system
++        ret = {}
++        ret["result"] = False
++        ret["comment"] = "Event module not available. Beacon status failed."
++        return ret
++
++    if beacon_status is None:
++        beacon_status = {}
++
++    if return_yaml:
++        tmp = {"beacons": beacon_status}
++        return salt.utils.yaml.safe_dump(tmp, default_flow_style=False)
++    else:
++        return beacon_status
++
++
+ def add(name, beacon_data, **kwargs):
+     """
+     Add a beacon on the minion
+diff --git a/tests/pytests/unit/modules/test_beacons.py b/tests/pytests/unit/modules/test_beacons.py
+index 52fc23a..edb1da1 100644
+--- a/tests/pytests/unit/modules/test_beacons.py
++++ b/tests/pytests/unit/modules/test_beacons.py
+@@ -269,6 +269,31 @@ def test_enable_beacon_module():
+             assert beacons.enable() == {"comment": comm1, "result": True}
+ 
+ 
++@pytest.mark.slow_test
++def test_status():
++    """
++    Test retrieving the last-fired/last-error status of beacons.
++    """
++    event_returns = [
++        {
++            "complete": True,
++            "tag": "/salt/minion/minion_beacon_status_complete",
++            "beacon_status": {
++                "ps": {"last_fired": 12345.0, "last_error": None},
++                "inotify": {"last_fired": None, "last_error": None},
++            },
++        },
++    ]
++
++    mock = MagicMock(return_value=True)
++    with patch.dict(beacons.__salt__, {"event.fire": mock}):
++        with patch.object(SaltEvent, "get_event", side_effect=event_returns):
++            assert beacons.status(return_yaml=False) == {
++                "ps": {"last_fired": 12345.0, "last_error": None},
++                "inotify": {"last_fired": None, "last_error": None},
++            }
++
++
+ @pytest.mark.slow_test
+ def test_delete_beacon_module():
+     """
+diff --git a/tests/pytests/unit/test_beacons.py b/tests/pytests/unit/test_beacons.py
+index a247689..6db1abb 100644
+--- a/tests/pytests/unit/test_beacons.py
++++ b/tests/pytests/unit/test_beacons.py
+@@ -81,6 +81,118 @@ def test_beacon_process_invalid(minion_opts):
+         log_error_mock.assert_called_with("Configuration for beacon must be a list.")
+ 
+ 
++def test_beacon_process_records_status(minion_opts):
++    """
++    Test that a successful beacon run records a last_fired time and a
++    ``None`` last_error in beacon_status.
++    """
++    minion_opts["id"] = "minion"
++    minion_opts["__role"] = "minion"
++    minion_opts["beacons"] = {
++        "watch_apache": [
++            {"processes": {"apache2": "stopped"}},
++            {"beacon_module": "ps"},
++        ]
++    }
++    beacon = salt.beacons.Beacon(minion_opts, [])
++
++    with patch("salt.beacons.time.time", return_value=12345.0):
++        beacon.process(minion_opts["beacons"], minion_opts["grains"])
++
++    assert beacon.beacon_status["watch_apache"] == {
++        "last_fired": 12345.0,
++        "last_error": None,
++    }
++
++
++def test_beacon_process_records_error_status(minion_opts):
++    """
++    Test that a beacon run that raises an exception records a last_fired
++    time and the error message in beacon_status.
++    """
++    minion_opts["id"] = "minion"
++    minion_opts["__role"] = "minion"
++    minion_opts["beacons"] = {
++        "watch_apache": [
++            {"processes": {"apache2": "stopped"}},
++            {"beacon_module": "ps"},
++        ]
++    }
++    beacon_mock = MagicMock(side_effect=Exception("Global Thermonuclear War"))
++    beacon_mock.__globals__ = {}
++
++    beacon = salt.beacons.Beacon(minion_opts, [])
++    beacon.beacons["ps.beacon"] = beacon_mock
++
++    with patch("salt.beacons.time.time", return_value=12345.0):
++        beacon.process(minion_opts["beacons"], minion_opts["grains"])
++
++    assert beacon.beacon_status["watch_apache"] == {
++        "last_fired": 12345.0,
++        "last_error": "Global Thermonuclear War",
++    }
++
++
++def test_list_beacon_status_never_fired(minion_opts):
++    """
++    Test that a configured beacon that has never fired reports
++    last_fired/last_error as None instead of a stale or made-up value.
++    """
++    minion_opts["id"] = "minion"
++    minion_opts["__role"] = "minion"
++    minion_opts["beacons"] = {
++        "watch_apache": [
++            {"processes": {"apache2": "stopped"}},
++            {"beacon_module": "ps"},
++        ]
++    }
++
++    beacon = salt.beacons.Beacon(minion_opts, [])
++
++    with patch("salt.utils.event.get_event") as get_event_mock:
++        beacon.list_beacon_status()
++
++    evt = get_event_mock.return_value.__enter__.return_value
++    fired_event = evt.fire_event.call_args[0][0]
++    assert fired_event == {
++        "complete": True,
++        "beacon_status": {
++            "watch_apache": {"last_fired": None, "last_error": None}
++        },
++    }
++
++
++def test_list_beacon_status_after_fire(minion_opts):
++    """
++    Test that list_beacon_status reflects the recorded status after a
++    beacon has fired, and that requesting a specific name filters to it.
++    """
++    minion_opts["id"] = "minion"
++    minion_opts["__role"] = "minion"
++    minion_opts["beacons"] = {
++        "watch_apache": [
++            {"processes": {"apache2": "stopped"}},
++            {"beacon_module": "ps"},
++        ]
++    }
++
++    beacon = salt.beacons.Beacon(minion_opts, [])
++    with patch("salt.beacons.time.time", return_value=12345.0):
++        beacon.process(minion_opts["beacons"], minion_opts["grains"])
++
++    with patch("salt.utils.event.get_event") as get_event_mock:
++        beacon.list_beacon_status(name="watch_apache")
++
++    evt = get_event_mock.return_value.__enter__.return_value
++    fired_event = evt.fire_event.call_args[0][0]
++    assert fired_event == {
++        "complete": True,
++        "beacon_status": {
++            "watch_apache": {"last_fired": 12345.0, "last_error": None}
++        },
++    }
++
++
+ def test_beacon_module(minion_opts):
+     """
+     Test that beacon_module parameter for beacon configuration

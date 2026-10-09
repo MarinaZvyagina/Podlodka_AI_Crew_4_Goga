@@ -1,0 +1,523 @@
+diff --git a/docs/arch/ws-graceful-shutdown-notification.md b/docs/arch/ws-graceful-shutdown-notification.md
+new file mode 100644
+index 0000000..9cc1423
+--- /dev/null
++++ b/docs/arch/ws-graceful-shutdown-notification.md
+@@ -0,0 +1,290 @@
++# Architecture Plan: WebSocket Graceful Shutdown Notification
++
++## Topic
++`ws-graceful-shutdown-notification` — `docs/arch/ws-graceful-shutdown-notification.md`
++
++Adds an automatic, library-agnostic "server is going away" notification for connected WebSocket
++clients, delivered immediately before their connection is closed as part of the framework's
++existing graceful-shutdown sequence (`NestApplication.dispose()` → `SocketModule.close()` →
++`adapter.close(server)`).
++
++## Implementation Order
++
++All 3 cells are **created anew** — no CODEMANIFEST previously existed for `packages/websockets/`,
++`packages/platform-socket.io/`, or `packages/platform-ws/` (confirmed via `goga schema`).
++
++1. **`packages/websockets/adapters`** — no Imports; the shared base type (`AbstractWsAdapter`).
++   Designed first per leaves-to-root ordering.
++2. **`packages/platform-socket.io/adapters`** — depends on cell 1 (imports `AbstractWsAdapter`,
++   mutated as `AbstractWsAdapter::IoAdapter`).
++3. **`packages/platform-ws/adapters`** — depends on cell 1 (imports `AbstractWsAdapter`, mutated as
++   `AbstractWsAdapter::WsAdapter`). No dependency on cell 2; may be implemented in either order
++   relative to it once cell 1 exists.
++
++## Artifacts
++
++### 1. `packages/websockets/adapters/CODEMANIFEST` (new)
++
++```
++Annotations: |
++  Defines Nest's WS-transport adapter boundary: the abstract surface every WebSocket
++  platform integration (socket.io, ws, and others) must implement so the rest of
++  the framework (SocketModule, gateway binding) can create servers, wire client
++  connect/disconnect, and tear servers down without knowing which underlying WS
++  library is in use.
++
++---
++
++"AbstractWsAdapter(appOrHttpServer: Object<string, any> | undefined)":
++  location: ws-adapter.ts
++  annotations: |
++    Abstract base class for platform WS adapters. Concrete subclasses (socket.io,
++    ws, and others) wrap a specific WS library instance behind this common
++    surface.
++
++    `appOrHttpServer`: an existing Nest application/HTTP server to bind to, or
++    undefined to let the subclass create its own
++
++    Algorithm:
++    1. Concrete subclasses call the base constructor with an already-created
++       application/HTTP-server reference, or let the base class leave it
++       undefined
++    2. `forceCloseConnections` is a plain flag subclasses read during close/dispose
++       to decide whether to hard-close connections sharing the application's own
++       HTTP server
++  properties:
++    "forceCloseConnections -> bool": |
++      Whether server teardown should forcibly close connections that share the
++      application's own HTTP server, rather than leaving them to close
++      gracefully on their own.
++  methods:
++    "bindClientConnect(server: any, callback: Function)": |
++      Register `callback` to run whenever a new client connects to `server`.
++    "bindClientDisconnect(client: any, callback: Function)": |
++      Register `callback` to run once when `client` disconnects.
++    "close(server: any)": |
++      Stop accepting new connections on `server` and shut it down.
++
++      Algorithm:
++      1. Call `notifyClientsOnShutdown` to give currently connected clients a
++         chance to receive a heads-up message before teardown
++      2. If `server` exposes a close method, call it and await completion
++    "dispose()": |
++      No-op by default; subclasses override to release adapter-wide resources
++      (e.g. extra HTTP servers they created).
++    "create(port: number, options: Object<string, any> | undefined) -> server: any": |
++      Abstract. Create and return a concrete WS server instance bound to `port`,
++      shaped by `options`.
++    "bindMessageHandlers(client: any, handlers: Array<Object<string, any>>, transform: Function)": |
++      Abstract. Wire `client`'s incoming messages to `handlers`, passing each
++      through `transform`.
++    "notifyClientsOnShutdown(server: any)": |
++      No-op by default. Subclasses override to broadcast a small "server is
++      going away" message to every client currently connected to `server`,
++      called by `close` immediately before the server actually stops
++      accepting/serving connections.
++
++      Requirements:
++      - Must not throw — a failure to notify must never block or fail the
++        shutdown sequence itself
++
++---
++
++Author: Goga
++CreatedAt: 17/09/26
++Description: |
++  Documents the abstract WS-transport adapter contract that decouples the
++  framework's gateway layer from any specific WebSocket library, mirroring
++  AbstractHttpAdapter for the WS transport. Concrete platform packages
++  (socket.io, ws) mutate this type rather than the framework depending on them
++  directly, and every subclass automatically inherits the shutdown-notification
++  template method via `close`.
++```
++
++`.usages/` files: none (no independent external consumer beyond the two mutating sibling cells;
++matches the existing `packages/core/adapters` cell, which also has none).
++
++---
++
++### 2. `packages/platform-socket.io/adapters/CODEMANIFEST` (new)
++
++```
++Imports:
++  - Types:
++      - AbstractWsAdapter
++    From: packages/websockets/adapters
++
++Annotations: |
++  Concrete `AbstractWsAdapter` implementation over the socket.io library: the
++  default WS platform used by the socket.io platform package.
++
++---
++
++"AbstractWsAdapter::IoAdapter(appOrHttpServer: Object<string, any> | undefined)":
++  location: io-adapter.ts
++  annotations: |
++    Wraps socket.io's Server/Namespace behind the `AbstractWsAdapter` contract
++    from Imports.
++
++    `appOrHttpServer`: an existing Nest application/HTTP server to bind the
++    socket.io server to, or undefined
++  methods:
++    "create(port: number, options: Object<string, any> | undefined) -> server: any": |
++      Create (or resolve, for a namespaced request against an already-created
++      server) a socket.io Server or Namespace.
++    "createIOServer(port: number, options: Object<string, any> | undefined) -> server: any": |
++      Construct a new socket.io Server, bound to the shared HTTP server when
++      `port` is 0 and one is available, otherwise listening on `port` directly.
++    "bindMessageHandlers(socket: any, handlers: Array<Object<string, any>>, transform: Function)": |
++      Wire each handler in `handlers` to the matching socket.io event on
++      `socket`, running responses through `transform` and emitting/acking the
++      result.
++    "mapPayload(payload: any) -> mapped: Object<string, any>": |
++      Split an incoming socket.io event payload into its data and an optional
++      acknowledgement callback.
++    "bindClientDisconnect(client: any, callback: Function)": |
++      Register `callback` to run once when `client`'s socket.io disconnect
++      event fires, passing the disconnect reason.
++    "close(server: any)": |
++      Algorithm:
++      1. If `forceCloseConnections` is set and `server` shares the application's
++         own underlying HTTP server, call `notifyClientsOnShutdown` and return
++         without closing `server` directly — the shared HTTP server's own close
++         (elsewhere in the shutdown sequence) will terminate these connections
++      2. Otherwise, delegate to the base close from `AbstractWsAdapter`, which
++         itself calls `notifyClientsOnShutdown` before closing `server`
++
++      Requirements:
++      - `notifyClientsOnShutdown` must run exactly once per close call,
++        regardless of which branch is taken
++    "notifyClientsOnShutdown(server: any)": |
++      Broadcast a shutdown event carrying a small heads-up message to every
++      socket currently connected to `server`, so socket.io clients receive it
++      before the connection closes.
++
++---
++
++Author: Goga
++CreatedAt: 17/09/26
++Description: |
++  Documents the socket.io platform adapter as a concrete mutation of
++  `AbstractWsAdapter`, showing how a WS platform package plugs into the adapter
++  boundary and broadcasts a shutdown notification to every connected socket
++  before the underlying server closes.
++```
++
++`.usages/` files: none (matches `packages/platform-express/adapters`, which also has none).
++
++---
++
++### 3. `packages/platform-ws/adapters/CODEMANIFEST` (new)
++
++```
++Imports:
++  - Types:
++      - AbstractWsAdapter
++    From: packages/websockets/adapters
++
++Annotations: |
++  Concrete `AbstractWsAdapter` implementation over the `ws` library: the
++  lightweight WS platform used by the ws platform package. Does not support
++  namespaces.
++
++---
++
++"AbstractWsAdapter::WsAdapter(appOrHttpServer: Object<string, any> | undefined, options: Object<string, any> | undefined)":
++  location: ws-adapter.ts
++  annotations: |
++    Wraps one or more raw ws server instances behind the `AbstractWsAdapter`
++    contract from Imports, including support for multiple ws servers sharing a
++    single HTTP server across different paths/ports.
++
++    `appOrHttpServer`: an existing Nest application/HTTP server, or undefined
++    `options`: adapter-level configuration, e.g. a custom message parser
++  methods:
++    "create(port: number, options: Object<string, any> | undefined) -> server: any": |
++      Create a raw ws server, registering it against the shared HTTP server
++      when appropriate for the given port/path/server combination.
++    "bindMessageHandlers(client: any, handlers: Array<Object<string, any>>, transform: Function)": |
++      Wire `client`'s incoming messages to the matching handler in `handlers`
++      by parsed event name, sending the transformed result back as a JSON
++      string.
++    "bindMessageHandler(buffer: any, handlersMap: Object<string, any>, transform: Function) -> result: any": |
++      Parse one raw message `buffer`, look up its handler in `handlersMap`, and
++      run it through `transform`.
++    "bindErrorHandler(server: any) -> server: any": |
++      Attach error logging to `server` and to every client it accepts.
++    "bindClientDisconnect(client: any, callback: Function)": |
++      Register `callback` to run once when `client`'s underlying socket close
++      event fires.
++    "close(server: any)": |
++      Algorithm:
++      1. Call `notifyClientsOnShutdown` and await it, so every currently-OPEN
++         client has its shutdown message flushed
++      2. Begin closing `server` and, concurrently, force-terminate every
++         remaining client in `server.clients`
++      3. Await the server's close completion
++
++      Requirements:
++      - Notification must complete (or fail silently) before the terminate
++        loop runs, so the message isn't discarded by the immediately-following
++        hard close
++    "dispose()": |
++      Close every extra HTTP server this adapter created (skipping the
++      application's own), then clear the internal registries.
++    "setMessageParser(parser: Function)": |
++      Replace the function used to parse incoming raw message buffers into
++      {event, data}.
++    "notifyClientsOnShutdown(server: any)": |
++      Send a small JSON-encoded {event, data} heads-up payload to every client
++      in `server.clients` whose readyState is OPEN, waiting for each send to be
++      flushed to the socket before returning.
++
++      Requirements:
++      - A send failure for one client must not prevent notifying or closing
++        the others
++
++---
++
++Author: Goga
++CreatedAt: 17/09/26
++Description: |
++  Documents the ws-library platform adapter as a second concrete mutation of
++  `AbstractWsAdapter`, alongside the socket.io adapter, showing the same
++  shutdown-notification contract satisfied over a lower-level WS library: a
++  flushed JSON message per open client precedes the existing hard-terminate
++  close path.
++```
++
++`.usages/` files: none (matches `packages/platform-fastify/adapters`, which also has none).
++
++## Dependency Map
++
++```
++packages/websockets/adapters (AbstractWsAdapter)
++        │
++        ├──(AbstractWsAdapter)──> packages/platform-socket.io/adapters (IoAdapter)
++        │
++        └──(AbstractWsAdapter)──> packages/platform-ws/adapters (WsAdapter)
++```
++
++## Verification Checklist
++
++- `goga lint` passes with 0 errors across all 3 new cells (DSL syntax, key casing, signature rules).
++- `goga contract packages/websockets/adapters packages/platform-socket.io/adapters packages/platform-ws/adapters`
++  shows implementation signatures matching the CODEMANIFEST for every listed entity/method once code is written.
++- `AbstractWsAdapter.close()` calls `notifyClientsOnShutdown(server)` before `server.close(resolve)`.
++- `IoAdapter.close()` calls `notifyClientsOnShutdown` exactly once regardless of the
++  `forceCloseConnections` branch taken (no double-emit).
++- `WsAdapter.close()` awaits `notifyClientsOnShutdown(server)` fully before the existing
++  `ws.terminate()` loop runs.
++- No changes to `bindClientConnect`, `bindClientDisconnect`, `bindMessageHandlers`,
++  `bindMessageHandler`, `create`, `createIOServer`, `mapPayload`, `bindErrorHandler`,
++  `setMessageParser`, `dispose` signatures or behavior — only `close` gains a new leading step,
++  and `notifyClientsOnShutdown` is newly added.
++- No changes to `packages/core/nest-application.ts`, `packages/core/nest-application-context.ts`,
++  or `packages/websockets/socket-module.ts` — the existing `dispose()` → `socketModule.close()` →
++  `adapter.close(server)` call chain is the delivery mechanism and needs no modification.
++- Unit tests: a gateway with 0 connected clients at shutdown observes no behavior change; an app
++  with no WS adapter registered (`SocketModule.close()`'s existing early-returns) observes no
++  behavior change; existing connect/disconnect/message-handling tests continue to pass unmodified.
+diff --git a/packages/platform-socket.io/adapters/CODEMANIFEST b/packages/platform-socket.io/adapters/CODEMANIFEST
+new file mode 100644
+index 0000000..6b59ef0
+--- /dev/null
++++ b/packages/platform-socket.io/adapters/CODEMANIFEST
+@@ -0,0 +1,62 @@
++Imports:
++  - Types:
++      - AbstractWsAdapter
++    From: packages/websockets/adapters
++
++Annotations: |
++  Concrete `AbstractWsAdapter` implementation over the socket.io library: the
++  default WS platform used by the socket.io platform package.
++
++---
++
++"AbstractWsAdapter::IoAdapter(appOrHttpServer: Object<string, any> | undefined)":
++  location: io-adapter.ts
++  annotations: |
++    Wraps socket.io's Server/Namespace behind the `AbstractWsAdapter` contract
++    from Imports.
++
++    `appOrHttpServer`: an existing Nest application/HTTP server to bind the
++    socket.io server to, or undefined
++  methods:
++    "create(port: number, options: Object<string, any> | undefined) -> server: any": |
++      Create (or resolve, for a namespaced request against an already-created
++      server) a socket.io Server or Namespace.
++    "createIOServer(port: number, options: Object<string, any> | undefined) -> server: any": |
++      Construct a new socket.io Server, bound to the shared HTTP server when
++      `port` is 0 and one is available, otherwise listening on `port` directly.
++    "bindMessageHandlers(socket: any, handlers: Array<Object<string, any>>, transform: Function)": |
++      Wire each handler in `handlers` to the matching socket.io event on
++      `socket`, running responses through `transform` and emitting/acking the
++      result.
++    "mapPayload(payload: any) -> mapped: Object<string, any>": |
++      Split an incoming socket.io event payload into its data and an optional
++      acknowledgement callback.
++    "bindClientDisconnect(client: any, callback: Function)": |
++      Register `callback` to run once when `client`'s socket.io disconnect
++      event fires, passing the disconnect reason.
++    "close(server: any)": |
++      Algorithm:
++      1. If `forceCloseConnections` is set and `server` shares the application's
++         own underlying HTTP server, call `notifyClientsOnShutdown` and return
++         without closing `server` directly — the shared HTTP server's own close
++         (elsewhere in the shutdown sequence) will terminate these connections
++      2. Otherwise, delegate to the base close from `AbstractWsAdapter`, which
++         itself calls `notifyClientsOnShutdown` before closing `server`
++
++      Requirements:
++      - `notifyClientsOnShutdown` must run exactly once per close call,
++        regardless of which branch is taken
++    "notifyClientsOnShutdown(server: any)": |
++      Broadcast a shutdown event carrying a small heads-up message to every
++      socket currently connected to `server`, so socket.io clients receive it
++      before the connection closes.
++
++---
++
++Author: Goga
++CreatedAt: 17/09/26
++Description: |
++  Documents the socket.io platform adapter as a concrete mutation of
++  `AbstractWsAdapter`, showing how a WS platform package plugs into the adapter
++  boundary and broadcasts a shutdown notification to every connected socket
++  before the underlying server closes.
+diff --git a/packages/platform-ws/adapters/CODEMANIFEST b/packages/platform-ws/adapters/CODEMANIFEST
+new file mode 100644
+index 0000000..3136298
+--- /dev/null
++++ b/packages/platform-ws/adapters/CODEMANIFEST
+@@ -0,0 +1,74 @@
++Imports:
++  - Types:
++      - AbstractWsAdapter
++    From: packages/websockets/adapters
++
++Annotations: |
++  Concrete `AbstractWsAdapter` implementation over the `ws` library: the
++  lightweight WS platform used by the ws platform package. Does not support
++  namespaces.
++
++---
++
++"AbstractWsAdapter::WsAdapter(appOrHttpServer: Object<string, any> | undefined, options: Object<string, any> | undefined)":
++  location: ws-adapter.ts
++  annotations: |
++    Wraps one or more raw ws server instances behind the `AbstractWsAdapter`
++    contract from Imports, including support for multiple ws servers sharing a
++    single HTTP server across different paths/ports.
++
++    `appOrHttpServer`: an existing Nest application/HTTP server, or undefined
++    `options`: adapter-level configuration, e.g. a custom message parser
++  methods:
++    "create(port: number, options: Object<string, any> | undefined) -> server: any": |
++      Create a raw ws server, registering it against the shared HTTP server
++      when appropriate for the given port/path/server combination.
++    "bindMessageHandlers(client: any, handlers: Array<Object<string, any>>, transform: Function)": |
++      Wire `client`'s incoming messages to the matching handler in `handlers`
++      by parsed event name, sending the transformed result back as a JSON
++      string.
++    "bindMessageHandler(buffer: any, handlersMap: Object<string, any>, transform: Function) -> result: any": |
++      Parse one raw message `buffer`, look up its handler in `handlersMap`, and
++      run it through `transform`.
++    "bindErrorHandler(server: any) -> server: any": |
++      Attach error logging to `server` and to every client it accepts.
++    "bindClientDisconnect(client: any, callback: Function)": |
++      Register `callback` to run once when `client`'s underlying socket close
++      event fires.
++    "close(server: any)": |
++      Algorithm:
++      1. Call `notifyClientsOnShutdown` and await it, so every currently-OPEN
++         client has its shutdown message flushed
++      2. Begin closing `server` and, concurrently, force-terminate every
++         remaining client in `server.clients`
++      3. Await the server's close completion
++
++      Requirements:
++      - Notification must complete (or fail silently) before the terminate
++        loop runs, so the message isn't discarded by the immediately-following
++        hard close
++    "dispose()": |
++      Close every extra HTTP server this adapter created (skipping the
++      application's own), then clear the internal registries.
++    "setMessageParser(parser: Function)": |
++      Replace the function used to parse incoming raw message buffers into
++      {event, data}.
++    "notifyClientsOnShutdown(server: any)": |
++      Send a small JSON-encoded {event, data} heads-up payload to every client
++      in `server.clients` whose readyState is OPEN, waiting for each send to be
++      flushed to the socket before returning.
++
++      Requirements:
++      - A send failure for one client must not prevent notifying or closing
++        the others
++
++---
++
++Author: Goga
++CreatedAt: 17/09/26
++Description: |
++  Documents the ws-library platform adapter as a second concrete mutation of
++  `AbstractWsAdapter`, alongside the socket.io adapter, showing the same
++  shutdown-notification contract satisfied over a lower-level WS library: a
++  flushed JSON message per open client precedes the existing hard-terminate
++  close path.
+diff --git a/packages/websockets/adapters/CODEMANIFEST b/packages/websockets/adapters/CODEMANIFEST
+new file mode 100644
+index 0000000..18aa2cd
+--- /dev/null
++++ b/packages/websockets/adapters/CODEMANIFEST
+@@ -0,0 +1,73 @@
++Annotations: |
++  Defines Nest's WS-transport adapter boundary: the abstract surface every WebSocket
++  platform integration (socket.io, ws, and others) must implement so the rest of
++  the framework (SocketModule, gateway binding) can create servers, wire client
++  connect/disconnect, and tear servers down without knowing which underlying WS
++  library is in use.
++
++---
++
++"AbstractWsAdapter(appOrHttpServer: Object<string, any> | undefined)":
++  location: ws-adapter.ts
++  annotations: |
++    Abstract base class for platform WS adapters. Concrete subclasses (socket.io,
++    ws, and others) wrap a specific WS library instance behind this common
++    surface.
++
++    `appOrHttpServer`: an existing Nest application/HTTP server to bind to, or
++    undefined to let the subclass create its own
++
++    Algorithm:
++    1. Concrete subclasses call the base constructor with an already-created
++       application/HTTP-server reference, or let the base class leave it
++       undefined
++    2. `forceCloseConnections` is a plain flag subclasses read during close/dispose
++       to decide whether to hard-close connections sharing the application's own
++       HTTP server
++  properties:
++    "forceCloseConnections -> bool": |
++      Whether server teardown should forcibly close connections that share the
++      application's own HTTP server, rather than leaving them to close
++      gracefully on their own.
++  methods:
++    "bindClientConnect(server: any, callback: Function)": |
++      Register `callback` to run whenever a new client connects to `server`.
++    "bindClientDisconnect(client: any, callback: Function)": |
++      Register `callback` to run once when `client` disconnects.
++    "close(server: any)": |
++      Stop accepting new connections on `server` and shut it down.
++
++      Algorithm:
++      1. Call `notifyClientsOnShutdown` to give currently connected clients a
++         chance to receive a heads-up message before teardown
++      2. If `server` exposes a close method, call it and await completion
++    "dispose()": |
++      No-op by default; subclasses override to release adapter-wide resources
++      (e.g. extra HTTP servers they created).
++    "create(port: number, options: Object<string, any> | undefined) -> server: any": |
++      Abstract. Create and return a concrete WS server instance bound to `port`,
++      shaped by `options`.
++    "bindMessageHandlers(client: any, handlers: Array<Object<string, any>>, transform: Function)": |
++      Abstract. Wire `client`'s incoming messages to `handlers`, passing each
++      through `transform`.
++    "notifyClientsOnShutdown(server: any)": |
++      No-op by default. Subclasses override to broadcast a small "server is
++      going away" message to every client currently connected to `server`,
++      called by `close` immediately before the server actually stops
++      accepting/serving connections.
++
++      Requirements:
++      - Must not throw — a failure to notify must never block or fail the
++        shutdown sequence itself
++
++---
++
++Author: Goga
++CreatedAt: 17/09/26
++Description: |
++  Documents the abstract WS-transport adapter contract that decouples the
++  framework's gateway layer from any specific WebSocket library, mirroring
++  AbstractHttpAdapter for the WS transport. Concrete platform packages
++  (socket.io, ws) mutate this type rather than the framework depending on them
++  directly, and every subclass automatically inherits the shutdown-notification
++  template method via `close`.

@@ -1,0 +1,285 @@
+diff --git a/docs/configuration.md b/docs/configuration.md
+index 229258b..53a9bb7 100644
+--- a/docs/configuration.md
++++ b/docs/configuration.md
+@@ -168,6 +168,7 @@ Mandatory parameters are marked as **Required**, which means that they are requi
+ | `stake_amount` | **Required.** Amount of crypto-currency your bot will use for each trade. Set it to `"unlimited"` to allow the bot to use all available balance. [More information below](#configuring-amount-per-trade). <br> **Datatype:** Positive float or `"unlimited"`.
+ | `tradable_balance_ratio` | Ratio of the total account balance the bot is allowed to trade. [More information below](#configuring-amount-per-trade). <br>*Defaults to `0.99` 99%).*<br> **Datatype:** Positive float between `0.1` and `1.0`.
+ | `available_capital` | Available starting capital for the bot. Useful when running multiple bots on the same exchange account. [More information below](#configuring-amount-per-trade). <br> **Datatype:** Positive float.
++| `max_currency_exposure` | Maximum share of the total tradable capital that may be committed, across all simultaneously open trades, to a single underlying (base) currency. [More information below](#configuring-amount-per-trade). [Strategy Override](#parameters-in-the-strategy). <br>*Defaults to `1.0` (100%, i.e. disabled).*<br> **Datatype:** Positive float between `0.0` and `1.0`.
+ | `amend_last_stake_amount` | Use reduced last stake amount if necessary. [More information below](#configuring-amount-per-trade). <br>*Defaults to `false`.* <br> **Datatype:** Boolean
+ | `last_stake_amount_min_ratio` | Defines minimum stake amount that has to be left and executed. Applies only to the last stake amount when it's amended to a reduced value (i.e. if `amend_last_stake_amount` is set to `true`). [More information below](#configuring-amount-per-trade). <br>*Defaults to `0.5`.* <br> **Datatype:** Float (as ratio)
+ | `amount_reserve_percent` | Reserve some amount in min pair stake amount. The bot will reserve `amount_reserve_percent` + stoploss value when calculating min pair stake amount in order to avoid possible trade refusals. <br>*Defaults to `0.05` (5%).* <br> **Datatype:** Positive Float as ratio.
+@@ -292,6 +293,7 @@ Values set in the configuration file always overwrite values set in the strategy
+ * `timeframe`
+ * `stoploss`
+ * `max_open_trades`
++* `max_currency_exposure`
+ * `trailing_stop`
+ * `trailing_stop_positive`
+ * `trailing_stop_positive_offset`
+@@ -379,6 +381,32 @@ Adjusting `available_capital` requires reloading the configuration to take effec
+ !!! Warning "Incompatible with `tradable_balance_ratio`"
+     Setting this option will replace any configuration of `tradable_balance_ratio`.
+ 
++#### Limit exposure to a single underlying currency
++
++If you trade several pairs that share the same underlying (base) currency - for example several
++altcoins that are all quoted against the same stake currency - a large adverse move in that
++currency can affect several of your open trades at the same time. `max_currency_exposure` lets you
++cap the total stake committed, across all simultaneously open trades, to a single underlying
++currency, as a fraction of your total tradable capital.
++
++For example, with `max_currency_exposure=0.2` (20%), the bot will never let the combined stake of
++all open trades whose pair shares an underlying currency exceed 20% of the total tradable capital.
++When opening (or increasing the size of) a trade would push that combined exposure above the
++limit, the stake amount for that trade is reduced to fit under the limit - the same way stake
++amounts are already reduced to fit `max_stake_amount` or the available balance. If reducing the
++stake amount would take it below the pair's minimum tradeable amount, the trade is not opened at
++all, exactly as with other stake-sizing limits.
++
++This setting defaults to `1.0` (100%), which is equivalent to being disabled, since no single
++currency's exposure can ever exceed the total tradable capital.
++
++This setting applies identically to live/dry-run trading and to backtesting/hyperopt, so backtest
++results accurately reflect how the bot will behave live.
++
++``` json
++"max_currency_exposure": 0.2,
++```
++
+ #### Amend last stake amount
+ 
+ Assuming we have the tradable balance of 1000 USDT, `stake_amount=400`, and `max_open_trades=3`.
+diff --git a/freqtrade/config_schema/config_schema.py b/freqtrade/config_schema/config_schema.py
+index 2036a3f..ca265d7 100644
+--- a/freqtrade/config_schema/config_schema.py
++++ b/freqtrade/config_schema/config_schema.py
+@@ -66,6 +66,16 @@ CONF_SCHEMA = {
+             "maximum": 1,
+             "default": 0.99,
+         },
++        "max_currency_exposure": {
++            "description": (
++                "Maximum share of the total tradable capital that may be committed, across "
++                "all simultaneously open trades, to a single underlying (base) currency."
++            ),
++            "type": "number",
++            "minimum": 0.0,
++            "maximum": 1.0,
++            "default": 1.0,
++        },
+         "available_capital": {
+             "description": "Total capital available for trading.",
+             "type": "number",
+diff --git a/freqtrade/resolvers/strategy_resolver.py b/freqtrade/resolvers/strategy_resolver.py
+index bdcf954..6aa5d68 100644
+--- a/freqtrade/resolvers/strategy_resolver.py
++++ b/freqtrade/resolvers/strategy_resolver.py
+@@ -80,6 +80,7 @@ class StrategyResolver(IResolver):
+             ("position_adjustment_enable", False),
+             ("max_entry_position_adjustment", -1),
+             ("max_open_trades", float("inf")),
++            ("max_currency_exposure", 1.0),
+         ]
+         for attribute, default in attributes:
+             StrategyResolver._override_attribute_helper(strategy, config, attribute, default)
+diff --git a/freqtrade/strategy/interface.py b/freqtrade/strategy/interface.py
+index 2a5d9ef..57449d4 100644
+--- a/freqtrade/strategy/interface.py
++++ b/freqtrade/strategy/interface.py
+@@ -78,6 +78,10 @@ class IStrategy(ABC, HyperStrategyMixin):
+     # max open trades for the strategy
+     max_open_trades: IntOrInf
+ 
++    # Maximum share of tradable capital that may be committed to a single underlying
++    # (base) currency across all simultaneously open trades. 1.0 (default) disables the limit.
++    max_currency_exposure: float = 1.0
++
+     # trailing stoploss
+     trailing_stop: bool = False
+     trailing_stop_positive: float | None = None
+diff --git a/freqtrade/wallets.py b/freqtrade/wallets.py
+index e644d82..a479d76 100644
+--- a/freqtrade/wallets.py
++++ b/freqtrade/wallets.py
+@@ -407,6 +407,31 @@ class Wallets:
+ 
+         return self._check_available_stake_amount(stake_amount, available_amount)
+ 
++    def _get_max_stake_for_currency_exposure(self, pair: str) -> float | None:
++        """
++        Determine how much additional stake may be committed to trades sharing this pair's
++        underlying (base) currency, without breaching the configured `max_currency_exposure`.
++        :param pair: Pair to check.
++        :return: None if no (meaningful) cap is configured, otherwise the maximum additional
++        stake amount that may be committed to this currency across all open trades.
++        """
++        max_exposure_ratio = self._config.get("max_currency_exposure", 1.0)
++        if not max_exposure_ratio or max_exposure_ratio >= 1.0:
++            # Disabled, or a ratio of 100%+ can never be more restrictive than the
++            # existing overall stake-amount limits.
++            return None
++
++        # Fall back to parsing the pair, mirroring Trade.safe_base_currency, so pairs missing
++        # from the exchange's market metadata still group correctly with existing open trades.
++        currency = self._exchange.get_pair_base_currency(pair) or pair.split("/")[0]
++        max_currency_stake = self.get_total_stake_amount() * max_exposure_ratio
++        current_exposure = sum(
++            trade.stake_amount
++            for trade in Trade.get_open_trades()
++            if trade.safe_base_currency == currency
++        )
++        return max(max_currency_stake - current_exposure, 0)
++
+     def validate_stake_amount(
+         self,
+         pair: str,
+@@ -428,6 +453,15 @@ class Wallets:
+             # Otherwise we could no longer exit.
+             max_allowed_stake = min(max_allowed_stake, max_stake_amount - trade_amount)
+ 
++        max_exposure_stake = self._get_max_stake_for_currency_exposure(pair)
++        if max_exposure_stake is not None and max_exposure_stake < max_allowed_stake:
++            self._local_log(
++                f"Stake amount for pair {pair} is capped to {max_exposure_stake} to respect "
++                "the configured `max_currency_exposure`.",
++                level="debug",
++            )
++            max_allowed_stake = max_exposure_stake
++
+         if min_stake_amount is not None and min_stake_amount > max_allowed_stake:
+             self._local_log(
+                 "Minimum stake amount > available balance. "
+diff --git a/tests/optimize/test_backtesting.py b/tests/optimize/test_backtesting.py
+index b958223..77548f6 100644
+--- a/tests/optimize/test_backtesting.py
++++ b/tests/optimize/test_backtesting.py
+@@ -590,6 +590,65 @@ def test_backtest__enter_trade(default_conf, fee, mocker) -> None:
+     assert trade.stake_amount == 300.0
+ 
+ 
++def test_backtest__enter_trade_currency_exposure(default_conf, fee, mocker) -> None:
++    default_conf["use_exit_signal"] = False
++    mocker.patch(f"{EXMS}.get_fee", fee)
++    mocker.patch(f"{EXMS}.get_min_pair_stake_amount", return_value=0.00001)
++    mocker.patch(f"{EXMS}.get_max_pair_stake_amount", return_value=float("inf"))
++    patch_exchange(mocker)
++    default_conf["max_open_trades"] = 2
++    default_conf["max_currency_exposure"] = 0.3
++    backtesting = Backtesting(default_conf)
++    backtesting._set_strategy(backtesting.strategylist[0])
++    backtesting.strategy.custom_stake_amount = lambda **kwargs: 100
++    pair = "UNITTEST/BTC"
++    row = [
++        pd.Timestamp(year=2020, month=1, day=1, hour=5, minute=0),
++        1,  # Buy
++        0.001,  # Open
++        0.0011,  # Close
++        0,  # Sell
++        0.00099,  # Low
++        0.0012,  # High
++        "",  # Buy Signal Name
++    ]
++    total_stake = backtesting.wallets.get_total_stake_amount()
++    max_currency_stake = total_stake * 0.3
++
++    # An already-open trade for the same underlying (base) currency eats into the
++    # allowance for any further trade in that currency.
++    existing_stake = 250.0
++    existing_trade = LocalTrade(
++        pair=pair,
++        base_currency="UNITTEST",
++        stake_currency="BTC",
++        open_rate=0.001,
++        open_date=row[0],
++        stake_amount=existing_stake,
++        amount=existing_stake / 0.001,
++        fee_open=fee.return_value,
++        fee_close=fee.return_value,
++        is_open=True,
++        exchange="binance",
++    )
++    LocalTrade.bt_trades_open.append(existing_trade)
++    backtesting.wallets.update()
++
++    trade = backtesting._enter_trade(pair, row=row, direction="long")
++    assert trade is not None
++    assert trade.stake_amount == pytest.approx(max_currency_stake - existing_stake)
++    LocalTrade.bt_trades_open.pop()  # Remove the newly-entered trade
++
++    LocalTrade.bt_trades_open.pop()  # Remove the pre-existing trade
++
++    # Without the pre-existing trade eating into the allowance, the full requested
++    # stake fits under the cap.
++    backtesting.wallets.update()
++    trade = backtesting._enter_trade(pair, row=row, direction="long")
++    assert trade is not None
++    assert trade.stake_amount == 100
++
++
+ def test_backtest__enter_trade_futures(default_conf_usdt, fee, mocker) -> None:
+     default_conf_usdt["use_exit_signal"] = False
+     mocker.patch(f"{EXMS}.get_fee", fee)
+diff --git a/tests/test_wallets.py b/tests/test_wallets.py
+index 9c0c018..af49675 100644
+--- a/tests/test_wallets.py
++++ b/tests/test_wallets.py
+@@ -218,6 +218,57 @@ def test_validate_stake_amount(
+     assert res == expected
+ 
+ 
++@pytest.mark.parametrize(
++    "max_currency_exposure,total_stake,existing_exposure,expected",
++    [
++        (None, 1000, 0, None),  # Not configured - disabled.
++        (1.0, 1000, 0, None),  # 100% - equivalent to disabled.
++        (0.3, 1000, 0, 300),  # No existing exposure - full share available.
++        (0.3, 1000, 250, 50),  # Existing exposure reduces the remaining share.
++        (0.3, 1000, 400, 0),  # Existing exposure already exceeds the cap.
++    ],
++)
++def test_get_max_stake_for_currency_exposure(
++    mocker, default_conf, max_currency_exposure, total_stake, existing_exposure, expected
++):
++    freqtrade = get_patched_freqtradebot(mocker, default_conf)
++    if max_currency_exposure is not None:
++        freqtrade.config["max_currency_exposure"] = max_currency_exposure
++
++    mocker.patch("freqtrade.wallets.Wallets.get_total_stake_amount", return_value=total_stake)
++    open_trade = MagicMock(safe_base_currency="ETH", stake_amount=existing_exposure)
++    other_currency_trade = MagicMock(safe_base_currency="BTC", stake_amount=99999)
++    mocker.patch(
++        "freqtrade.wallets.Trade.get_open_trades",
++        return_value=[open_trade, other_currency_trade],
++    )
++
++    res = freqtrade.wallets._get_max_stake_for_currency_exposure("ETH/USDT")
++    assert res == expected
++
++
++def test_validate_stake_amount_currency_exposure(mocker, default_conf):
++    freqtrade = get_patched_freqtradebot(mocker, default_conf)
++    freqtrade.config["max_currency_exposure"] = 0.3
++
++    mocker.patch("freqtrade.wallets.Wallets.get_available_stake_amount", return_value=10000)
++    mocker.patch("freqtrade.wallets.Wallets.get_total_stake_amount", return_value=1000)
++    open_trade = MagicMock(safe_base_currency="ETH", stake_amount=250)
++    mocker.patch("freqtrade.wallets.Trade.get_open_trades", return_value=[open_trade])
++
++    # Exposure limit (300 - 250 = 50) is more restrictive than max_stake_amount / availability.
++    res = freqtrade.wallets.validate_stake_amount("ETH/USDT", 100, 10, 10000, None)
++    assert res == 50
++
++    # A pair with a different underlying currency is unaffected by ETH's exposure.
++    res = freqtrade.wallets.validate_stake_amount("XRP/USDT", 100, 10, 10000, None)
++    assert res == 100
++
++    # If the exposure headroom is below min-stake, the trade is skipped entirely.
++    res = freqtrade.wallets.validate_stake_amount("ETH/USDT", 100, 60, 10000, None)
++    assert res == 0
++
++
+ @pytest.mark.parametrize(
+     "available_capital,closed_profit,open_stakes,free,expected",
+     [

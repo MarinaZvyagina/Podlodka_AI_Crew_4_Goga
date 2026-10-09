@@ -1,0 +1,17 @@
+## Cache repeated source searches
+
+When browsing a source and searching for a title, if the user searches for the same query again
+shortly after (for example, they navigate back to the browse screen and re-enter the same search,
+or scroll back up and the screen reloads), the app re-fetches the exact same results from the
+network every time, even though nothing has changed. This is slow, wastes the user's data, and
+feels especially bad on flaky connections.
+
+Please add caching so that searching a source with the same query and filters shortly after a
+previous identical search returns the previously-fetched results without hitting the network
+again. This should also apply to the regular "popular" and "latest" listings a source shows, not
+just explicit text search.
+
+The cache should not serve stale data forever — it should expire after some reasonable amount of
+time, and it should also be possible to force a fresh fetch (for example, when the user explicitly
+pulls to refresh or reloads results). Scrolling through multiple pages of a cached search must
+keep working correctly.

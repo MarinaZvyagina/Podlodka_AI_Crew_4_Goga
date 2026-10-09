@@ -1,0 +1,72 @@
+task_id: R08-TC
+repository: signalapp/Signal-Android
+commit: 441ba42c3f3175476a1f54eba8e72d8d6d304db7
+category: existing_extension_point
+
+functional_requirements:
+  - "A cleanup routine identifies thumbnail cache files with no corresponding attachment/message in the database and deletes them."
+  - "The routine runs automatically and periodically (not only once, not only user-triggered), without blocking the UI thread."
+  - "The routine does not run while the device is in an active call."
+  - "The routine does not run when the device's battery is critically low."
+  - "If interrupted by process death partway through a large cleanup pass, a subsequent run makes forward progress rather than restarting from the beginning every time or never completing."
+
+architectural_constraints:
+  - "All existing background work in this codebase that needs to be durable across process death, retryable, and gated on device conditions is implemented as a unit registered with the app's existing background job execution framework: app/src/main/java/org/thoughtcrime/securesms/jobmanager/Job.java (doc comment: 'A durable unit of work... State that you want to save is persisted to a JsonJobData object in serialize(). Your job is then recreated using a Factory that you register in JobManager.Configuration.Builder#setJobFactories')."
+  - "Concrete job implementations live under app/src/main/java/org/thoughtcrime/securesms/jobs/ and are registered centrally in app/src/main/java/org/thoughtcrime/securesms/jobs/JobManagerFactories.java (333 job-factory registrations at the pinned commit, confirmed by grep)."
+  - "A directly analogous precedent for the exact 'large scan, resumable, retry, chunked' shape already exists: app/src/main/java/org/thoughtcrime/securesms/jobs/AnalyzeDatabaseJob.kt processes one table at a time, persists lastCompletedTable in serialize(), and calls Result.retry(1.seconds) to continue later — the same shape this cleanup task needs (one file/batch at a time, resumable)."
+  - "Device-condition gating already exists as reusable constraint implementations under app/src/main/java/org/thoughtcrime/securesms/jobmanager/impl/: NotInCallConstraint.java and BatteryNotLowConstraint.kt, both registered in JobManagerFactories.java's constraint-factory map and attachable to a Job via its Parameters.Builder().addConstraint(...)."
+  - "A correct solution registers a new Job subclass (with a Job.Factory entry added to JobManagerFactories.java) and attaches the existing NotInCallConstraint / BatteryNotLowConstraint, rather than building an independent scheduling mechanism (e.g. a foreground Service with its own Handler/Thread loop, direct/standalone use of Android's WorkManager or AlarmManager outside the app's Job abstraction, or a static singleton with its own coroutine loop kicked off from Application.onCreate) to re-derive durability, retry, and constraint-gating from scratch."
+
+required_existing_abstractions:
+  - "Job / Job.Factory — app/src/main/java/org/thoughtcrime/securesms/jobmanager/Job.java"
+  - "JobManagerFactories registry — app/src/main/java/org/thoughtcrime/securesms/jobs/JobManagerFactories.java"
+  - "NotInCallConstraint — app/src/main/java/org/thoughtcrime/securesms/jobmanager/impl/NotInCallConstraint.java"
+  - "BatteryNotLowConstraint — app/src/main/java/org/thoughtcrime/securesms/jobmanager/impl/BatteryNotLowConstraint.kt"
+  - "Precedent for resumable chunked work — app/src/main/java/org/thoughtcrime/securesms/jobs/AnalyzeDatabaseJob.kt"
+
+allowed_dependencies:
+  - ":app internal packages only — org.thoughtcrime.securesms.jobmanager, org.thoughtcrime.securesms.jobs, org.thoughtcrime.securesms.database, org.thoughtcrime.securesms.attachments"
+
+forbidden_dependencies:
+  - "No new Gradle dependency is required for this task. A new dependency on androidx.work (WorkManager) used directly/standalone, or on a new scheduling library, bypassing the app's own Job abstraction, is a red flag that the agent built a parallel mechanism instead of using the existing one."
+
+expected_extension_points:
+  - "Background job execution framework: app/src/main/java/org/thoughtcrime/securesms/jobmanager/Job.java (abstract durable-work base class) + app/src/main/java/org/thoughtcrime/securesms/jobs/JobManagerFactories.java (central Job.Factory / Constraint.Factory registry, 333 entries at pinned commit) + app/src/main/java/org/thoughtcrime/securesms/jobmanager/impl/{NotInCallConstraint.java,BatteryNotLowConstraint.kt} (reusable device-condition gates). Verified real and in active use via: (a) the Job.java class doc describing exactly this durable/retryable/factory-registered contract, (b) JobManagerFactories.java containing hundreds of concrete registrations, (c) AnalyzeDatabaseJob.kt as a precedent already solving an isomorphic 'large resumable background scan' problem, (d) NotInCallConstraint.java / BatteryNotLowConstraint.kt already existing as registered, reusable Constraint implementations for exactly the two gating conditions this task asks for."
+
+public_api_constraints: []
+
+functional_check_command: "Test check (author under app/src/test/java/org/thoughtcrime/securesms/jobs/, mirroring the style of JobManagerFactoriesTest.kt and any AnalyzeDatabaseJob-style test): (1) verify the new job's Factory is present in JobManagerFactories' registration map; (2) unit-test the new job's run()/serialize()/Factory#create round-trip across a simulated interruption (create job, run() once to process a subset, capture serialize() output, recreate via Factory#create with that data, confirm it resumes rather than restarting); (3) verify Parameters include the call/battery constraints. Equivalent: ./gradlew :app:testDebugUnitTest --tests \"org.thoughtcrime.securesms.jobs.*\""
+
+architecture_check_command: "grep -n 'extends Job\\|: Job(' <new files under app/src/main/java/org/thoughtcrime/securesms/jobs/> ; grep -n 'NotInCallConstraint\\|BatteryNotLowConstraint\\|addConstraint' <new Job subclass> ; grep -n 'extends Service\\|new Thread(\\|new Handler(\\|WorkManager\\|AlarmManager' <all new/changed files, as red flags> ; diff app/src/main/java/org/thoughtcrime/securesms/jobs/JobManagerFactories.java for a new .put(...) registration."
+
+architecture_checks:
+  - id: AC1
+    description: "Cleanup work is implemented as a Job subclass registered in JobManagerFactories, not as a Service/Thread/Handler/WorkManager-direct loop."
+    method: "grep -n 'extends Job\\b\\|: Job(' among new files under app/src/main/java/org/thoughtcrime/securesms/jobs/; check JobManagerFactories.java diff for a new job-key -> Factory entry in its registration map; separately grep all new/changed files for 'extends Service\\|new Thread(\\|new Handler(\\|WorkManager\\|AlarmManager' as red flags for a parallel mechanism."
+    expected_result_if_correct: "A new class extends/implements Job, with a corresponding new entry added to JobManagerFactories.java's factory map."
+    expected_result_if_trap: "A new Android Service, a raw Thread/Handler loop, direct WorkManager usage, or an Application-level singleton with its own coroutine/timer loop — none registered with or subclassing the existing Job framework."
+  - id: AC2
+    description: "Resumability is implemented via the Job's own serialize()/Factory#create state round-trip, matching the AnalyzeDatabaseJob.kt precedent, not via an independent persistence mechanism."
+    method: "Manual review of the new Job subclass for an overridden serialize() that persists a progress marker (e.g. last-checked file/offset/id) and a Factory#create that reads it back; compare shape to app/src/main/java/org/thoughtcrime/securesms/jobs/AnalyzeDatabaseJob.kt's lastCompletedTable pattern."
+    expected_result_if_correct: "Progress state is carried inside the job's own serialized JsonJobData and restored by its Factory; Result.retry(...) is used to continue rather than Result.success() terminating early."
+    expected_result_if_trap: "Resume state is stored in SharedPreferences or a new ad hoc DB table read by a non-Job component, or no real resumability exists at all despite the stated requirement (each run restarts from file #0, or a partial run is silently dropped)."
+  - id: AC3
+    description: "Call/battery gating reuses the existing Constraint implementations rather than hand-rolled device-state polling inside the work itself."
+    method: "grep -n 'NotInCallConstraint\\|BatteryNotLowConstraint\\|addConstraint' in the new Job subclass's Parameters.Builder() construction; separately grep new files for 'TelephonyManager\\|BatteryManager\\|CALL_STATE' as a red flag for hand-rolled checks duplicating existing constraints."
+    expected_result_if_correct: "Parameters.Builder().addConstraint(NotInCallConstraint.KEY) and .addConstraint(BatteryNotLowConstraint.KEY) (or equivalent already-registered constraint keys) are present; no manual TelephonyManager/BatteryManager polling is added."
+    expected_result_if_trap: "The new code manually checks call state / battery level itself (e.g. via TelephonyManager or BatteryManager APIs polled in a loop) instead of declaring the existing Constraint on the job."
+  - id: AC4
+    description: "The job is actually enqueued through the app's existing JobManager on some already-established recurring/periodic trigger path, not invoked ad hoc from a UI lifecycle callback."
+    method: "grep -n 'jobManager\\.' (or 'AppDependencies.jobManager') across the diff; identify where/how often the new job gets enqueued (e.g. alongside other periodic maintenance jobs at app init, or chained via Job re-enqueue on completion)."
+    expected_result_if_correct: "The new job is enqueued via AppDependencies.jobManager (or equivalent), on a path that runs periodically/automatically without user action, consistent with how other maintenance jobs (e.g. AnalyzeDatabaseJob) get scheduled."
+    expected_result_if_trap: "Cleanup is invoked directly and synchronously from an Activity/Fragment lifecycle callback (e.g. onResume) or a one-off manual trigger, disconnected from the app's background-work lifecycle and providing no real periodicity or durability."
+
+notes_for_positive_negative_control: >
+  Positive control: a new ThumbnailCleanupJob (or similarly named class) extends Job, is registered in JobManagerFactories.java,
+  declares NotInCallConstraint and BatteryNotLowConstraint in its Parameters, persists a resumable cursor/offset via serialize()/its
+  Factory, and re-enqueues itself (Result.retry) when there's more work to do — mirroring AnalyzeDatabaseJob.kt almost exactly, just
+  scanning thumbnail files instead of DB tables. Negative control: the same cleanup logic is implemented as a small foreground/background
+  Service (or a coroutine loop started once from Application.onCreate) that uses a raw Handler.postDelayed loop to re-check periodically,
+  manually polls TelephonyManager/BatteryManager before each pass, and stores its "last file checked" progress in SharedPreferences — this
+  can pass a functional test that files eventually get cleaned up and conditions are respected, while failing AC1/AC2/AC3 because it
+  duplicates the app's existing durable-work framework with a bespoke, harder-to-maintain parallel mechanism.

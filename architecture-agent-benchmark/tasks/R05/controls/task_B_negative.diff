@@ -1,0 +1,192 @@
+diff --git a/app/vmagent/main.go b/app/vmagent/main.go
+index 6c532cc..e46ee3a 100644
+--- a/app/vmagent/main.go
++++ b/app/vmagent/main.go
+@@ -43,6 +43,7 @@ import (
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/procutil"
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/kubernetes"
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/opentelemetry/firehose"
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/protoparserutil"
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/pushmetrics"
+@@ -478,6 +479,22 @@ func requestHandler(w http.ResponseWriter, r *http.Request) bool {
+ 		scrapePool := r.FormValue("scrapePool")
+ 		promscrape.WriteAPIV1Targets(w, state, scrapePool)
+ 		return true
++	case "/api/v1/limited_jobs":
++		// Ad hoc endpoint for visibility into kubernetes_sd_configs entries which hit
++		// -promscrape.kubernetesSD.maxTargetsPerJob (see lib/promscrape/discovery/kubernetes).
++		w.Header().Set("Content-Type", "application/json")
++		limited := kubernetes.LimitedTargetsSnapshot()
++		fmt.Fprintf(w, `{"status":"success","data":{`)
++		i := 0
++		for key, dropped := range limited {
++			if i > 0 {
++				fmt.Fprintf(w, `,`)
++			}
++			fmt.Fprintf(w, `%q:%d`, key, dropped)
++			i++
++		}
++		fmt.Fprintf(w, `}}`)
++		return true
+ 	case "/prometheus/target_response", "/target_response":
+ 		promscrapeTargetResponseRequests.Inc()
+ 		if err := promscrape.WriteTargetResponse(w, r); err != nil {
+diff --git a/lib/promscrape/discovery/kubernetes/kubernetes.go b/lib/promscrape/discovery/kubernetes/kubernetes.go
+index 98b96a1..3cf0dec 100644
+--- a/lib/promscrape/discovery/kubernetes/kubernetes.go
++++ b/lib/promscrape/discovery/kubernetes/kubernetes.go
+@@ -3,6 +3,7 @@ package kubernetes
+ import (
+ 	"flag"
+ 	"fmt"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
+@@ -15,6 +16,30 @@ var SDCheckInterval = flag.Duration("promscrape.kubernetesSDCheckInterval", 30*t
+ 	"This works only if kubernetes_sd_configs is configured in '-promscrape.config' file. "+
+ 	"See https://docs.victoriametrics.com/victoriametrics/sd_configs/#kubernetes_sd_configs for details")
+ 
++// maxTargetsPerJob caps the number of scrape targets a single kubernetes_sd_configs entry
++// (api_server + role combination) is allowed to return. NOTE: this is a NEGATIVE CONTROL /
++// intentionally-flawed implementation for benchmark purposes: the cap is self-contained inside
++// the kubernetes discovery backend only, and every other *_sd_configs backend remains unbounded.
++var maxTargetsPerJob = flag.Int("promscrape.kubernetesSD.maxTargetsPerJob", 0, "The maximum number of scrape targets a single kubernetes_sd_configs entry is allowed to return. "+
++	"Zero (default) disables the limit. See /api/v1/limited_jobs for the list of kubernetes_sd_configs entries which hit the limit")
++
++var (
++	limitedTargetsMu sync.Mutex
++	limitedTargets   = make(map[string]int)
++)
++
++// LimitedTargetsSnapshot returns a snapshot of api_server+role combinations which hit
++// -promscrape.kubernetesSD.maxTargetsPerJob, together with the number of excluded targets.
++func LimitedTargetsSnapshot() map[string]int {
++	limitedTargetsMu.Lock()
++	defer limitedTargetsMu.Unlock()
++	m := make(map[string]int, len(limitedTargets))
++	for k, v := range limitedTargets {
++		m[k] = v
++	}
++	return m
++}
++
+ // SDConfig represents kubernetes-based service discovery config.
+ //
+ // See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#kubernetes_sd_config
+@@ -80,7 +105,21 @@ func (sdc *SDConfig) GetScrapeWorkObjects() ([]any, error) {
+ 	if sdc.cfg == nil {
+ 		return nil, sdc.startErr
+ 	}
+-	return sdc.cfg.aw.getScrapeWorkObjects(), nil
++	swos := sdc.cfg.aw.getScrapeWorkObjects()
++	limit := *maxTargetsPerJob
++	key := fmt.Sprintf("%s/%s", sdc.APIServer, sdc.role())
++	if limit > 0 && len(swos) > limit {
++		dropped := len(swos) - limit
++		limitedTargetsMu.Lock()
++		limitedTargets[key] = dropped
++		limitedTargetsMu.Unlock()
++		swos = swos[:limit]
++	} else {
++		limitedTargetsMu.Lock()
++		delete(limitedTargets, key)
++		limitedTargetsMu.Unlock()
++	}
++	return swos, nil
+ }
+ 
+ // MustStart initializes sdc before its usage.
+diff --git a/lib/promscrape/discovery/kubernetes/kubernetes_maxtargets_test.go b/lib/promscrape/discovery/kubernetes/kubernetes_maxtargets_test.go
+new file mode 100644
+index 0000000..2f092e7
+--- /dev/null
++++ b/lib/promscrape/discovery/kubernetes/kubernetes_maxtargets_test.go
+@@ -0,0 +1,85 @@
++package kubernetes
++
++import (
++	"fmt"
++	"testing"
++
++	"github.com/VictoriaMetrics/metrics"
++)
++
++// newSDConfigWithFakeTargets builds an *SDConfig backed by an apiWatcher pre-seeded with n fake
++// ScrapeWork-like objects, bypassing the real Kubernetes API watcher machinery. This is enough to
++// exercise (*SDConfig).GetScrapeWorkObjects() and its -promscrape.kubernetesSD.maxTargetsPerJob
++// truncation without spinning up a fake API server.
++func newSDConfigWithFakeTargets(t *testing.T, apiServer string, n int) *SDConfig {
++	t.Helper()
++	sdc := &SDConfig{
++		APIServer: apiServer,
++		Role:      "pod",
++	}
++	aw := &apiWatcher{
++		role:             sdc.role(),
++		gw:               &groupWatcher{m: make(map[string]*urlWatcher)},
++		swosByURLWatcher: make(map[*urlWatcher]map[string][]any),
++		swosCount:        metrics.GetOrCreateCounter(fmt.Sprintf(`test_kubernetes_swos_count{name=%q}`, t.Name())),
++	}
++	uw := &urlWatcher{}
++	swosByKey := make(map[string][]any, n)
++	for i := 0; i < n; i++ {
++		swosByKey[fmt.Sprintf("key-%d", i)] = []any{fmt.Sprintf("target-%d", i)}
++	}
++	aw.swosByURLWatcher[uw] = swosByKey
++	sdc.cfg = &apiConfig{aw: aw}
++	return sdc
++}
++
++// TestKubernetesSDMaxTargetsPerJob is a Kubernetes-only functional test for the (intentionally
++// backend-local, see negative control notes in metadata_B.yaml) -promscrape.kubernetesSD.maxTargetsPerJob
++// cap: it covers a discovery round under the limit (unaffected), over the limit (truncated, and
++// visible via kubernetes.LimitedTargetsSnapshot), and the default/unlimited behavior.
++func TestKubernetesSDMaxTargetsPerJob(t *testing.T) {
++	defaultLimit := *maxTargetsPerJob
++	defer func() { *maxTargetsPerJob = defaultLimit }()
++
++	t.Run("default is unlimited", func(t *testing.T) {
++		*maxTargetsPerJob = 0
++		sdc := newSDConfigWithFakeTargets(t, "http://fake-api-server-1", 10)
++		swos, err := sdc.GetScrapeWorkObjects()
++		if err != nil {
++			t.Fatalf("unexpected error: %s", err)
++		}
++		if len(swos) != 10 {
++			t.Fatalf("unexpected number of targets; got %d; want 10", len(swos))
++		}
++	})
++
++	t.Run("under the limit is unaffected", func(t *testing.T) {
++		*maxTargetsPerJob = 10
++		sdc := newSDConfigWithFakeTargets(t, "http://fake-api-server-2", 5)
++		swos, err := sdc.GetScrapeWorkObjects()
++		if err != nil {
++			t.Fatalf("unexpected error: %s", err)
++		}
++		if len(swos) != 5 {
++			t.Fatalf("unexpected number of targets; got %d; want 5", len(swos))
++		}
++	})
++
++	t.Run("over the limit is truncated and visible via LimitedTargetsSnapshot", func(t *testing.T) {
++		*maxTargetsPerJob = 3
++		apiServer := "http://fake-api-server-3"
++		sdc := newSDConfigWithFakeTargets(t, apiServer, 10)
++		swos, err := sdc.GetScrapeWorkObjects()
++		if err != nil {
++			t.Fatalf("unexpected error: %s", err)
++		}
++		if len(swos) != 3 {
++			t.Fatalf("unexpected number of targets; got %d; want 3", len(swos))
++		}
++		snapshot := LimitedTargetsSnapshot()
++		key := fmt.Sprintf("%s/%s", apiServer, sdc.role())
++		if dropped, ok := snapshot[key]; !ok || dropped != 7 {
++			t.Fatalf("unexpected LimitedTargetsSnapshot()[%q]; got %d (present=%v); want 7", key, dropped, ok)
++		}
++	})
++}

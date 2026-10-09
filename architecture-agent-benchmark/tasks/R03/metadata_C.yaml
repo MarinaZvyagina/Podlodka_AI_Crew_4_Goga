@@ -1,0 +1,151 @@
+task_id: R03-TC
+repository: nestjs/nest
+commit: f94e9eb15ba2a22f69aef234cb81333764d0b298
+category: existing_extension_point
+
+functional_requirements:
+  - A developer can mark an individual route handler method, or an entire controller class, as
+    "affected by maintenance mode".
+  - While maintenance mode is toggled on, calls to marked handlers are rejected (with a clear
+    error) before any of the handler's own business logic executes; unmarked handlers are
+    completely unaffected and keep working normally.
+  - Toggling maintenance mode off restores normal behavior for previously-blocked handlers,
+    without redeploying or restarting the process.
+  - The same marking approach and rejection point in the pipeline work for plain HTTP route
+    handlers and for WebSocket gateway message handlers — one consistent mechanism, not two.
+  - The check can be unit-tested in isolation — it must be possible to assert "handler X is
+    blocked / handler Y is not, given the current maintenance-mode state" without booting an HTTP
+    server or opening a socket connection.
+
+architectural_constraints:
+  - Must reuse the framework's existing "is this call allowed to proceed" mechanism rather than
+    introduce a second, parallel check running at a different point in the pipeline (e.g. inside
+    handler bodies, in response-shaping/interceptor code, or via new low-level
+    connection/middleware interception).
+  - Which handlers are marked must be attached via reflective metadata on the method/class
+    (consistent with how other per-route configuration is expressed in this codebase), not via a
+    hand-rolled registry keyed by literal HTTP path strings — a path-string registry cannot
+    express "this WebSocket message handler is protected", since WS message handlers have no
+    HTTP path.
+  - Must not introduce a new dependency from packages/common on packages/core, or add any new
+    code to packages/platform-express or packages/platform-fastify — the correct mechanism
+    operates above the concrete HTTP adapter layer and is therefore transport-agnostic by
+    construction.
+
+required_existing_abstractions:
+  - CanActivate interface — packages/common/interfaces/features/can-activate.interface.ts
+  - SetMetadata decorator — packages/common/decorators/core/set-metadata.decorator.ts
+  - Reflector service — packages/core/services/reflector.service.ts
+  - GuardsConsumer / GuardsContextCreator — packages/core/guards/guards-consumer.ts,
+    packages/core/guards/guards-context-creator.ts
+  - "@UseGuards decorator / APP_GUARD token — packages/common/decorators/core/use-guards.decorator.ts,
+    packages/core/constants.ts"
+
+allowed_dependencies:
+  - packages/common, packages/core (existing edges only)
+
+forbidden_dependencies:
+  - packages/platform-express, packages/platform-fastify — a transport-agnostic "reject before
+    handler runs" mechanism should not need any HTTP-adapter-specific code; new code appearing
+    here indicates the solution bolted the check onto one specific adapter instead of using the
+    shared, cross-transport mechanism.
+
+expected_extension_points:
+  - name: "Guard mechanism (CanActivate interface + GuardsConsumer/GuardsContextCreator execution),
+      combined with SetMetadata + Reflector for per-handler marking"
+    verified_at:
+      - packages/common/interfaces/features/can-activate.interface.ts
+      - packages/core/guards/guards-consumer.ts
+      - packages/core/guards/guards-context-creator.ts
+      - packages/common/decorators/core/set-metadata.decorator.ts
+      - packages/common/decorators/core/use-guards.decorator.ts
+      - packages/core/services/reflector.service.ts
+    cross_transport_evidence: >
+      packages/core/router/router-execution-context.ts (HTTP) and
+      packages/websockets/context/ws-context-creator.ts (WebSocket gateways) both construct and
+      invoke the same GuardsContextCreator/GuardsConsumer pair, confirming guards are already the
+      one mechanism genuinely shared across these two transports in this codebase — not merely
+      documented as reusable in theory.
+
+public_api_constraints:
+  - Must not change the public signature of CanActivate or ExecutionContext.
+  - If a new guard/decorator pair is added as reusable framework surface, it should follow
+    existing @publicApi annotation conventions used by sibling guards/decorators; this is not
+    strictly required if the solution is expressed as example/application-level code instead.
+
+functional_check_command: >
+  Unit test: instantiate the new guard class directly (no HTTP server), construct two mock
+  ExecutionContext objects — one wrapping a handler marked maintenance-protected, one wrapping an
+  unmarked handler — toggle a maintenance-mode flag/service and assert `canActivate()` returns
+  false/true accordingly for each. Integration: an e2e test hitting a marked HTTP route while
+  maintenance mode is on expects a non-2xx rejection and the route handler body never executing
+  (e.g. via a spy); a WS gateway e2e test emitting a marked message while maintenance mode is on
+  expects the handler not to execute, while an unmarked handler/route on the same
+  app continues to work.
+
+architecture_check_command: >
+  grep-based diff inspection plus manual review, per architecture_checks below.
+
+architecture_checks:
+  - id: AC1
+    description: Rejection is implemented via a class shaped like the framework's existing "allowed to proceed" contract.
+    method: "grep -n 'implements CanActivate' across the diff."
+    expected_result_if_correct: >
+      Present — a new class implements CanActivate and is registered against handlers via
+      @UseGuards (or globally via APP_GUARD).
+    expected_result_if_trap: >
+      No CanActivate implementation found; instead the diff shows a new interceptor-shaped class
+      performing the block, or manual `if (maintenanceService.isOn()) { throw ... }` guard clauses
+      pasted at the top of each protected handler/controller method body.
+  - id: AC2
+    description: Per-handler marking is done via reflective metadata, not a string-keyed path registry.
+    method: >
+      grep -n "SetMetadata\|Reflector" in the diff; separately grep for suspicious patterns such
+      as a `Set<string>`/array of literal URL path strings checked against `request.url` or
+      `request.path` to decide protection.
+    expected_result_if_correct: >
+      A SetMetadata-based custom decorator marks handlers/classes; the guard reads it back via
+      Reflector.get/getAllAndOverride.
+    expected_result_if_trap: >
+      A hardcoded list of path strings (e.g. `['/orders', '/payments']`) is checked against the
+      incoming HTTP request's URL — functionally works for the tested HTTP routes but cannot
+      express "this WS message handler is protected," so the WS requirement is silently unmet.
+  - id: AC3
+    description: The same mechanism is genuinely exercised for both HTTP and WebSocket gateways, and no HTTP-adapter-specific code was added.
+    method: >
+      Inspect added/changed test or example files for both an HTTP controller case and a
+      `@WebSocketGateway`/`@SubscribeMessage` case referencing the same guard class; grep
+      packages/platform-express and packages/platform-fastify for any new maintenance-mode-related
+      code (expected: none).
+    expected_result_if_correct: >
+      Same guard class is applied to (and tested against) both an HTTP handler and a WS gateway
+      handler; zero new code in either platform-express or platform-fastify.
+    expected_result_if_trap: >
+      Two separate implementations exist (e.g. a guard for HTTP plus a platform-express-specific
+      middleware/route-level check for the WS-adjacent case), or the WS path is left unprotected
+      because the trap solution only touches the HTTP request pipeline.
+  - id: AC4
+    description: No bypass of routing/guard resolution via raw middleware or adapter-level hacks.
+    method: >
+      grep the diff for `.use(` calls registering raw middleware, or edits inside
+      packages/platform-express/adapters/express-adapter.ts or
+      packages/platform-fastify/adapters/fastify-adapter.ts.
+    expected_result_if_correct: None found.
+    expected_result_if_trap: >
+      Maintenance check implemented as Express (or Fastify) middleware registered via
+      `app.use(...)`, which runs before routing/guard resolution and has no equivalent code path
+      for WebSocket gateway messages at all.
+
+notes_for_positive_negative_control: >
+  Positive control: a `MaintenanceModeGuard implements CanActivate` that reads metadata attached
+  by a small `SetMetadata`-based decorator (e.g. applied per-method or per-class), injects a
+  maintenance-mode flag/service via DI, is registered with `@UseGuards`/`APP_GUARD`, and is
+  demonstrated/tested against both an HTTP controller method and a `@SubscribeMessage` gateway
+  handler — both work because both paths already funnel through the same guard-execution
+  machinery. Negative/trap control: the maintenance check reimplemented as Express middleware
+  (`app.use((req, res, next) => { if (isMaintained(req.path)) return res.status(503).end(); next(); })`)
+  registered directly against the underlying Express instance, or duplicated as a manual guard
+  clause pasted into each protected controller method and gateway handler body — compiles, blocks
+  the specific HTTP routes exercised by a naive functional test, but WS messages still execute
+  during maintenance, and protecting a newly added route requires remembering to edit multiple
+  places by hand.

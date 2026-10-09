@@ -1,0 +1,74 @@
+# R08-TC-BF-06
+
+Condition: goga_forced_workflow
+Functional success: False
+Full architecture conformance: False
+ACR: 0.0
+Dangerous success: False
+Goga engagement signal: False
+Cost: $2.5832638500000003
+Duration: 441074ms, turns: 51
+
+## Agent's own summary
+
+# Change Plan
+
+## Task Classification
+**Feature extension** — adds periodic scheduling, resumability, and battery/call constraint-gating to an existing opportunistic cleanup routine. No existing public contract changes shape or meaning; purely additive.
+
+## Affected Cells
+
+| Cell | Files to Modify | What Changes |
+|---|---|---|
+| `app/src/main/java/org/thoughtcrime/securesms/database` | `AttachmentTable.kt` | Extract the existing disk-vs-DB diff into a reusable private helper; add a new public batched/resumable cleanup method that deletes a bounded chunk per call and returns what's left |
+| `app/src/main/java/org/thoughtcrime/securesms/jobmanager` | *(none — only consumed, not modified)* | `Job`, `Job.Parameters`, `JsonJobData`, `Constraint.KEY` constants are consumed as-is via their existing public contracts |
+| *(non-cell implementation)* | `jobs/DeleteAbandonedAttachmentsJob.kt`, `jobs/JobManagerFactories.java` (no line change needed, verified below), `service/DeleteAbandonedAttachmentFilesAlarmListener.kt` (new), `keyvalue/MiscellaneousValues.kt`, `ApplicationContext.java` | Job becomes resumable + constraint-gated; new alarm listener drives periodic cadence |
+
+## Root Cause Analysis
+(From Investigation Report) Orphaned files persist because `DeleteAbandonedAttachmentsJob` is never scheduled on a recurring cadence — only opportunistically (`ThreadTable` mutations) and once (`AppInitialization`) — and its underlying `AttachmentTable.deleteAbandonedAttachmentFiles()` does a single unbatched, unchecked-pointed pass, so a process kill mid-run wastes the whole pass with no resume state. No battery/call gating exists today (only `DataRestoreConstraint.KEY`).
+
+## Trace Summary
+`ApplicationContext.initializePeriodicTasks()` → new `DeleteAbandonedAttachmentFilesAlarmListener.schedule()` → `PersistentAlarmManagerListener.onReceive()` → `onAlarm()` → `DeleteAbandonedAttachmentsJob.enqueue()` → `JobManager` (durable queue) → `Job.run()` → `AttachmentTable.deleteAbandonedAttachmentFilesBatch(remaining, batchSize)` → deletes ≤`batchSize` files, returns remainder → job serializes remainder via `JsonJobData` and returns `Result.retry(...)` until empty. Existing opportunistic call sites (`ThreadTable.kt`, `AppInitialization.java`) continue calling the same `enqueue()`, now benefiting from constraint-gating and batching automatically — no call-site changes needed there.
+
+## Change Strategy
+
+**Design decision: extend `DeleteAbandonedAttachmentsJob` in place; do not introduce a second job class.**
+Rejected the "new parallel job class" alternative because: (a) it would duplicate the diff-and-delete logic across two classes or force one to depend awkwardly on the other; (b) two independently-scheduled jobs racing over the same "parts" directory risks redundant work/log noise; (c) the investigation's rejected-hypotheses only ruled out *(i)* making the job self-schedule instead of using an alarm listener, and *(ii)* leaving the underlying delete method unbatched — neither objection applies to reusing the job class itself, only to how triggering and batching are implemented. Reusing the class also means existing opportunistic triggers (message/thread deletion) automatically gain battery/call safety and bounded execution for free, which is a strict improvement, not a regression, for those call sites.
+
+1. **`AttachmentTable.kt`** (~line 1775): extract current body of `deleteAbandonedAttachmentFiles()` into a private helper `computeAbandonedAttachmentFilePaths(): List<String>` (same diff logic, returns a deterministic sorted list instead of a `Set`). Keep public `deleteAbandonedAttachmentFiles(): Int` delegating to the helper and deleting everything in one pass — **unchanged behavior**, still used as-is by any caller needing immediate full cleanup. Add new public method:
+   `deleteAbandonedAttachmentFilesBatch(remaining: List<String>?, batchSize: Int = DEFAULT_ABANDONED_FILE_BATCH_SIZE): AbandonedAttachmentFileCleanupResult` — if `remaining` is null, calls `computeAbandonedAttachmentFilePaths()` (fresh pass); otherwise uses the passed-in list directly (resumed pass, no rescan). Deletes up to `batchSize` files from the front, returns a small data class `AbandonedAttachmentFileCleanupResult(deletedCount: Int, remaining: List<String>)`. Safe to trust a stale `remaining` list across retries because attachment filenames are uniquely generated per-attachment (`newDataFile`) and never reused, so a path identified as orphaned stays orphaned.
+
+2. **`jobs/DeleteAbandonedAttachmentsJob.kt`**: constructor gains `private var remainingPaths: List<String>?` (defaults null via existing no-arg `enqueue()` constructor). `Parameters` gain `.addConstraint(BatteryNotLowConstraint.KEY)`, `.addConstraint(NotInCallConstraint.KEY)`, `.setMaxAttempts(Parameters.UNLIMITED)` (existing `DataRestoreConstraint.KEY` and `setMaxInstancesForFactory(2)`/`setLifespan(1.days)` retained). `serialize()` writes `remainingPaths` via `JsonJobData.Builder().putStringListAsArray(...)` (null/empty → omit key). `Factory.create()` restores via `getStringArrayAsList(...)` guarded for absence. `run()` calls `attachments.deleteAbandonedAttachmentFilesBatch(remainingPaths, BATCH_SIZE)`; if `result.remaining.isEmpty()` → `Result.success()`; else update `remainingPaths = result.remaining` and `return Result.retry(1.seconds...)`.
+
+3. **New file `service/DeleteAbandonedAttachmentFilesAlarmListener.kt`**: mirrors `AnalyzeDatabaseAlarmListener.kt` exactly — extends `PersistentAlarmManagerListener`, `onAlarm()` calls `DeleteAbandonedAttachmentsJob.enqueue()`, reschedules next run ~24h later at a randomized off-peak hour (staggered from the 2-5am DB-analysis window, e.g. 3-6am, to avoid both heavy jobs colliding) using a new `SignalStore.misc` timestamp.
+
+4. **`keyvalue/MiscellaneousValues.kt`**: add `NEXT_ABANDONED_ATTACHMENT_FILES_CLEANUP_TIME = "misc.next_abandoned_attachment_files_cleanup_time"` constant and `var nextAbandonedAttachmentFilesCleanupTime: Long by longValue(NEXT_ABANDONED_ATTACHMENT_FILES_CLEANUP_TIME, 0)`, following the `nextDatabaseAnalysisTime` pattern exactly.
+
+5. **`ApplicationContext.java`**: add import for the new listener; add `DeleteAbandonedAttachmentFilesAlarmListener.schedule(this);` inside `initializePeriodicTasks()` alongside `AnalyzeDatabaseAlarmListener.schedule(this)`.
+
+6. **`jobs/JobManagerFactories.java`**: **no change needed** — `DeleteAbandonedAttachmentsJob.KEY` factory entry (line 177) and both `BatteryNotLowConstraint.KEY`/`NotInCallConstraint.KEY` factory + observer registrations (lines 461, 471, 481-493) already exist and require no edits; only the job's own `Parameters` need to reference the constraint keys.
+
+## Specification Impact
+**None.** Neither `jobmanager`'s nor `database`'s CODEMANIFEST declares `AttachmentTable`-specific methods or `DeleteAbandonedAttachmentsJob` as cataloged types (confirmed in Investigation). All new code consumes existing documented extension points (`Job`, `Constraint`, `JsonJobData`, `DatabaseTable` convention) through their unmodified public contracts. No CODEMANIFEST edits required.
+
+## Usage Impact
+**None.** Neither cell has `.usages/` practice files (confirmed via `goga config codemanifest.usages` → not found, and no cell-level `.usages/` directories exist for these two cells). No usage files to update.
+
+## Compatibility Verification
+**Backward compatible.** `AttachmentTable.deleteAbandonedAttachmentFiles(): Int` keeps its exact signature and full-pass behavior — existing callers (`AppInitialization.java:62`, `ThreadTable.kt`) are untouched. `DeleteAbandonedAttachmentsJob.enqueue()` keeps its exact signature — existing callers are untouched; the job's internal behavior gains constraint-gating and batching, which changes *when/how fast* cleanup completes but not the correctness contract ("eventually delete orphaned files"), and no test currently asserts specific timing (confirmed zero existing tests reference these symbols). No manifest guarantee altered.
+
+## Test Strategy
+- **`AttachmentTable` unit/instrumented test** (new, in `app/src/test` or `app/src/androidTest` matching existing `AttachmentTable`-adjacent test conventions): verify `deleteAbandonedAttachmentFilesBatch` deletes only files past-batchSize-boundary remain in `remaining`, that files referenced by `DATA_FILE`/`THUMBNAIL_FILE`/sticker files are never deleted, and that passing a previously-returned `remaining` list resumes without rescanning (e.g. by asserting a fresh file created on disk between batches — simulating a new orphan appearing mid-pass — is *not* picked up until the next fresh pass, proving no implicit rescan).
+- **`DeleteAbandonedAttachmentsJob` test**: verify `serialize()`/`Factory.create()` round-trip of `remainingPaths`; verify `run()` returns `Result.retry` when batch leaves remainder and `Result.success()` when empty; verify constraint keys present in `Parameters`.
+- **`DeleteAbandonedAttachmentFilesAlarmListener` test** (mirroring any existing `AnalyzeDatabaseAlarmListener` test, if one exists — confirm during implementation): verify `getNextScheduledExecutionTime` seeds and persists `SignalStore.misc.nextAbandonedAttachmentFilesCleanupTime`, and `onAlarm` enqueues the job and advances the stored time by ~1 day.
+
+## Risk Assessment
+
+| Risk | Likelihood | Impact | Mitigation |
+|---|---|---|---|
+| Persisting a large `remainingPaths` list in `JsonJobData` bloats the jobmanager DB row on devices with very many orphaned files | Low-Medium | Low (transient — cleared once pass completes; jobmanager DB already stores arbitrary payload sizes for other jobs) | Bound `batchSize` reasonably (e.g. 250/run) so the list shrinks steadily; document the tradeoff; no need for further mitigation given short-lived nature |
+| Two alarm listeners (`AnalyzeDatabaseAlarmListener`, new one) firing near-simultaneously causes contention | Low | Low | Stagger scheduled hour windows (e.g. 3-6am vs 2-5am) with independent randomization, matching existing pattern for other periodic listeners |
+| Reused job now deferred by `BatteryNotLowConstraint`/`NotInCallConstraint` when triggered opportunistically right after a user deletes a large attachment, delaying reclaim of disk space the user expects "now" | Low | Low | Acceptable and intended — matches ticket's explicit priority ordering ("lower priority than anything the user is actively doing"); disk space reclaim is not user-visible/time-critical |
+| Concurrent modification: a file in `remainingPaths` gets deleted by some other path (e.g. manual clear-cache) before the batch job reaches it | Low | Low | `File.delete()` on a non-existent file returns `false`; treat as already-handled (log at debug, don't fail the batch) rather than erroring |
+
+Do you approve this plan? Proceed to implementation?

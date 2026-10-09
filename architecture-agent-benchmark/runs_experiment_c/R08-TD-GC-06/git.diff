@@ -1,0 +1,311 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+index f47eddb..39d2841 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+@@ -18,6 +18,7 @@ import org.signal.core.util.logging.Log;
+ import org.thoughtcrime.securesms.conversation.MessageStyler;
+ import org.thoughtcrime.securesms.database.BodyAdjustment;
+ import org.thoughtcrime.securesms.database.BodyRangeUtil;
++import org.thoughtcrime.securesms.database.DatabaseObserver;
+ import org.thoughtcrime.securesms.database.GroupTable;
+ import org.thoughtcrime.securesms.database.MentionTable;
+ import org.thoughtcrime.securesms.database.MentionUtil;
+@@ -49,7 +50,11 @@ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.Executor;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicLong;
++import java.util.function.Supplier;
+ 
+ import static org.thoughtcrime.securesms.database.SearchTable.SNIPPET_WRAP;
+ 
+@@ -62,6 +67,19 @@ public class SearchRepository {
+ 
+   private static final int MAX_SNIPPET_SIZE = 100;
+ 
++  /**
++   * Caches for {@link #queryThreadsSync} / {@link #queryMessagesSync}, shared across every
++   * instance so that repeated identical searches stay fast even when the screen that owns a
++   * {@link SearchRepository} (and therefore the repository itself) gets recreated in between --
++   * e.g. navigating away from and back to the chat list. Cleared wholesale whenever any message
++   * or conversation changes, since a targeted per-entry invalidation would require re-running the
++   * very query it's trying to avoid.
++   */
++  private static final Map<ThreadQueryKey, ThreadSearchResult>   threadResultCache           = new ConcurrentHashMap<>();
++  private static final Map<MessageQueryKey, MessageSearchResult> messageResultCache          = new ConcurrentHashMap<>();
++  private static final AtomicLong                                cacheGeneration             = new AtomicLong(0);
++  private static final AtomicBoolean                             cacheInvalidationRegistered = new AtomicBoolean(false);
++
+   private final Context           context;
+   private final String            noteToSelfTitle;
+   private final SearchTable       searchDatabase;
+@@ -81,18 +99,71 @@ public class SearchRepository {
+     this.mentionTable      = SignalDatabase.mentions();
+     this.messageTable      = SignalDatabase.messages();
+     this.serialExecutor    = new SerialExecutor(SignalExecutors.BOUNDED);
++
++    registerCacheInvalidationListenersOnce();
++  }
++
++  /**
++   * Registers exactly once for the life of the process, regardless of how many
++   * {@link SearchRepository} instances get created -- the listeners only ever touch the static
++   * caches above, so there's nothing instance-specific to leak or unregister.
++   */
++  private static void registerCacheInvalidationListenersOnce() {
++    if (cacheInvalidationRegistered.compareAndSet(false, true)) {
++      DatabaseObserver observer = AppDependencies.getDatabaseObserver();
++      observer.registerConversationListObserver(SearchRepository::invalidateCaches);
++      observer.registerMessageUpdateObserver(messageId -> invalidateCaches());
++    }
++  }
++
++  private static void invalidateCaches() {
++    cacheGeneration.incrementAndGet();
++    threadResultCache.clear();
++    messageResultCache.clear();
++  }
++
++  /**
++   * Exercises the same invalidation path a real {@link DatabaseObserver} notification would take,
++   * without needing a live observer round-trip in tests.
++   */
++  @VisibleForTesting
++  static void invalidateCachesForTesting() {
++    invalidateCaches();
++  }
++
++  /**
++   * Returns the cached value for {@code key}, if present, otherwise computes it via
++   * {@code compute} and caches it -- unless a cache invalidation happened while {@code compute}
++   * was running, in which case the (now possibly stale) result is returned but not cached.
++   */
++  private static <K, V> V computeCached(@NonNull Map<K, V> cache, @NonNull K key, @NonNull Supplier<V> compute) {
++    V cached = cache.get(key);
++    if (cached != null) {
++      return cached;
++    }
++
++    long generationBeforeCompute = cacheGeneration.get();
++    V    computed                = compute.get();
++
++    if (cacheGeneration.get() == generationBeforeCompute) {
++      cache.put(key, computed);
++    }
++
++    return computed;
+   }
+ 
+   @WorkerThread
+   public @NonNull ThreadSearchResult queryThreadsSync(@NonNull String query, boolean unreadOnly) {
+     SignalTrace.beginSection("ConversationListSearch-Threads");
+     try {
+-      long                      start  = System.currentTimeMillis();
+-      List<ThreadWithRecipient> result = queryConversations(query, unreadOnly);
++      return computeCached(threadResultCache, new ThreadQueryKey(query, unreadOnly), () -> {
++        long                      start  = System.currentTimeMillis();
++        List<ThreadWithRecipient> result = queryConversations(query, unreadOnly);
+ 
+-      Log.d(TAG, "[threads] Search took " + (System.currentTimeMillis() - start) + " ms");
++        Log.d(TAG, "[threads] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new ThreadSearchResult(result, query);
++        return new ThreadSearchResult(result, query);
++      });
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -102,16 +173,18 @@ public class SearchRepository {
+   public @NonNull MessageSearchResult queryMessagesSync(@NonNull String query, @NonNull SearchFilter filter) {
+     SignalTrace.beginSection("ConversationListSearch-Messages");
+     try {
+-      long start = System.currentTimeMillis();
++      return computeCached(messageResultCache, new MessageQueryKey(query, filter), () -> {
++        long start = System.currentTimeMillis();
+ 
+-      List<MessageResult> messages         = queryMessages(query, filter);
+-      List<MessageResult> mentionMessages  = queryMentions(convertMentionsQueryToTokens(query));
+-      List<MessageResult> filteredMentions = filterMentionResults(mentionMessages, filter);
+-      List<MessageResult> combined         = mergeMessagesAndMentions(messages, filteredMentions);
++        List<MessageResult> messages         = queryMessages(query, filter);
++        List<MessageResult> mentionMessages  = queryMentions(convertMentionsQueryToTokens(query));
++        List<MessageResult> filteredMentions = filterMentionResults(mentionMessages, filter);
++        List<MessageResult> combined         = mergeMessagesAndMentions(messages, filteredMentions);
+ 
+-      Log.d(TAG, "[messages] Search took " + (System.currentTimeMillis() - start) + " ms");
++        Log.d(TAG, "[messages] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new MessageSearchResult(combined, query);
++        return new MessageSearchResult(combined, query);
++      });
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -442,6 +515,52 @@ public class SearchRepository {
+     return combined;
+   }
+ 
++  private static final class ThreadQueryKey {
++    private final String  query;
++    private final boolean unreadOnly;
++
++    ThreadQueryKey(@NonNull String query, boolean unreadOnly) {
++      this.query      = query;
++      this.unreadOnly = unreadOnly;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++      if (this == o) return true;
++      if (!(o instanceof ThreadQueryKey)) return false;
++      ThreadQueryKey other = (ThreadQueryKey) o;
++      return unreadOnly == other.unreadOnly && query.equals(other.query);
++    }
++
++    @Override
++    public int hashCode() {
++      return Objects.hash(query, unreadOnly);
++    }
++  }
++
++  private static final class MessageQueryKey {
++    private final String       query;
++    private final SearchFilter filter;
++
++    MessageQueryKey(@NonNull String query, @NonNull SearchFilter filter) {
++      this.query  = query;
++      this.filter = filter;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++      if (this == o) return true;
++      if (!(o instanceof MessageQueryKey)) return false;
++      MessageQueryKey other = (MessageQueryKey) o;
++      return query.equals(other.query) && filter.equals(other.filter);
++    }
++
++    @Override
++    public int hashCode() {
++      return Objects.hash(query, filter);
++    }
++  }
++
+   private static class ThreadModelBuilder implements ModelBuilder<ThreadWithRecipient> {
+ 
+     private final ThreadTable threadTable;
+diff --git a/app/src/test/java/org/thoughtcrime/securesms/search/SearchRepositoryCacheTest.kt b/app/src/test/java/org/thoughtcrime/securesms/search/SearchRepositoryCacheTest.kt
+new file mode 100644
+index 0000000..59eaf00
+--- /dev/null
++++ b/app/src/test/java/org/thoughtcrime/securesms/search/SearchRepositoryCacheTest.kt
+@@ -0,0 +1,106 @@
++/*
++ * Copyright 2026 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.search
++
++import android.app.Application
++import io.mockk.every
++import io.mockk.mockk
++import io.mockk.mockkObject
++import io.mockk.unmockkObject
++import io.mockk.verify
++import org.junit.After
++import org.junit.Before
++import org.junit.Rule
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import org.thoughtcrime.securesms.database.MentionTable
++import org.thoughtcrime.securesms.database.MessageTable
++import org.thoughtcrime.securesms.database.RecipientTable
++import org.thoughtcrime.securesms.database.SearchTable
++import org.thoughtcrime.securesms.database.SignalDatabase
++import org.thoughtcrime.securesms.database.ThreadTable
++import org.thoughtcrime.securesms.testutil.MockAppDependenciesRule
++
++/**
++ * Verifies that [SearchRepository] avoids repeating an identical [SearchRepository.queryMessagesSync]
++ * search against the database, and correctly re-runs it once the cache has been invalidated.
++ */
++@RunWith(RobolectricTestRunner::class)
++@Config(manifest = Config.NONE, application = Application::class)
++class SearchRepositoryCacheTest {
++
++  @get:Rule
++  val appDependencies = MockAppDependenciesRule()
++
++  private val searchTable = mockk<SearchTable>(relaxed = true)
++
++  private lateinit var repository: SearchRepository
++
++  @Before
++  fun setUp() {
++    mockkObject(SignalDatabase)
++    every { SignalDatabase.messageSearch } returns searchTable
++    every { SignalDatabase.threads } returns mockk<ThreadTable>(relaxed = true)
++    every { SignalDatabase.recipients } returns mockk<RecipientTable>(relaxed = true)
++    every { SignalDatabase.mentions } returns mockk<MentionTable>(relaxed = true)
++    every { SignalDatabase.messages } returns mockk<MessageTable>(relaxed = true)
++
++    every { searchTable.queryMessages(any(), any<SearchFilter>()) } returns null
++
++    repository = SearchRepository("Note to Self")
++
++    // The cache is shared across every SearchRepository instance for the life of the process, so
++    // clear out anything left behind by other tests before each one runs.
++    SearchRepository.invalidateCachesForTesting()
++  }
++
++  @After
++  fun tearDown() {
++    unmockkObject(SignalDatabase)
++  }
++
++  @Test
++  fun repeatedIdenticalSearchReusesCachedResult() {
++    repository.queryMessagesSync("hello", SearchFilter.EMPTY)
++    repository.queryMessagesSync("hello", SearchFilter.EMPTY)
++
++    verify(exactly = 1) { searchTable.queryMessages("hello", SearchFilter.EMPTY) }
++  }
++
++  @Test
++  fun differentQueriesAreCachedIndependently() {
++    repository.queryMessagesSync("hello", SearchFilter.EMPTY)
++    repository.queryMessagesSync("world", SearchFilter.EMPTY)
++
++    verify(exactly = 1) { searchTable.queryMessages("hello", SearchFilter.EMPTY) }
++    verify(exactly = 1) { searchTable.queryMessages("world", SearchFilter.EMPTY) }
++  }
++
++  @Test
++  fun differentFiltersAreCachedIndependently() {
++    val unfiltered = SearchFilter.EMPTY
++    val filtered = SearchFilter(startDate = 1000L)
++
++    repository.queryMessagesSync("hello", unfiltered)
++    repository.queryMessagesSync("hello", filtered)
++
++    verify(exactly = 1) { searchTable.queryMessages("hello", unfiltered) }
++    verify(exactly = 1) { searchTable.queryMessages("hello", filtered) }
++  }
++
++  @Test
++  fun invalidationForcesReQueryOnNextIdenticalSearch() {
++    repository.queryMessagesSync("hello", SearchFilter.EMPTY)
++
++    SearchRepository.invalidateCachesForTesting()
++
++    repository.queryMessagesSync("hello", SearchFilter.EMPTY)
++
++    verify(exactly = 2) { searchTable.queryMessages("hello", SearchFilter.EMPTY) }
++  }
++}

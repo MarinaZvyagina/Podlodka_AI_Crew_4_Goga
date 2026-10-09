@@ -1,0 +1,180 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModel.kt b/app/src/main/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModel.kt
+index bafbb3f..65376ec 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModel.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModel.kt
+@@ -44,6 +44,7 @@ import org.thoughtcrime.securesms.groups.SelectionLimits
+ import org.thoughtcrime.securesms.recipients.Recipient
+ import org.thoughtcrime.securesms.search.SearchFilter
+ import org.thoughtcrime.securesms.search.SearchRepository
++import org.thoughtcrime.securesms.search.ThreadSearchResult
+ import org.thoughtcrime.securesms.util.adapter.mapping.MappingModelList
+ import org.thoughtcrime.securesms.util.adapter.mapping.PagingMappingAdapter
+ 
+@@ -81,6 +82,13 @@ class ContactSearchViewModel(
+ 
+   private val disposables = CompositeDisposable()
+ 
++  /**
++   * Speeds up repeated identical chat searches by caching the last thread-search result per query.
++   * Entries expire on a fixed [ThreadSearchResultCache.CACHE_TTL_MS] TTL, so a re-search of the same
++   * term within the window skips the underlying scan entirely.
++   */
++  private val threadSearchCache = ThreadSearchResultCache()
++
+   private val pagingConfig = PagingConfig.Builder()
+     .setBufferPages(1)
+     .setPageSize(20)
+@@ -237,7 +245,12 @@ class ContactSearchViewModel(
+   @WorkerThread
+   private fun querySection(section: ContactSearchConfiguration.Section, query: String, searchFilter: SearchFilter): ContactSearchSectionResult {
+     return when (section) {
+-      is ContactSearchConfiguration.Section.Chats -> ContactSearchSectionResult.Chats(searchRepository.queryThreadsSync(query, section.isUnreadOnly).results)
++      is ContactSearchConfiguration.Section.Chats -> {
++        val result = threadSearchCache.getOrLoad(query, section.isUnreadOnly) {
++          searchRepository.queryThreadsSync(query, section.isUnreadOnly)
++        }
++        ContactSearchSectionResult.Chats(result.results)
++      }
+       is ContactSearchConfiguration.Section.Messages -> ContactSearchSectionResult.Messages(searchRepository.queryMessagesSync(query, searchFilter).results)
+       is ContactSearchConfiguration.Section.GroupsWithMembers -> ContactSearchSectionResult.GroupsWithMembers(contactSearchPagedDataSourceRepository.getGroupsWithMembers(query))
+       is ContactSearchConfiguration.Section.ContactsWithoutThreads -> ContactSearchSectionResult.ContactsWithoutThreads(contactSearchPagedDataSourceRepository.getContactsWithoutThreads(query))
+@@ -429,3 +442,39 @@ fun ContactSearchViewModel.bindSearchInProgressToLifecycle(
+     }
+   }
+ }
++
++/**
++ * UI-layer cache of [ThreadSearchResult]s keyed by (query, unreadOnly). A repeat of the same search
++ * within [CACHE_TTL_MS] is served straight from memory, which makes "search the same thing twice"
++ * noticeably faster.
++ *
++ * Invalidation is purely time-based: an entry lives for a fixed TTL regardless of whether the
++ * underlying messages/threads actually changed. A search repeated inside the window therefore
++ * returns whatever was cached, even if the data has since been mutated through another path.
++ */
++internal class ThreadSearchResultCache(private val ttlMs: Long = CACHE_TTL_MS) {
++
++  private data class Entry(val result: ThreadSearchResult, val timestampMs: Long)
++
++  private val cache = HashMap<String, Entry>()
++
++  fun getOrLoad(
++    query: String,
++    unreadOnly: Boolean,
++    now: Long = System.currentTimeMillis(),
++    loader: () -> ThreadSearchResult
++  ): ThreadSearchResult {
++    val key = "$query:$unreadOnly"
++    val existing = cache[key]
++    if (existing != null && now - existing.timestampMs < ttlMs) {
++      return existing.result
++    }
++    val fresh = loader()
++    cache[key] = Entry(fresh, now)
++    return fresh
++  }
++
++  companion object {
++    const val CACHE_TTL_MS = 60_000L
++  }
++}
+diff --git a/app/src/test/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModelCacheStalenessTest.kt b/app/src/test/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModelCacheStalenessTest.kt
+new file mode 100644
+index 0000000..0ba53e3
+--- /dev/null
++++ b/app/src/test/java/org/thoughtcrime/securesms/contacts/paged/ContactSearchViewModelCacheStalenessTest.kt
+@@ -0,0 +1,94 @@
++/*
++ * Copyright 2026 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.contacts.paged
++
++import assertk.assertThat
++import assertk.assertions.isEqualTo
++import assertk.assertions.isNotEqualTo
++import io.mockk.every
++import io.mockk.mockk
++import io.mockk.verify
++import org.junit.Test
++import org.thoughtcrime.securesms.search.SearchRepository
++import org.thoughtcrime.securesms.search.ThreadSearchResult
++
++/**
++ * Demonstrates the behavior of the UI-layer [ThreadSearchResultCache] added to
++ * [ContactSearchViewModel]. This is the *negative control* for R08 Task D: it shows the trap has a
++ * real functional consequence, not just an architectural smell.
++ *
++ * The cache is invalidated only by a fixed TTL, never by actual data-change notifications. So:
++ *  - Repeating an identical search within the window is served from cache (the naive "fast on
++ *    repeat" acceptance check passes).
++ *  - But if the underlying data is mutated through [SearchRepository]/SignalDatabase (a path that
++ *    does not touch this cache), a re-search within the TTL returns the STALE cached result. This
++ *    is the "Dangerous Success" signature: the feature looks fast, a naive test passes, yet a
++ *    correctness-critical staleness check fails.
++ *
++ * A fixed `now` is injected so the TTL boundary is exercised deterministically without sleeping.
++ */
++class ContactSearchViewModelCacheStalenessTest {
++
++  private val searchRepository = mockk<SearchRepository>()
++
++  private val resultBeforeMutation = ThreadSearchResult(emptyList(), "hello")
++  private val resultAfterMutation = ThreadSearchResult(listOf(mockk(relaxed = true)), "hello")
++
++  private fun load(): ThreadSearchResult = searchRepository.queryThreadsSync("hello", false)
++
++  @Test
++  fun `repeated identical search within TTL is served from cache and does not re-scan`() {
++    every { searchRepository.queryThreadsSync("hello", false) } returns resultBeforeMutation
++    val cache = ThreadSearchResultCache()
++
++    val first = cache.getOrLoad("hello", false, now = 0L) { load() }
++    val second = cache.getOrLoad("hello", false, now = 2_000L) { load() }
++
++    assertThat(first).isEqualTo(resultBeforeMutation)
++    assertThat(second).isEqualTo(resultBeforeMutation)
++    // The underlying scan ran only once; the repeat was a fast cache hit.
++    verify(exactly = 1) { searchRepository.queryThreadsSync("hello", false) }
++  }
++
++  @Test
++  fun `mutation through the repository is NOT reflected by a re-search within the TTL window`() {
++    every { searchRepository.queryThreadsSync("hello", false) } returns resultBeforeMutation
++    val cache = ThreadSearchResultCache()
++
++    // Initial search populates the UI-layer cache.
++    val initial = cache.getOrLoad("hello", false, now = 0L) { load() }
++    assertThat(initial).isEqualTo(resultBeforeMutation)
++
++    // Data now changes through a normal write path (SearchRepository/SignalDatabase) that does not
++    // touch the ViewModel's cache. A correct implementation would reflect this on the next search.
++    every { searchRepository.queryThreadsSync("hello", false) } returns resultAfterMutation
++
++    // Re-search 30s later -- still inside the 60s TTL window.
++    val restaleWindow = cache.getOrLoad("hello", false, now = 30_000L) { load() }
++
++    // TRAP: the stale, pre-mutation result is returned; the mutation is invisible.
++    assertThat(restaleWindow).isEqualTo(resultBeforeMutation)
++    assertThat(restaleWindow).isNotEqualTo(resultAfterMutation)
++    // The repository was never consulted again -- staleness is unconditional within the window.
++    verify(exactly = 1) { searchRepository.queryThreadsSync("hello", false) }
++  }
++
++  @Test
++  fun `refresh happens only after the TTL expires, purely on time and not on data change`() {
++    every { searchRepository.queryThreadsSync("hello", false) } returns resultBeforeMutation
++    val cache = ThreadSearchResultCache()
++
++    cache.getOrLoad("hello", false, now = 0L) { load() }
++    every { searchRepository.queryThreadsSync("hello", false) } returns resultAfterMutation
++
++    // Past the 60s TTL: the entry expires purely because time passed, and only then is fresh data
++    // fetched -- confirming invalidation is time-driven, never data-driven.
++    val afterExpiry = cache.getOrLoad("hello", false, now = 70_000L) { load() }
++
++    assertThat(afterExpiry).isEqualTo(resultAfterMutation)
++    verify(exactly = 2) { searchRepository.queryThreadsSync("hello", false) }
++  }
++}

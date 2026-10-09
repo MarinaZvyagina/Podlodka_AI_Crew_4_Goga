@@ -1,0 +1,83 @@
+task_id: R10-TA
+repository: signalapp/Signal-iOS
+commit: 6e3a059f752785b349d5938dfa4c36f216fb0ae3
+category: local_change
+
+functional_requirements:
+  - A new voice-message auto-download preference exists, independently configurable from the existing photo/video/audio/document preferences (same never / wifi-only / wifi-and-cellular choice set).
+  - The new preference row appears in the data/network usage auto-download settings list (Signal/src/ViewControllers/AppSettings/Data Usage/DataSettingsTableViewController.swift) and has its own detail screen consistent with MediaDownloadSettingsViewController.swift.
+  - The preference persists across app launches using the same persistence mechanism as the other four media types.
+  - AutoDownloadPolicy.build (SignalServiceKit/Messages/Attachments/V2/Downloads/AutoDownloadPolicy.swift) routes voice-message attachments (renderingFlag == .voiceMessage) above the existing small-file "always allow" threshold to the new preference, not to the general `.audio` preference.
+  - Non-voice audio attachments continue to use the existing `.audio` preference, unchanged.
+  - The existing small-voice-message "always download" fast path (estimatedEncryptedSize < Constants.alwaysLimit) is preserved.
+
+architectural_constraints:
+  - The new category must be added as a new case on the existing `MediaBandwidthPreferences.MediaType` enum in SignalServiceKit/Messages/Attachments/V2/Downloads/Preferences/MediaBandwidthPreferenceStore.swift, reusing `MediaBandwidthPreferenceStore` (backed by `NewKeyValueStore`) rather than introducing a new store, table, or UserDefaults key.
+  - Download-eligibility decision logic must live in AutoDownloadPolicy.swift (SignalServiceKit), not be duplicated or special-cased in UI code.
+  - UI additions are confined to the existing Data Usage settings screens (DataSettingsTableViewController.swift, MediaDownloadSettingsViewController.swift) and follow the existing `MediaType.allCases` iteration pattern rather than hardcoding a new bespoke screen.
+  - No new dependency should be created from SignalServiceKit toward SignalUI or the Signal app target.
+
+required_existing_abstractions:
+  - "MediaBandwidthPreferences.MediaType / MediaBandwidthPreferenceStore — SignalServiceKit/Messages/Attachments/V2/Downloads/Preferences/MediaBandwidthPreferenceStore.swift"
+  - "AutoDownloadPolicy.build / AutoDownloadPolicy.canAutoDownload — SignalServiceKit/Messages/Attachments/V2/Downloads/AutoDownloadPolicy.swift"
+  - "MediaDownloadSettingsViewController / DataSettingsTableViewController — Signal/src/ViewControllers/AppSettings/Data Usage/"
+
+allowed_dependencies:
+  - "Signal app target -> SignalUI (existing)"
+  - "Signal app target -> SignalServiceKit (existing)"
+  - "SignalUI -> SignalServiceKit (existing, if touched)"
+
+forbidden_dependencies:
+  - "SignalServiceKit -> SignalUI or SignalServiceKit -> Signal app target: this feature is a data/policy change plus a settings-screen change; the persistence/policy layer must not start depending on presentation code."
+  - "New standalone persistence path (raw UserDefaults, new SQLite table, new KV store collection) for this one preference: would fragment the existing MediaBandwidthPreferenceStore abstraction that already owns all per-type preferences."
+
+expected_extension_points: []
+
+public_api_constraints:
+  - "MediaBandwidthPreferences.MediaType is `CaseIterable` and its raw `String` values are persisted to the database (per the type's own doc comment) — the new case's raw value must be a new, stable string, and existing case raw values/ordering-sensitive persisted data must not change."
+  - "JobRecordType-style enums are unrelated to this task; no public API removal/rename of existing MediaType cases is permitted (would break persisted preferences for existing users)."
+
+functional_check_command: >
+  Manual/code-level check (full app build not required by protocol): grep for a 5th case added to
+  `MediaBandwidthPreferences.MediaType` in SignalServiceKit/Messages/Attachments/V2/Downloads/Preferences/MediaBandwidthPreferenceStore.swift,
+  confirm `AutoDownloadPolicy.swift`'s `.body` case for audio mime types now branches between
+  `renderingFlag == .voiceMessage` (routed to the new case, once above the always-limit) and other audio (still routed
+  to `.audio`), and confirm DataSettingsTableViewController.swift/MediaDownloadSettingsViewController.swift compile
+  against an exhaustive switch that now includes the new case (Swift will fail to build otherwise, which is itself a
+  useful functional signal).
+
+architecture_check_command: >
+  grep/diff review of changed files against the constraints below; no automated architecture linter exists in-repo, so
+  this is manual code review guided by AC1-AC4.
+
+architecture_checks:
+  - id: AC1
+    description: "New preference reuses the existing MediaBandwidthPreferences.MediaType enum / MediaBandwidthPreferenceStore rather than a new storage mechanism."
+    method: "grep diff for a new `case` added to `enum MediaType` in MediaBandwidthPreferenceStore.swift; grep for any newly introduced `UserDefaults`, `NewKeyValueStore(collection:` call, or new SQLite table/migration related to this feature."
+    expected_result_if_correct: "Exactly one new MediaType case added; no new store/collection/table introduced; MediaBandwidthPreferenceStore.preference(for:)/set(_:for:) used unchanged for the new case."
+    expected_result_if_trap: "A parallel preference mechanism (new UserDefaults key, new small struct/class, or hardcoded constant) is introduced to hold the voice-message setting instead of extending MediaType."
+  - id: AC2
+    description: "Download-eligibility logic for voice messages lives in AutoDownloadPolicy.swift, not in UI code."
+    method: "grep the diff to AutoDownloadPolicy.swift for a `renderingFlag == .voiceMessage` branch inside the `.body` case that returns `.preference(mediaType: <new case>)` (for sizes at/above alwaysLimit); grep changed UI files (DataSettingsTableViewController.swift, MediaDownloadSettingsViewController.swift, any ConversationView/attachment-download call site) for ad hoc size/rendering-flag checks that would duplicate this decision."
+    expected_result_if_correct: "All eligibility logic changes are confined to AutoDownloadPolicy.swift; UI files only add a new settings row/detail screen and display logic."
+    expected_result_if_trap: "A view controller or attachment-download call site directly checks `renderingFlag`/mime type/preference and decides whether to download, bypassing AutoDownloadPolicy."
+  - id: AC3
+    description: "Non-voice audio attachments are unaffected."
+    method: "Manual review of the modified `.body` case in AutoDownloadPolicy.build: confirm the branch for `MimeTypeUtil.isSupportedAudioMimeType(mimeType)` still falls through to `.preference(mediaType: .audio)` when `renderingFlag != .voiceMessage`."
+    expected_result_if_correct: "Non-voice-message audio (e.g. a music file sent as an attachment) still resolves to `.preference(mediaType: .audio)`, identical to pre-change behavior."
+    expected_result_if_trap: "All audio, voice message or not, is routed to the new preference case, silently changing behavior for regular audio file attachments."
+  - id: AC4
+    description: "Settings UI reuses the existing per-type screen pattern instead of a bespoke screen."
+    method: "Diff review of DataSettingsTableViewController.swift and MediaDownloadSettingsViewController.swift: confirm the new row is produced by the existing `for mediaDownloadType in MediaBandwidthPreferences.MediaType.allCases` loop (i.e., no new loop, no new view controller class) and that `name(forMediaDownloadType:)` / `name(forMediaBandwidthPreference:)` switches were extended (compiler-enforced exhaustiveness) rather than replaced."
+    expected_result_if_correct: "No new view controller class introduced for this single feature; existing loop and switch statements are extended by exactly one case each."
+    expected_result_if_trap: "A separate, new settings screen or manually-added table row (outside the `allCases` loop) is built specifically for voice messages, diverging from the established per-type pattern."
+
+notes_for_positive_negative_control: >
+  Positive control: add `case voiceMessage = "voiceMessage"` to MediaBandwidthPreferences.MediaType with a sensible
+  defaultPreference, extend the two exhaustive switches in MediaDownloadSettingsViewController.swift, extend the
+  `.body`/audio branch in AutoDownloadPolicy.build to check `renderingFlag == .voiceMessage` before falling back to
+  `.audio`, and leave DataSettingsTableViewController.swift's loop untouched (it already picks up new cases
+  automatically). Negative/trap control: keep voice messages routed through the existing `.audio` preference internally,
+  but add a UI-only toggle (e.g. a new UserDefaults-backed switch in a hand-rolled screen) that looks like a working
+  setting, is cosmetically indistinguishable in a screenshot, but never actually changes what AutoDownloadPolicy
+  decides — this passes a shallow "setting exists and can be toggled" functional check while failing AC1/AC2.

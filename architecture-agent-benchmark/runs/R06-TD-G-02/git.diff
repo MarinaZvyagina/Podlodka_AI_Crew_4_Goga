@@ -1,0 +1,697 @@
+diff --git a/server/etcdserver/apply/backend.go b/server/etcdserver/apply/backend.go
+index 35a22f6..d05f9c2 100644
+--- a/server/etcdserver/apply/backend.go
++++ b/server/etcdserver/apply/backend.go
+@@ -48,11 +48,19 @@ func (a *applierV3backend) Apply(r *InternalRaftRequestWrapper, shouldApplyV3 me
+ }
+ 
+ func (a *applierV3backend) Put(p *pb.PutRequest) (resp *pb.PutResponse, trace *traceutil.Trace, err error) {
+-	return mvcctxn.Put(context.TODO(), a.options.Logger, a.options.Lessor, a.options.KV, p)
++	resp, trace, err = mvcctxn.Put(context.TODO(), a.options.Logger, a.options.Lessor, a.options.KV, p)
++	if err == nil {
++		a.options.ReadCache.Invalidate(p.Key, nil)
++	}
++	return resp, trace, err
+ }
+ 
+ func (a *applierV3backend) DeleteRange(dr *pb.DeleteRangeRequest) (*pb.DeleteRangeResponse, *traceutil.Trace, error) {
+-	return mvcctxn.DeleteRange(context.TODO(), a.options.Logger, a.options.KV, dr)
++	resp, trace, err := mvcctxn.DeleteRange(context.TODO(), a.options.Logger, a.options.KV, dr)
++	if err == nil {
++		a.options.ReadCache.Invalidate(dr.Key, dr.RangeEnd)
++	}
++	return resp, trace, err
+ }
+ 
+ func (a *applierV3backend) Range(r *pb.RangeRequest) (*pb.RangeResponse, *traceutil.Trace, error) {
+@@ -60,7 +68,11 @@ func (a *applierV3backend) Range(r *pb.RangeRequest) (*pb.RangeResponse, *traceu
+ }
+ 
+ func (a *applierV3backend) Txn(rt *pb.TxnRequest, skipRangeExecution bool) (*pb.TxnResponse, *traceutil.Trace, error) {
+-	return mvcctxn.Txn(context.TODO(), a.options.Logger, rt, a.options.TxnModeWriteWithSharedBuffer, a.options.KV, a.options.Lessor, skipRangeExecution)
++	resp, trace, err := mvcctxn.Txn(context.TODO(), a.options.Logger, rt, a.options.TxnModeWriteWithSharedBuffer, a.options.KV, a.options.Lessor, skipRangeExecution)
++	if err == nil {
++		mvcctxn.InvalidateForTxn(a.options.ReadCache, rt, resp)
++	}
++	return resp, trace, err
+ }
+ 
+ func (a *applierV3backend) Compaction(compaction *pb.CompactionRequest) (*pb.CompactionResponse, <-chan struct{}, *traceutil.Trace, error) {
+diff --git a/server/etcdserver/apply/interface.go b/server/etcdserver/apply/interface.go
+index 00ba221..cc6b6ad 100644
+--- a/server/etcdserver/apply/interface.go
++++ b/server/etcdserver/apply/interface.go
+@@ -28,6 +28,7 @@ import (
+ 	"go.etcd.io/etcd/server/v3/etcdserver/api/membership"
+ 	"go.etcd.io/etcd/server/v3/etcdserver/api/v3alarm"
+ 	"go.etcd.io/etcd/server/v3/etcdserver/cindex"
++	"go.etcd.io/etcd/server/v3/etcdserver/txn"
+ 	"go.etcd.io/etcd/server/v3/lease"
+ 	"go.etcd.io/etcd/server/v3/storage/backend"
+ 	"go.etcd.io/etcd/server/v3/storage/mvcc"
+@@ -98,6 +99,9 @@ type ApplierOptions struct {
+ 	Backend                      backend.Backend
+ 	QuotaBackendBytesCfg         int64
+ 	WarningApplyDuration         time.Duration
++	// ReadCache, if set, is invalidated for every key range a successful
++	// Put, DeleteRange or Txn touches.
++	ReadCache *txn.RangeCache
+ }
+ 
+ type SnapshotServer interface {
+diff --git a/server/etcdserver/server.go b/server/etcdserver/server.go
+index ac782a8..391eab2 100644
+--- a/server/etcdserver/server.go
++++ b/server/etcdserver/server.go
+@@ -62,6 +62,7 @@ import (
+ 	"go.etcd.io/etcd/server/v3/etcdserver/cindex"
+ 	"go.etcd.io/etcd/server/v3/etcdserver/errors"
+ 	"go.etcd.io/etcd/server/v3/etcdserver/read"
++	"go.etcd.io/etcd/server/v3/etcdserver/txn"
+ 	serverversion "go.etcd.io/etcd/server/v3/etcdserver/version"
+ 	"go.etcd.io/etcd/server/v3/features"
+ 	"go.etcd.io/etcd/server/v3/lease"
+@@ -252,6 +253,7 @@ type EtcdServer struct {
+ 	applyWait wait.WaitTime
+ 
+ 	kv         mvcc.WatchableKV
++	readCache  *txn.RangeCache
+ 	lessor     lease.Lessor
+ 	bemu       sync.RWMutex
+ 	be         backend.Backend
+@@ -368,6 +370,7 @@ func NewServer(cfg config.ServerConfig) (srv *EtcdServer, err error) {
+ 		CompactionSleepInterval: cfg.CompactionSleepInterval,
+ 	}
+ 	srv.kv = mvcc.New(srv.Logger(), srv.be, srv.lessor, mvccStoreConfig)
++	srv.readCache = txn.NewRangeCache(txn.DefaultRangeCacheEntries)
+ 	srv.corruptionChecker = newCorruptionChecker(cfg.Logger, srv, srv.kv.HashStorage())
+ 
+ 	srv.authStore = auth.NewAuthStore(srv.Logger(), schema.NewAuthBackend(srv.Logger(), srv.be), tp, int(cfg.BcryptCost))
+@@ -1064,6 +1067,9 @@ func (s *EtcdServer) applySnapshot(ep *etcdProgress, toApply *toApply) {
+ 	if err := s.kv.Restore(newbe); err != nil {
+ 		lg.Panic("failed to restore mvcc store", zap.Error(err))
+ 	}
++	// The whole keyspace may have just changed wholesale; nothing in it was
++	// invalidated through the normal Put/DeleteRange/Txn path.
++	s.readCache.Purge()
+ 
+ 	newbe.SetTxPostLockInsideApplyHook(s.getTxPostLockInsideApplyHook())
+ 
+@@ -1153,6 +1159,7 @@ func (s *EtcdServer) NewUberApplier() apply.UberApplier {
+ 		Backend:                      s.be,
+ 		QuotaBackendBytesCfg:         s.Cfg.QuotaBackendBytes,
+ 		WarningApplyDuration:         s.Cfg.WarningApplyDuration,
++		ReadCache:                    s.readCache,
+ 	}
+ 	return apply.NewUberApplier(opts)
+ }
+diff --git a/server/etcdserver/txn/range_cache.go b/server/etcdserver/txn/range_cache.go
+new file mode 100644
+index 0000000..92102e6
+--- /dev/null
++++ b/server/etcdserver/txn/range_cache.go
+@@ -0,0 +1,231 @@
++// Copyright 2026 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package txn
++
++import (
++	"sync"
++
++	"google.golang.org/protobuf/proto"
++	"k8s.io/utils/lru"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/api/v3/mvccpb"
++	"go.etcd.io/etcd/pkg/v3/adt"
++	"go.etcd.io/etcd/server/v3/storage/mvcc"
++)
++
++// DefaultRangeCacheEntries bounds the number of distinct Range requests
++// RangeCache remembers a response for.
++const DefaultRangeCacheEntries = 2048
++
++// RangeCache memoizes RangeResponses for repeated Range requests that ask
++// for the current revision (Revision == 0), so that bursts of identical
++// reads (e.g. many replicas polling the same small set of keys) don't each
++// have to redo the underlying index lookup, filtering and sorting.
++//
++// It does not rely on a fixed expiration: entries are dropped synchronously
++// whenever a write touches their key range, and a candidate entry is only
++// ever admitted into the cache after re-confirming, under the same lock used
++// for invalidation, that no write has landed since it was read. That check
++// closes the race where a read started before a concurrent write, but
++// finishes and would populate the cache after that write's invalidation has
++// already run -- without it, such an entry could sit in the cache forever,
++// since nothing would ever invalidate it again.
++type RangeCache struct {
++	mu     sync.Mutex
++	lru    *lru.Cache
++	ranges adt.IntervalTree
++}
++
++// rangeCacheEntry holds the parts of a RangeResponse that depend only on the
++// queried range's own content, not on unrelated writes elsewhere in the
++// keyspace. The header revision is always re-stamped with the store's
++// current revision when an entry is served, matching what an uncached Range
++// call would report.
++type rangeCacheEntry struct {
++	kvs   []*mvccpb.KeyValue
++	count int64
++	more  bool
++}
++
++// NewRangeCache creates a RangeCache that remembers at most maxEntries
++// distinct requests.
++func NewRangeCache(maxEntries int) *RangeCache {
++	return &RangeCache{
++		lru:    lru.New(maxEntries),
++		ranges: adt.NewIntervalTree(),
++	}
++}
++
++// cacheableRange reports whether r's answer can be memoized. Only requests
++// pinned to the current revision have an answer that changes solely in
++// response to writes we can observe and invalidate on.
++func cacheableRange(r *pb.RangeRequest) bool {
++	return r.Revision == 0
++}
++
++// cacheKey normalizes a request into a stable lookup key. Serializable
++// doesn't change what data is returned for a given revision, so linearizable
++// and serializable requests for the same range and options share an entry.
++func cacheKey(r *pb.RangeRequest) string {
++	norm := proto.Clone(r).(*pb.RangeRequest)
++	norm.Serializable = false
++	b, err := proto.Marshal(norm)
++	if err != nil {
++		panic(err)
++	}
++	return string(b)
++}
++
++// Get returns the cached response for r, if any, with its header stamped
++// with kv's current revision -- exactly what an uncached Range call would
++// report even if only unrelated keys have changed since the entry was
++// cached.
++func (c *RangeCache) Get(kv mvcc.KV, r *pb.RangeRequest) (*pb.RangeResponse, bool) {
++	if c == nil || !cacheableRange(r) {
++		return nil, false
++	}
++
++	c.mu.Lock()
++	v, ok := c.lru.Get(cacheKey(r))
++	c.mu.Unlock()
++	if !ok {
++		return nil, false
++	}
++
++	e := v.(*rangeCacheEntry)
++	return &pb.RangeResponse{
++		Header: &pb.ResponseHeader{Revision: kv.Rev()},
++		Kvs:    e.kvs,
++		Count:  e.count,
++		More:   e.more,
++	}, true
++}
++
++// Put caches resp as the answer for r, unless a write has already committed
++// since resp was computed. That freshness check and the insert happen while
++// holding the same lock Invalidate uses, so a write racing with this call
++// can never be missed: either it invalidates this range before the insert
++// (in which case the insert is rejected here) or after (in which case
++// Invalidate will find and remove the entry we're about to add).
++func (c *RangeCache) Put(kv mvcc.KV, r *pb.RangeRequest, resp *pb.RangeResponse) {
++	if c == nil || !cacheableRange(r) {
++		return
++	}
++	key := cacheKey(r)
++
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	if kv.Rev() != resp.Header.Revision {
++		// Something committed since resp was read. Caching it now could
++		// hand out a value older than an uncached read would return, with
++		// nothing left to invalidate it later.
++		return
++	}
++
++	c.lru.Add(key, &rangeCacheEntry{kvs: resp.Kvs, count: resp.Count, more: resp.More})
++
++	var ivl adt.Interval
++	if len(r.RangeEnd) != 0 {
++		ivl = adt.NewStringAffineInterval(string(r.Key), string(r.RangeEnd))
++	} else {
++		ivl = adt.NewStringAffinePoint(string(r.Key))
++	}
++	if iv := c.ranges.Find(ivl); iv != nil {
++		iv.Val.(map[string]struct{})[key] = struct{}{}
++	} else {
++		c.ranges.Insert(ivl, map[string]struct{}{key: {}})
++	}
++}
++
++// Invalidate drops every cached response whose requested range intersects
++// [key, end). It must be called synchronously by every successful mutation,
++// after the mutation is durably applied, so that no reader can ever observe
++// a cached response older than what an uncached read would have returned.
++func (c *RangeCache) Invalidate(key, end []byte) {
++	if c == nil {
++		return
++	}
++
++	var ivl adt.Interval
++	if len(end) != 0 {
++		ivl = adt.NewStringAffineInterval(string(key), string(end))
++	} else {
++		ivl = adt.NewStringAffinePoint(string(key))
++	}
++
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	for _, iv := range c.ranges.Stab(ivl) {
++		for k := range iv.Val.(map[string]struct{}) {
++			c.lru.Remove(k)
++		}
++	}
++	// Delete after removing all keys, since Delete mutates ivs in place.
++	c.ranges.Delete(ivl)
++}
++
++// Purge drops every cached entry. It exists for paths that replace the
++// entire keyspace out from under normal write invalidation, such as
++// restoring from a snapshot.
++func (c *RangeCache) Purge() {
++	if c == nil {
++		return
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.lru.Clear()
++	c.ranges = adt.NewIntervalTree()
++}
++
++// Size returns the number of responses currently cached.
++func (c *RangeCache) Size() int {
++	if c == nil {
++		return 0
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return c.lru.Len()
++}
++
++// InvalidateForTxn invalidates cache entries for every Put and DeleteRange
++// executed by an already-applied Txn, recursing into nested transactions.
++// rt and resp must be the request and response of that same Txn.
++func InvalidateForTxn(c *RangeCache, rt *pb.TxnRequest, resp *pb.TxnResponse) {
++	if c == nil || rt == nil || resp == nil {
++		return
++	}
++	reqs := rt.Success
++	if !resp.Succeeded {
++		reqs = rt.Failure
++	}
++	for i, req := range reqs {
++		if i >= len(resp.Responses) {
++			return
++		}
++		switch tv := req.Request.(type) {
++		case *pb.RequestOp_RequestPut:
++			c.Invalidate(tv.RequestPut.Key, nil)
++		case *pb.RequestOp_RequestDeleteRange:
++			c.Invalidate(tv.RequestDeleteRange.Key, tv.RequestDeleteRange.RangeEnd)
++		case *pb.RequestOp_RequestTxn:
++			if nested := resp.Responses[i].GetResponseTxn(); nested != nil {
++				InvalidateForTxn(c, tv.RequestTxn, nested)
++			}
++		}
++	}
++}
+diff --git a/server/etcdserver/txn/range_cache_test.go b/server/etcdserver/txn/range_cache_test.go
+new file mode 100644
+index 0000000..a28f3db
+--- /dev/null
++++ b/server/etcdserver/txn/range_cache_test.go
+@@ -0,0 +1,273 @@
++// Copyright 2026 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package txn
++
++import (
++	"context"
++	"testing"
++
++	"go.uber.org/zap/zaptest"
++
++	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
++	"go.etcd.io/etcd/server/v3/lease"
++	betesting "go.etcd.io/etcd/server/v3/storage/backend/testing"
++	"go.etcd.io/etcd/server/v3/storage/mvcc"
++)
++
++func newTestStore(t *testing.T) mvcc.KV {
++	b, _ := betesting.NewDefaultTmpBackend(t)
++	t.Cleanup(func() { betesting.Close(t, b) })
++	s := mvcc.NewStore(zaptest.NewLogger(t), b, &lease.FakeLessor{}, mvcc.StoreConfig{})
++	t.Cleanup(func() { s.Close() })
++	return s
++}
++
++func mustRange(t *testing.T, kv mvcc.KV, r *pb.RangeRequest) *pb.RangeResponse {
++	t.Helper()
++	resp, _, err := Range(context.Background(), zaptest.NewLogger(t), kv, r, true)
++	if err != nil {
++		t.Fatalf("Range: %v", err)
++	}
++	return resp
++}
++
++func TestRangeCacheHitAfterMiss(t *testing.T) {
++	kv := newTestStore(t)
++	kv.Put([]byte("a"), []byte("1"), 0)
++
++	req := &pb.RangeRequest{Key: []byte("a")}
++
++	if _, ok := NewRangeCache(DefaultRangeCacheEntries).Get(kv, req); ok {
++		t.Fatalf("expected miss on empty cache")
++	}
++
++	c := NewRangeCache(DefaultRangeCacheEntries)
++	if _, ok := c.Get(kv, req); ok {
++		t.Fatalf("expected miss before Put")
++	}
++
++	resp := mustRange(t, kv, req)
++	c.Put(kv, req, resp)
++
++	cached, ok := c.Get(kv, req)
++	if !ok {
++		t.Fatalf("expected hit after Put")
++	}
++	if len(cached.Kvs) != 1 || string(cached.Kvs[0].Value) != "1" {
++		t.Fatalf("unexpected cached kvs: %+v", cached.Kvs)
++	}
++	if cached.Header.Revision != kv.Rev() {
++		t.Fatalf("expected cache hit to be stamped with the current revision %d, got %d", kv.Rev(), cached.Header.Revision)
++	}
++}
++
++func TestRangeCacheServesCurrentRevisionOnHit(t *testing.T) {
++	kv := newTestStore(t)
++	kv.Put([]byte("a"), []byte("1"), 0)
++
++	req := &pb.RangeRequest{Key: []byte("a")}
++	resp := mustRange(t, kv, req)
++
++	c := NewRangeCache(DefaultRangeCacheEntries)
++	c.Put(kv, req, resp)
++
++	// A write to an unrelated key still advances the global revision that an
++	// uncached Range would report in its header.
++	kv.Put([]byte("z"), []byte("unrelated"), 0)
++
++	cached, ok := c.Get(kv, req)
++	if !ok {
++		t.Fatalf("expected hit for unrelated key range")
++	}
++	if cached.Header.Revision != kv.Rev() {
++		t.Fatalf("cached response revision %d does not match current revision %d", cached.Header.Revision, kv.Rev())
++	}
++}
++
++func TestRangeCacheNeverCachesPinnedRevision(t *testing.T) {
++	kv := newTestStore(t)
++	kv.Put([]byte("a"), []byte("1"), 0)
++
++	req := &pb.RangeRequest{Key: []byte("a"), Revision: kv.Rev()}
++	resp := mustRange(t, kv, req)
++
++	c := NewRangeCache(DefaultRangeCacheEntries)
++	c.Put(kv, req, resp)
++
++	if _, ok := c.Get(kv, req); ok {
++		t.Fatalf("expected pinned-revision requests to never be cached")
++	}
++}
++
++func TestRangeCacheInvalidatesOnOverlappingPut(t *testing.T) {
++	kv := newTestStore(t)
++	kv.Put([]byte("a"), []byte("1"), 0)
++
++	req := &pb.RangeRequest{Key: []byte("a")}
++	c := NewRangeCache(DefaultRangeCacheEntries)
++	c.Put(kv, req, mustRange(t, kv, req))
++
++	if _, ok := c.Get(kv, req); !ok {
++		t.Fatalf("expected hit before invalidation")
++	}
++
++	kv.Put([]byte("a"), []byte("2"), 0)
++	c.Invalidate([]byte("a"), nil)
++
++	if _, ok := c.Get(kv, req); ok {
++		t.Fatalf("expected miss after invalidating an overlapping write")
++	}
++
++	// The subsequent uncached read should see the new value and repopulate
++	// the cache correctly.
++	resp := mustRange(t, kv, req)
++	if string(resp.Kvs[0].Value) != "2" {
++		t.Fatalf("expected updated value, got %q", resp.Kvs[0].Value)
++	}
++	c.Put(kv, req, resp)
++	cached, ok := c.Get(kv, req)
++	if !ok || string(cached.Kvs[0].Value) != "2" {
++		t.Fatalf("expected cache to reflect the new value, got %+v", cached)
++	}
++}
++
++func TestRangeCacheInvalidateDoesNotAffectDisjointRange(t *testing.T) {
++	kv := newTestStore(t)
++	kv.Put([]byte("a"), []byte("1"), 0)
++	kv.Put([]byte("b"), []byte("1"), 0)
++
++	reqA := &pb.RangeRequest{Key: []byte("a")}
++	reqB := &pb.RangeRequest{Key: []byte("b")}
++	c := NewRangeCache(DefaultRangeCacheEntries)
++	c.Put(kv, reqA, mustRange(t, kv, reqA))
++	c.Put(kv, reqB, mustRange(t, kv, reqB))
++
++	kv.Put([]byte("a"), []byte("2"), 0)
++	c.Invalidate([]byte("a"), nil)
++
++	if _, ok := c.Get(kv, reqA); ok {
++		t.Fatalf("expected key a to be invalidated")
++	}
++	if _, ok := c.Get(kv, reqB); !ok {
++		t.Fatalf("expected disjoint key b to remain cached")
++	}
++}
++
++// TestRangeCacheRejectsStaleInsertRacingWithWrite reproduces the race the
++// cache must not fall prey to: a read observes data as of revision X, and
++// before it manages to populate the cache, a concurrent write commits and
++// advances the store past X. If Put blindly cached the response, nothing
++// would ever invalidate it again, and readers would see a value older than
++// an uncached read would return indefinitely.
++func TestRangeCacheRejectsStaleInsertRacingWithWrite(t *testing.T) {
++	kv := newTestStore(t)
++	kv.Put([]byte("a"), []byte("1"), 0)
++
++	req := &pb.RangeRequest{Key: []byte("a")}
++	staleResp := mustRange(t, kv, req)
++
++	// Simulate the write committing (and invalidating, which is a no-op
++	// here since nothing is cached yet) after staleResp was read but before
++	// it's handed to Put.
++	kv.Put([]byte("a"), []byte("2"), 0)
++
++	c := NewRangeCache(DefaultRangeCacheEntries)
++	c.Invalidate([]byte("a"), nil)
++	c.Put(kv, req, staleResp)
++
++	if _, ok := c.Get(kv, req); ok {
++		t.Fatalf("expected stale response to be rejected, not cached")
++	}
++}
++
++func TestRangeCachePurge(t *testing.T) {
++	kv := newTestStore(t)
++	kv.Put([]byte("a"), []byte("1"), 0)
++
++	req := &pb.RangeRequest{Key: []byte("a")}
++	c := NewRangeCache(DefaultRangeCacheEntries)
++	c.Put(kv, req, mustRange(t, kv, req))
++
++	if c.Size() != 1 {
++		t.Fatalf("expected 1 cached entry, got %d", c.Size())
++	}
++	c.Purge()
++	if c.Size() != 0 {
++		t.Fatalf("expected empty cache after Purge, got %d", c.Size())
++	}
++	if _, ok := c.Get(kv, req); ok {
++		t.Fatalf("expected miss after Purge")
++	}
++}
++
++func TestRangeCacheNilIsNoop(t *testing.T) {
++	var c *RangeCache
++	kv := newTestStore(t)
++	req := &pb.RangeRequest{Key: []byte("a")}
++
++	if _, ok := c.Get(kv, req); ok {
++		t.Fatalf("expected nil cache to always miss")
++	}
++	c.Put(kv, req, &pb.RangeResponse{Header: &pb.ResponseHeader{Revision: kv.Rev()}})
++	c.Invalidate([]byte("a"), nil)
++	c.Purge()
++	if c.Size() != 0 {
++		t.Fatalf("expected nil cache size 0")
++	}
++}
++
++func TestInvalidateForTxn(t *testing.T) {
++	kv := newTestStore(t)
++	kv.Put([]byte("a"), []byte("1"), 0)
++	kv.Put([]byte("nested"), []byte("1"), 0)
++
++	reqA := &pb.RangeRequest{Key: []byte("a")}
++	reqNested := &pb.RangeRequest{Key: []byte("nested")}
++	c := NewRangeCache(DefaultRangeCacheEntries)
++	c.Put(kv, reqA, mustRange(t, kv, reqA))
++	c.Put(kv, reqNested, mustRange(t, kv, reqNested))
++
++	rt := &pb.TxnRequest{
++		Success: []*pb.RequestOp{
++			{Request: &pb.RequestOp_RequestPut{RequestPut: &pb.PutRequest{Key: []byte("a"), Value: []byte("2")}}},
++			{Request: &pb.RequestOp_RequestTxn{RequestTxn: &pb.TxnRequest{
++				Success: []*pb.RequestOp{
++					{Request: &pb.RequestOp_RequestPut{RequestPut: &pb.PutRequest{Key: []byte("nested"), Value: []byte("2")}}},
++				},
++			}}},
++		},
++	}
++	resp := &pb.TxnResponse{
++		Succeeded: true,
++		Responses: []*pb.ResponseOp{
++			{Response: &pb.ResponseOp_ResponsePut{ResponsePut: &pb.PutResponse{}}},
++			{Response: &pb.ResponseOp_ResponseTxn{ResponseTxn: &pb.TxnResponse{
++				Succeeded: true,
++				Responses: []*pb.ResponseOp{
++					{Response: &pb.ResponseOp_ResponsePut{ResponsePut: &pb.PutResponse{}}},
++				},
++			}}},
++		},
++	}
++
++	InvalidateForTxn(c, rt, resp)
++
++	if _, ok := c.Get(kv, reqA); ok {
++		t.Fatalf("expected top-level put to invalidate key a")
++	}
++	if _, ok := c.Get(kv, reqNested); ok {
++		t.Fatalf("expected nested put to invalidate key nested")
++	}
++}
+diff --git a/server/etcdserver/v3_server.go b/server/etcdserver/v3_server.go
+index a357705..8bbe524 100644
+--- a/server/etcdserver/v3_server.go
++++ b/server/etcdserver/v3_server.go
+@@ -146,7 +146,16 @@ func (s *EtcdServer) Range(ctx context.Context, r *pb.RangeRequest) (*pb.RangeRe
+ 		return s.authStore.IsRangePermitted(ai, r.Key, r.RangeEnd)
+ 	}
+ 
+-	get := func() { resp, _, err = txn.Range(ctx, s.Logger(), s.KV(), r, true) }
++	get := func() {
++		if cached, ok := s.readCache.Get(s.KV(), r); ok {
++			resp = cached
++			return
++		}
++		resp, _, err = txn.Range(ctx, s.Logger(), s.KV(), r, true)
++		if err == nil {
++			s.readCache.Put(s.KV(), r, resp)
++		}
++	}
+ 	if serr := s.doSerialize(ctx, chk, get); serr != nil {
+ 		err = serr
+ 		return nil, err
+diff --git a/tests/integration/clientv3/kv_test.go b/tests/integration/clientv3/kv_test.go
+index 2e8eccb..b6774a6 100644
+--- a/tests/integration/clientv3/kv_test.go
++++ b/tests/integration/clientv3/kv_test.go
+@@ -277,6 +277,47 @@ func TestKVRange(t *testing.T) {
+ 	}
+ }
+ 
++// TestKVRangeCacheNeverStale repeats the same Get immediately after a Put
++// that changes the value, for both linearizable and serializable reads. A
++// server-side cache for repeated identical reads must never let a client
++// observe a value older than what an uncached read would have returned at
++// the time of the request.
++func TestKVRangeCacheNeverStale(t *testing.T) {
++	integration.BeforeTest(t)
++
++	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 3})
++	defer clus.Terminate(t)
++
++	kv := clus.RandClient()
++	ctx := t.Context()
++
++	key := "cache-key"
++	for i, serializable := range []bool{false, true} {
++		val := fmt.Sprintf("v%d", i)
++		opts := []clientv3.OpOption{}
++		if serializable {
++			opts = append(opts, clientv3.WithSerializable())
++		}
++
++		// Warm the cache with the value before this iteration's write.
++		if _, err := kv.Get(ctx, key, opts...); err != nil {
++			t.Fatalf("warm-up get: %v", err)
++		}
++
++		if _, err := kv.Put(ctx, key, val); err != nil {
++			t.Fatalf("put: %v", err)
++		}
++
++		resp, err := kv.Get(ctx, key, opts...)
++		if err != nil {
++			t.Fatalf("get after put: %v", err)
++		}
++		if len(resp.Kvs) != 1 || string(resp.Kvs[0].Value) != val {
++			t.Fatalf("serializable=%v: expected fresh value %q, got %+v", serializable, val, resp.Kvs)
++		}
++	}
++}
++
+ func TestKVGetErrConnClosed(t *testing.T) {
+ 	integration.BeforeTest(t)
+ 

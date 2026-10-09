@@ -1,0 +1,723 @@
+diff --git a/packages/excalidraw/actions/actionSnapToGrid.test.tsx b/packages/excalidraw/actions/actionSnapToGrid.test.tsx
+new file mode 100644
+index 0000000..4cbc98c
+--- /dev/null
++++ b/packages/excalidraw/actions/actionSnapToGrid.test.tsx
+@@ -0,0 +1,125 @@
++import { Excalidraw } from "../index";
++import { API } from "../tests/helpers/api";
++import { Keyboard, UI } from "../tests/helpers/ui";
++import { render } from "../tests/test-utils";
++
++import { actionSnapToGrid } from "./actionSnapToGrid";
++
++const { h } = window;
++
++describe("snap to grid", () => {
++  beforeEach(async () => {
++    await render(<Excalidraw handleKeyboardGlobally />);
++  });
++
++  it("snaps position and size of the selection to the nearest grid line", () => {
++    expect(h.state.gridSize).toBe(20);
++
++    const rectangle = API.createElement({
++      type: "rectangle",
++      x: 101,
++      y: 99,
++      width: 42,
++      height: 38,
++    });
++
++    API.setElements([rectangle]);
++    API.setSelectedElements([rectangle]);
++
++    API.executeAction(actionSnapToGrid);
++
++    const snapped = API.getElement(rectangle);
++    expect(snapped.x).toBe(100);
++    expect(snapped.y).toBe(100);
++    expect(snapped.width).toBe(40);
++    expect(snapped.height).toBe(40);
++  });
++
++  it("snaps every element independently when nothing is selected", () => {
++    const rectangle = API.createElement({
++      type: "rectangle",
++      id: "rect1",
++      x: 101,
++      y: 99,
++      width: 42,
++      height: 38,
++    });
++    const ellipse = API.createElement({
++      type: "ellipse",
++      id: "ellipse1",
++      x: 209,
++      y: 8,
++      width: 22,
++      height: 61,
++    });
++
++    API.setElements([rectangle, ellipse]);
++    API.setSelectedElements([]);
++
++    API.executeAction(actionSnapToGrid);
++
++    const snappedRect = API.getElement(rectangle);
++    expect(snappedRect.x).toBe(100);
++    expect(snappedRect.y).toBe(100);
++    expect(snappedRect.width).toBe(40);
++    expect(snappedRect.height).toBe(40);
++
++    const snappedEllipse = API.getElement(ellipse);
++    expect(snappedEllipse.x).toBe(200);
++    expect(snappedEllipse.y).toBe(0);
++    expect(snappedEllipse.width).toBe(20);
++    expect(snappedEllipse.height).toBe(60);
++  });
++
++  it("does not move a shape not part of a multi-selection as a group", () => {
++    const rectangle = API.createElement({
++      type: "rectangle",
++      id: "rect1",
++      x: 101,
++      y: 99,
++      width: 42,
++      height: 38,
++      groupIds: ["group1"],
++    });
++    const ellipse = API.createElement({
++      type: "ellipse",
++      id: "ellipse1",
++      x: 209,
++      y: 8,
++      width: 22,
++      height: 61,
++      groupIds: ["group1"],
++    });
++
++    API.setElements([rectangle, ellipse]);
++    API.setSelectedElements([rectangle, ellipse]);
++
++    API.executeAction(actionSnapToGrid);
++
++    // each grouped element snaps to its own nearest grid line, rather than
++    // both moving by the same offset as a rigid group
++    expect(API.getElement(rectangle).x).toBe(100);
++    expect(API.getElement(ellipse).x).toBe(200);
++  });
++
++  it("reverts the snap in a single undo step", () => {
++    const rectangle = UI.createElement("rectangle", {
++      x: 101,
++      y: 99,
++      width: 42,
++      height: 38,
++    });
++    API.setSelectedElements([rectangle]);
++
++    API.executeAction(actionSnapToGrid);
++    expect(API.getElement(rectangle).x).toBe(100);
++
++    Keyboard.undo();
++
++    const reverted = API.getElement(rectangle);
++    expect(reverted.x).toBe(101);
++    expect(reverted.y).toBe(99);
++    expect(reverted.width).toBe(42);
++    expect(reverted.height).toBe(38);
++  });
++});
+diff --git a/packages/excalidraw/actions/actionSnapToGrid.ts b/packages/excalidraw/actions/actionSnapToGrid.ts
+new file mode 100644
+index 0000000..b8245d7
+--- /dev/null
++++ b/packages/excalidraw/actions/actionSnapToGrid.ts
+@@ -0,0 +1,117 @@
++import {
++  CaptureUpdateAction,
++  getBoundTextElement,
++  getNonDeletedElements,
++  isBoundToContainer,
++  isElbowArrow,
++  isFreeDrawElement,
++  isLinearElement,
++  isTextElement,
++  rescalePointsInElement,
++  redrawTextBoundingBox,
++  updateBoundElements,
++  updateFrameMembershipOfSelectedElements,
++} from "@excalidraw/element";
++
++import { arrayToMap, getGridPoint } from "@excalidraw/common";
++
++import type { ExcalidrawElement } from "@excalidraw/element/types";
++
++import { gridIcon } from "../components/icons";
++
++import { getSelectedElements, isSomeElementSelected } from "../scene";
++
++import { register } from "./register";
++
++import type { AppClassProperties, AppState, NullableGridSize } from "../types";
++
++const snapElementsToGrid = (
++  elements: readonly ExcalidrawElement[],
++  appState: Readonly<AppState>,
++  app: AppClassProperties,
++) => {
++  const gridSize = appState.gridSize;
++  const nonDeletedElements = getNonDeletedElements(elements);
++
++  const targetElements = isSomeElementSelected(nonDeletedElements, appState)
++    ? getSelectedElements(nonDeletedElements, appState)
++    : nonDeletedElements;
++
++  // bound text snaps together with its container; group membership is
++  // intentionally ignored so each shape snaps independently
++  const elementsToSnap = targetElements.filter(
++    (element) => !element.locked && !isBoundToContainer(element),
++  );
++
++  if (elementsToSnap.length === 0) {
++    return elements;
++  }
++
++  elementsToSnap.forEach((element) => {
++    const [x, y] = getGridPoint(
++      element.x,
++      element.y,
++      gridSize as NullableGridSize,
++    );
++
++    // elbow arrow routing and text metrics aren't simple round-to-grid
++    // quantities, so only reposition them; every other shape also snaps size
++    if (isTextElement(element) || isElbowArrow(element)) {
++      app.scene.mutateElement(element, { x, y });
++      return;
++    }
++
++    const width = Math.max(
++      gridSize,
++      Math.round(element.width / gridSize) * gridSize,
++    );
++    const height = Math.max(
++      gridSize,
++      Math.round(element.height / gridSize) * gridSize,
++    );
++
++    const pointUpdates =
++      isLinearElement(element) || isFreeDrawElement(element)
++        ? rescalePointsInElement(element, width, height, true)
++        : {};
++
++    app.scene.mutateElement(element, { x, y, width, height, ...pointUpdates });
++  });
++
++  elementsToSnap.forEach((element) => {
++    updateBoundElements(element, app.scene, {
++      simultaneouslyUpdated: elementsToSnap,
++    });
++
++    const boundText = getBoundTextElement(
++      element,
++      app.scene.getNonDeletedElementsMap(),
++    );
++    if (boundText) {
++      redrawTextBoundingBox(boundText, element, app.scene);
++    }
++  });
++
++  const updatedElementsMap = arrayToMap(elementsToSnap);
++
++  return updateFrameMembershipOfSelectedElements(
++    elements.map((element) => updatedElementsMap.get(element.id) || element),
++    appState,
++    app,
++  );
++};
++
++export const actionSnapToGrid = register({
++  name: "snapToGrid",
++  label: "labels.snapToGrid",
++  icon: gridIcon,
++  keywords: ["grid", "align", "snap"],
++  trackEvent: { category: "element" },
++  perform: (elements, appState, _, app) => {
++    return {
++      elements: snapElementsToGrid(elements, appState, app),
++      appState,
++      captureUpdate: CaptureUpdateAction.IMMEDIATELY,
++    };
++  },
++});
+diff --git a/packages/excalidraw/actions/index.ts b/packages/excalidraw/actions/index.ts
+index 6d2321b..631049f 100644
+--- a/packages/excalidraw/actions/index.ts
++++ b/packages/excalidraw/actions/index.ts
+@@ -69,6 +69,8 @@ export {
+ 
+ export { actionFlipHorizontal, actionFlipVertical } from "./actionFlip";
+ 
++export { actionSnapToGrid } from "./actionSnapToGrid";
++
+ export {
+   actionCopy,
+   actionCut,
+diff --git a/packages/excalidraw/actions/types.ts b/packages/excalidraw/actions/types.ts
+index 4f7cbd3..69485d6 100644
+--- a/packages/excalidraw/actions/types.ts
++++ b/packages/excalidraw/actions/types.ts
+@@ -115,6 +115,7 @@ export type ActionName =
+   | "distributeVertically"
+   | "flipHorizontal"
+   | "flipVertical"
++  | "snapToGrid"
+   | "deselect"
+   | "viewMode"
+   | "exportWithDarkMode"
+diff --git a/packages/excalidraw/components/App.tsx b/packages/excalidraw/components/App.tsx
+index d0c75ad..e4ca448 100644
+--- a/packages/excalidraw/components/App.tsx
++++ b/packages/excalidraw/components/App.tsx
+@@ -308,6 +308,7 @@ import {
+   actionFinalize,
+   actionFlipHorizontal,
+   actionFlipVertical,
++  actionSnapToGrid,
+   actionGroup,
+   actionPasteStyles,
+   actionSelectAll,
+@@ -13585,6 +13586,8 @@ class App extends React.Component<AppProps, AppState> {
+         actionSelectAll,
+         actionUnlockAllElements,
+         CONTEXT_MENU_SEPARATOR,
++        actionSnapToGrid,
++        CONTEXT_MENU_SEPARATOR,
+         actionToggleGridMode,
+         actionToggleObjectsSnapMode,
+         actionToggleArrowBinding,
+@@ -13645,6 +13648,8 @@ class App extends React.Component<AppProps, AppState> {
+       actionFlipHorizontal,
+       actionFlipVertical,
+       CONTEXT_MENU_SEPARATOR,
++      actionSnapToGrid,
++      CONTEXT_MENU_SEPARATOR,
+       actionToggleLinearEditor,
+       CONTEXT_MENU_SEPARATOR,
+       actionLink,
+diff --git a/packages/excalidraw/locales/en.json b/packages/excalidraw/locales/en.json
+index 4a6fa1d..f67d183 100644
+--- a/packages/excalidraw/locales/en.json
++++ b/packages/excalidraw/locales/en.json
+@@ -113,6 +113,7 @@
+     "collaborators": "Collaborators",
+     "you": "You",
+     "toggleGrid": "Toggle grid",
++    "snapToGrid": "Snap to grid",
+     "addToLibrary": "Add to library",
+     "removeFromLibrary": "Remove from library",
+     "libraryLoadingMessage": "Loading library…",
+diff --git a/packages/excalidraw/tests/__snapshots__/contextmenu.test.tsx.snap b/packages/excalidraw/tests/__snapshots__/contextmenu.test.tsx.snap
+index f81b29f..62a4645 100644
+--- a/packages/excalidraw/tests/__snapshots__/contextmenu.test.tsx.snap
++++ b/packages/excalidraw/tests/__snapshots__/contextmenu.test.tsx.snap
+@@ -734,6 +734,60 @@ exports[`contextMenu element > right-clicking on a group should select whole gro
+         },
+       },
+       "separator",
++      {
++        "icon": <svg
++          aria-hidden="true"
++          className=""
++          fill="none"
++          focusable="false"
++          role="img"
++          stroke="currentColor"
++          strokeLinecap="round"
++          strokeLinejoin="round"
++          strokeWidth={2}
++          viewBox="0 0 24 24"
++        >
++          <g
++            strokeWidth={"1.50000"}
++          >
++            <path
++              d="M0 0h24v24H0z"
++              fill="none"
++              stroke="none"
++            />
++            <path
++              d="M3 6h18"
++            />
++            <path
++              d="M3 12h18"
++            />
++            <path
++              d="M3 18h18"
++            />
++            <path
++              d="M6 3v18"
++            />
++            <path
++              d="M12 3v18"
++            />
++            <path
++              d="M18 3v18"
++            />
++          </g>
++        </svg>,
++        "keywords": [
++          "grid",
++          "align",
++          "snap",
++        ],
++        "label": "labels.snapToGrid",
++        "name": "snapToGrid",
++        "perform": [Function],
++        "trackEvent": {
++          "category": "element",
++        },
++      },
++      "separator",
+       {
+         "PanelComponent": [Function],
+         "category": "Elements",
+@@ -5457,6 +5511,60 @@ exports[`contextMenu element > shows 'Group selection' in context menu for multi
+         },
+       },
+       "separator",
++      {
++        "icon": <svg
++          aria-hidden="true"
++          className=""
++          fill="none"
++          focusable="false"
++          role="img"
++          stroke="currentColor"
++          strokeLinecap="round"
++          strokeLinejoin="round"
++          strokeWidth={2}
++          viewBox="0 0 24 24"
++        >
++          <g
++            strokeWidth={"1.50000"}
++          >
++            <path
++              d="M0 0h24v24H0z"
++              fill="none"
++              stroke="none"
++            />
++            <path
++              d="M3 6h18"
++            />
++            <path
++              d="M3 12h18"
++            />
++            <path
++              d="M3 18h18"
++            />
++            <path
++              d="M6 3v18"
++            />
++            <path
++              d="M12 3v18"
++            />
++            <path
++              d="M18 3v18"
++            />
++          </g>
++        </svg>,
++        "keywords": [
++          "grid",
++          "align",
++          "snap",
++        ],
++        "label": "labels.snapToGrid",
++        "name": "snapToGrid",
++        "perform": [Function],
++        "trackEvent": {
++          "category": "element",
++        },
++      },
++      "separator",
+       {
+         "PanelComponent": [Function],
+         "category": "Elements",
+@@ -6680,6 +6788,60 @@ exports[`contextMenu element > shows 'Ungroup selection' in context menu for gro
+         },
+       },
+       "separator",
++      {
++        "icon": <svg
++          aria-hidden="true"
++          className=""
++          fill="none"
++          focusable="false"
++          role="img"
++          stroke="currentColor"
++          strokeLinecap="round"
++          strokeLinejoin="round"
++          strokeWidth={2}
++          viewBox="0 0 24 24"
++        >
++          <g
++            strokeWidth={"1.50000"}
++          >
++            <path
++              d="M0 0h24v24H0z"
++              fill="none"
++              stroke="none"
++            />
++            <path
++              d="M3 6h18"
++            />
++            <path
++              d="M3 12h18"
++            />
++            <path
++              d="M3 18h18"
++            />
++            <path
++              d="M6 3v18"
++            />
++            <path
++              d="M12 3v18"
++            />
++            <path
++              d="M18 3v18"
++            />
++          </g>
++        </svg>,
++        "keywords": [
++          "grid",
++          "align",
++          "snap",
++        ],
++        "label": "labels.snapToGrid",
++        "name": "snapToGrid",
++        "perform": [Function],
++        "trackEvent": {
++          "category": "element",
++        },
++      },
++      "separator",
+       {
+         "PanelComponent": [Function],
+         "category": "Elements",
+@@ -7514,6 +7676,60 @@ exports[`contextMenu element > shows context menu for canvas > [end of test] app
+         "viewMode": false,
+       },
+       "separator",
++      {
++        "icon": <svg
++          aria-hidden="true"
++          className=""
++          fill="none"
++          focusable="false"
++          role="img"
++          stroke="currentColor"
++          strokeLinecap="round"
++          strokeLinejoin="round"
++          strokeWidth={2}
++          viewBox="0 0 24 24"
++        >
++          <g
++            strokeWidth={"1.50000"}
++          >
++            <path
++              d="M0 0h24v24H0z"
++              fill="none"
++              stroke="none"
++            />
++            <path
++              d="M3 6h18"
++            />
++            <path
++              d="M3 12h18"
++            />
++            <path
++              d="M3 18h18"
++            />
++            <path
++              d="M6 3v18"
++            />
++            <path
++              d="M12 3v18"
++            />
++            <path
++              d="M18 3v18"
++            />
++          </g>
++        </svg>,
++        "keywords": [
++          "grid",
++          "align",
++          "snap",
++        ],
++        "label": "labels.snapToGrid",
++        "name": "snapToGrid",
++        "perform": [Function],
++        "trackEvent": {
++          "category": "element",
++        },
++      },
++      "separator",
+       {
+         "checked": [Function],
+         "icon": <svg
+@@ -8649,6 +8865,60 @@ exports[`contextMenu element > shows context menu for element > [end of test] ap
+         },
+       },
+       "separator",
++      {
++        "icon": <svg
++          aria-hidden="true"
++          className=""
++          fill="none"
++          focusable="false"
++          role="img"
++          stroke="currentColor"
++          strokeLinecap="round"
++          strokeLinejoin="round"
++          strokeWidth={2}
++          viewBox="0 0 24 24"
++        >
++          <g
++            strokeWidth={"1.50000"}
++          >
++            <path
++              d="M0 0h24v24H0z"
++              fill="none"
++              stroke="none"
++            />
++            <path
++              d="M3 6h18"
++            />
++            <path
++              d="M3 12h18"
++            />
++            <path
++              d="M3 18h18"
++            />
++            <path
++              d="M6 3v18"
++            />
++            <path
++              d="M12 3v18"
++            />
++            <path
++              d="M18 3v18"
++            />
++          </g>
++        </svg>,
++        "keywords": [
++          "grid",
++          "align",
++          "snap",
++        ],
++        "label": "labels.snapToGrid",
++        "name": "snapToGrid",
++        "perform": [Function],
++        "trackEvent": {
++          "category": "element",
++        },
++      },
++      "separator",
+       {
+         "PanelComponent": [Function],
+         "category": "Elements",
+@@ -9646,6 +9916,60 @@ exports[`contextMenu element > shows context menu for element > [end of test] ap
+         },
+       },
+       "separator",
++      {
++        "icon": <svg
++          aria-hidden="true"
++          className=""
++          fill="none"
++          focusable="false"
++          role="img"
++          stroke="currentColor"
++          strokeLinecap="round"
++          strokeLinejoin="round"
++          strokeWidth={2}
++          viewBox="0 0 24 24"
++        >
++          <g
++            strokeWidth={"1.50000"}
++          >
++            <path
++              d="M0 0h24v24H0z"
++              fill="none"
++              stroke="none"
++            />
++            <path
++              d="M3 6h18"
++            />
++            <path
++              d="M3 12h18"
++            />
++            <path
++              d="M3 18h18"
++            />
++            <path
++              d="M6 3v18"
++            />
++            <path
++              d="M12 3v18"
++            />
++            <path
++              d="M18 3v18"
++            />
++          </g>
++        </svg>,
++        "keywords": [
++          "grid",
++          "align",
++          "snap",
++        ],
++        "label": "labels.snapToGrid",
++        "name": "snapToGrid",
++        "perform": [Function],
++        "trackEvent": {
++          "category": "element",
++        },
++      },
++      "separator",
+       {
+         "PanelComponent": [Function],
+         "category": "Elements",
+diff --git a/packages/excalidraw/tests/contextmenu.test.tsx b/packages/excalidraw/tests/contextmenu.test.tsx
+index 67c5f88..0ae1427 100644
+--- a/packages/excalidraw/tests/contextmenu.test.tsx
++++ b/packages/excalidraw/tests/contextmenu.test.tsx
+@@ -129,6 +129,7 @@ describe("contextMenu element", () => {
+       "addToLibrary",
+       "flipHorizontal",
+       "flipVertical",
++      "snapToGrid",
+       "sendBackward",
+       "bringForward",
+       "sendToBack",
+@@ -233,7 +234,10 @@ describe("contextMenu element", () => {
+     ];
+ 
+     expect(contextMenu).not.toBeNull();
+-    expect(contextMenuOptions?.length).toBe(expectedShortcutNames.length);
++    expect(contextMenuOptions?.length).toBe(expectedShortcutNames.length + 1); // + snapToGrid
++    expect(
++      contextMenu?.querySelector('li[data-testid="snapToGrid"]'),
++    ).not.toBeNull();
+     expectedShortcutNames.forEach((shortcutName) => {
+       expect(
+         contextMenu?.querySelector(`li[data-testid="${shortcutName}"]`),
+@@ -282,6 +286,7 @@ describe("contextMenu element", () => {
+       "addToLibrary",
+       "flipHorizontal",
+       "flipVertical",
++      "snapToGrid",
+       "sendBackward",
+       "bringForward",
+       "sendToBack",

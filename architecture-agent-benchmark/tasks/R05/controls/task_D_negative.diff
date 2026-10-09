@@ -1,0 +1,130 @@
+diff --git a/lib/storage/storage.go b/lib/storage/storage.go
+index 4b8f6cd..da0ed9c 100644
+--- a/lib/storage/storage.go
++++ b/lib/storage/storage.go
+@@ -148,6 +148,12 @@ type Storage struct {
+ 
+ 	metricsTracker *metricnamestats.Tracker
+ 
++	// droppedSeriesByNameLock protects droppedSeriesByName below.
++	droppedSeriesByNameLock sync.Mutex
++	// droppedSeriesByName tracks, per metric name, how many samples were
++	// dropped because of -storage.maxHourlySeries / -storage.maxDailySeries.
++	droppedSeriesByName map[string]uint64
++
+ 	// idbPrefillStartSeconds defines the start time of the idbNext prefill.
+ 	// It helps to spread load in time for index records creation and reduce resource usage.
+ 	idbPrefillStartSeconds int64
+@@ -2157,11 +2163,25 @@ func (s *Storage) registerSeriesCardinality(metricNameRaw []byte) bool {
+ 	if sl := s.hourlySeriesLimiter; sl != nil && !sl.Add(metricID) {
+ 		s.hourlySeriesLimitRowsDropped.Add(1)
+ 		logSkippedSeries(metricNameRaw, "-storage.maxHourlySeries", sl.MaxItems())
++		metricName := getUserReadableMetricName(metricNameRaw)
++		s.droppedSeriesByNameLock.Lock()
++		if s.droppedSeriesByName == nil {
++			s.droppedSeriesByName = make(map[string]uint64)
++		}
++		s.droppedSeriesByName[metricName]++
++		s.droppedSeriesByNameLock.Unlock()
+ 		return false
+ 	}
+ 	if sl := s.dailySeriesLimiter; sl != nil && !sl.Add(metricID) {
+ 		s.dailySeriesLimitRowsDropped.Add(1)
+ 		logSkippedSeries(metricNameRaw, "-storage.maxDailySeries", sl.MaxItems())
++		metricName := getUserReadableMetricName(metricNameRaw)
++		s.droppedSeriesByNameLock.Lock()
++		if s.droppedSeriesByName == nil {
++			s.droppedSeriesByName = make(map[string]uint64)
++		}
++		s.droppedSeriesByName[metricName]++
++		s.droppedSeriesByNameLock.Unlock()
+ 		return false
+ 	}
+ 	return true
+@@ -2668,6 +2688,33 @@ func (s *Storage) ResetMetricNamesStats(_ *querytracer.Tracer) {
+ 	s.metricsTracker.Reset(s.tsidCache.Reset)
+ }
+ 
++// droppedSeriesEntry is a metric name paired with its drop count, used by
++// GetTopDroppedSeriesByName.
++type droppedSeriesEntry struct {
++	MetricName string
++	DropCount  uint64
++}
++
++// GetTopDroppedSeriesByName returns up to limit metric names with the
++// highest counts of samples dropped due to -storage.maxHourlySeries or
++// -storage.maxDailySeries, sorted by drop count descending.
++func (s *Storage) GetTopDroppedSeriesByName(limit int) []droppedSeriesEntry {
++	s.droppedSeriesByNameLock.Lock()
++	entries := make([]droppedSeriesEntry, 0, len(s.droppedSeriesByName))
++	for name, count := range s.droppedSeriesByName {
++		entries = append(entries, droppedSeriesEntry{MetricName: name, DropCount: count})
++	}
++	s.droppedSeriesByNameLock.Unlock()
++
++	sort.Slice(entries, func(i, j int) bool {
++		return entries[i].DropCount > entries[j].DropCount
++	})
++	if limit > 0 && len(entries) > limit {
++		entries = entries[:limit]
++	}
++	return entries
++}
++
+ // GetMetadataRows returns time series metric names metadata for the given args
+ func (s *Storage) GetMetadataRows(qt *querytracer.Tracer, limit int, metricName string) []*metricsmetadata.Row {
+ 	var (
+diff --git a/lib/storage/storage_test.go b/lib/storage/storage_test.go
+index b114bdc..8a52e83 100644
+--- a/lib/storage/storage_test.go
++++ b/lib/storage/storage_test.go
+@@ -1992,6 +1992,48 @@ func TestStorageRowsNotAdded_SeriesLimitExceeded(t *testing.T) {
+ 	})
+ }
+ 
++// TestStorageDroppedSeriesByName_TracksTopOffenders verifies that samples
++// dropped due to -storage.maxHourlySeries are recorded per metric name and
++// are queryable via Storage.GetTopDroppedSeriesByName.
++func TestStorageDroppedSeriesByName_TracksTopOffenders(t *testing.T) {
++	defer testRemoveAll(t)
++
++	const (
++		maxHourlySeries = 10
++		numRows         = 2000
++	)
++
++	rng := rand.New(rand.NewSource(1))
++	minTimestamp := time.Now().UnixMilli()
++	maxTimestamp := minTimestamp + 1000
++	mrs := testGenerateMetricRows(rng, numRows, minTimestamp, maxTimestamp)
++
++	opts := OpenOptions{
++		MaxHourlySeries: maxHourlySeries,
++	}
++	s := MustOpenStorage(t.Name(), opts)
++	defer s.MustClose()
++
++	s.AddRows(mrs, defaultPrecisionBits)
++	s.DebugFlush()
++
++	var gotMetrics Metrics
++	s.UpdateMetrics(&gotMetrics)
++	if gotMetrics.HourlySeriesLimitRowsDropped == 0 {
++		t.Fatalf("expected some rows to be dropped due to maxHourlySeries=%d, got HourlySeriesLimitRowsDropped=0", maxHourlySeries)
++	}
++
++	top := s.GetTopDroppedSeriesByName(5)
++	if len(top) == 0 {
++		t.Fatalf("expected GetTopDroppedSeriesByName to report at least one offending metric name, got none")
++	}
++	for _, e := range top {
++		if e.DropCount == 0 {
++			t.Fatalf("expected nonzero DropCount for tracked metric name %q, got 0", e.MetricName)
++		}
++	}
++}
++
+ // testCountAllMetricNames is a test helper function that counts the names of
+ // all time series within the given time range.
+ func testCountAllMetricNames(s *Storage, tr TimeRange) int {

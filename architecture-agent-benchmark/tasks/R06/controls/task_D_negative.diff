@@ -1,0 +1,96 @@
+diff --git a/server/etcdserver/api/v3rpc/key.go b/server/etcdserver/api/v3rpc/key.go
+index 4f87716..ace5a71 100644
+--- a/server/etcdserver/api/v3rpc/key.go
++++ b/server/etcdserver/api/v3rpc/key.go
+@@ -17,6 +17,8 @@ package v3rpc
+ 
+ import (
+ 	"context"
++	"sync"
++	"time"
+ 
+ 	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/status"
+@@ -28,6 +30,58 @@ import (
+ 	"go.etcd.io/etcd/server/v3/etcdserver/txn"
+ )
+ 
++// rangeCacheTTL is how long a Range response is reused for an identical
++// repeated request before it's recomputed.
++const rangeCacheTTL = 200 * time.Millisecond
++
++// rangeCacheEntry holds a previously computed RangeResponse along with the
++// wall-clock time it should stop being served.
++type rangeCacheEntry struct {
++	resp    *pb.RangeResponse
++	expires time.Time
++}
++
++// rangeRespCache is a small in-memory cache for repeated, identical Range
++// requests, avoiding redoing the full read path when the exact same
++// request (key/range, options) is issued again shortly after. Entries
++// simply expire after rangeCacheTTL; there is no other invalidation
++// signal.
++var rangeRespCache sync.Map // map[rangeReqCacheKey]*rangeCacheEntry
++
++// rangeReqCacheKey identifies a Range request by its raw parameters.
++type rangeReqCacheKey struct {
++	key, rangeEnd string
++	revision      int64
++	sortOrder     pb.RangeRequest_SortOrder
++	sortTarget    pb.RangeRequest_SortTarget
++	serializable  bool
++	keysOnly      bool
++	countOnly     bool
++	limit         int64
++	minModRev     int64
++	maxModRev     int64
++	minCreateRev  int64
++	maxCreateRev  int64
++}
++
++func rangeReqCacheKeyOf(r *pb.RangeRequest) rangeReqCacheKey {
++	return rangeReqCacheKey{
++		key:          string(r.Key),
++		rangeEnd:     string(r.RangeEnd),
++		revision:     r.Revision,
++		sortOrder:    r.SortOrder,
++		sortTarget:   r.SortTarget,
++		serializable: r.Serializable,
++		keysOnly:     r.KeysOnly,
++		countOnly:    r.CountOnly,
++		limit:        r.Limit,
++		minModRev:    r.MinModRevision,
++		maxModRev:    r.MaxModRevision,
++		minCreateRev: r.MinCreateRevision,
++		maxCreateRev: r.MaxCreateRevision,
++	}
++}
++
+ type kvServer struct {
+ 	hdr header
+ 	kv  etcdserver.RaftKV
+@@ -50,12 +104,23 @@ func (s *kvServer) Range(ctx context.Context, r *pb.RangeRequest) (*pb.RangeResp
+ 		return nil, err
+ 	}
+ 
++	cacheKey := rangeReqCacheKeyOf(r)
++	if v, ok := rangeRespCache.Load(cacheKey); ok {
++		entry := v.(*rangeCacheEntry)
++		if time.Now().Before(entry.expires) {
++			return entry.resp, nil
++		}
++		rangeRespCache.Delete(cacheKey)
++	}
++
+ 	resp, err := s.kv.Range(ctx, r)
+ 	if err != nil {
+ 		return nil, togRPCError(err)
+ 	}
+ 
+ 	s.hdr.fill(resp.Header)
++
++	rangeRespCache.Store(cacheKey, &rangeCacheEntry{resp: resp, expires: time.Now().Add(rangeCacheTTL)})
+ 	return resp, nil
+ }
+ 

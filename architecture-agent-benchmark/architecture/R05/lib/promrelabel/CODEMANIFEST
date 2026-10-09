@@ -1,0 +1,143 @@
+Usages:
+  action_set: |
+    Recognized relabel actions (validated at parse time, executed by ParsedConfigs.Apply):
+    replace (default), replace_all, keep, drop, keep_if_contains, drop_if_contains,
+    keep_if_equal, drop_if_equal, keepequal, dropequal, hashmod, labelmap, labelmap_all,
+    labeldrop, labelkeep, uppercase, lowercase, graphite. keep_metrics/drop_metrics are accepted
+    at parse time and rewritten internally to keep/drop against the __name__ label.
+
+Annotations: |
+  This cell is a pure, side-effect-free label-transformation engine implementing Prometheus
+  relabeling semantics (plus VictoriaMetrics extensions like keep_if_contains/hashmod/keepequal)
+  over slices of label pairs. It is the single implementation shared by every ingestion surface:
+  the scrape path (lib/promscrape) and the push/remote-write path (via app/vminsert's and
+  app/vmagent's own relabel wrapper packages) both compile YAML relabel rules through this
+  cell's loaders and execute the same `ParsedConfigs` Apply logic, guaranteeing byte-for-byte
+  identical relabeling behavior regardless of which component or wire protocol samples entered
+  through.
+
+  Use `action_set` when implementing or reasoning about a new relabel rule's runtime behavior.
+
+---
+
+"RelabelConfig(if: IfExpression, action: string, sourceLabels: []string, separator: string, targetLabel: string, regex: string, modulus: uint64, replacement: string)":
+  location: config.go
+  annotations: |
+    Raw, YAML-shaped form of one relabel rule, as written by a user in a scrape config or
+    remote-write relabel config file.
+
+    `action`: one of `action_set`; validated and normalized at parse time
+    `if`: optional `IfExpression` gating whether this rule applies to a given label set
+    Requirements:
+    - Must be compiled via `ParseRelabelConfigs` before it can be applied; this raw form is
+      never applied directly
+
+"ParsedConfigs()":
+  location: relabel.go
+  annotations: |
+    Compiled, ready-to-execute form of an ordered list of `RelabelConfig` rules. Obtained via
+    `LoadRelabelConfigs`, `ParseRelabelConfigsData`, or `ParseRelabelConfigs`; never constructed
+    directly.
+  methods:
+    "Len() -> count:int": |
+      Number of compiled rules.
+    "String() -> text:string": |
+      Render back to a human-readable form (used for debug endpoints).
+    "Apply(labels: []Label, labelsOffset: int) -> labels:[]Label": |
+      Apply every compiled rule in order to `labels` starting at `labelsOffset`, returning the
+      transformed label slice. This is the hot-path entry point called once per scraped/ingested
+      sample.
+
+      `labelsOffset`: index marking where this sample's own labels start (labels before the
+      offset are treated as shared/external labels not subject to source_labels lookups)
+    "ApplyDebug(labels: []Label) -> labels:[]Label, steps:[]DebugStep": |
+      Same as this type's own Apply method, but additionally records one `DebugStep` per rule
+      for troubleshooting endpoints (e.g. why a target/metric was dropped or relabeled a
+      particular way).
+
+"DebugStep(rule: string, in: string, out: string)":
+  location: relabel.go
+  annotations: |
+    One recorded relabeling step: the rule text, the label set before (`in`) and after (`out`)
+    applying it. Purely a debug-endpoint artifact, never used on the hot path.
+  methods:
+    "String() -> text:string": |
+      Human-readable rendering of this step.
+
+"IfExpression()":
+  location: if_expression.go
+  annotations: |
+    A boolean matcher over a label set, compiled from either a PromQL/MetricsQL-style series
+    selector string or a metric-expression AST. Used to gate whether a `RelabelConfig` rule
+    applies to a given sample.
+  methods:
+    "Parse(s: string) -> err:error": |
+      Compile `s` (a series-selector-like string, e.g. `{env="prod"}`) into matchable form.
+    "ParseFromMetricExpr(me: MetricExpr) -> err:error": |
+      Compile from an already-parsed metric expression AST instead of raw text.
+    "Match(labels: []Label) -> matched:bool": |
+      Evaluate whether `labels` satisfies this expression.
+    "String() -> text:string": |
+      Render back to its original selector-like text form.
+
+"LoadRelabelConfigs(path: string) -> parsed:ParsedConfigs, raw:[]byte, err:error":
+  location: config.go
+  annotations: |
+    Read and compile a relabel-config YAML file from disk.
+
+    `raw`: the unparsed file bytes, kept for debug/reload-diffing endpoints
+
+"ParseRelabelConfigsData(data: []byte) -> parsed:ParsedConfigs, err:error":
+  location: config.go
+  annotations: |
+    Parse and compile relabel configs from in-memory YAML bytes (used when config arrives via
+    HTTP or is embedded rather than read from a local file).
+
+"ParseRelabelConfigs(rcs: []RelabelConfig) -> parsed:ParsedConfigs, err:error":
+  location: config.go
+  annotations: |
+    Compile an already-YAML-decoded slice of `RelabelConfig` into a `ParsedConfigs`.
+
+    Algorithm:
+    1. Validate and normalize each rule's action against `action_set`
+    2. Compile each rule's source_labels/regex/if into matchable form
+    3. Reject the whole set on the first invalid rule, returning an error
+
+"FinalizeLabels(dst: []Label, src: []Label) -> labels:[]Label":
+  location: relabel.go
+  annotations: |
+    Append `src` onto `dst` while resolving name collisions and dropping labels with empty
+    values, producing the final label set for a sample after all relabeling has run.
+
+"GetLabelByName(labels: []Label, name: string) -> label:Label":
+  location: relabel.go
+  annotations: |
+    Find the label named `name` in `labels`, or a nil/zero result if absent.
+
+"SanitizeLabelName(name: string) -> name:string":
+  location: relabel.go
+  annotations: |
+    Replace characters not valid in a Prometheus label name with an underscore.
+
+"SanitizeMetricName(value: string) -> name:string":
+  location: relabel.go
+  annotations: |
+    Replace characters not valid in a Prometheus metric name with an underscore.
+
+"GetScrapeURL(labels: Labels, extraParams: map[string][]string) -> url:string, path:string":
+  location: scrape_url.go
+  annotations: |
+    Build the final scrape URL for a target from its (post-relabeling) label set — combining
+    the __address__/__scheme__/__metrics_path__ meta-labels with any extra query
+    parameters configured for the job.
+
+---
+
+Author: Goga
+CreatedAt: 26/08/26
+Description: |
+  Shared, cross-cutting relabeling engine. Confirmed by import-graph analysis to be consumed
+  identically by `lib/promscrape` (target and per-sample metric relabeling during scraping) and
+  by app/vminsert's and app/vmagent's own `relabel`/`remotewrite` subpackages (remote-write
+  ingestion relabeling), plus `lib/streamaggr`, `app/vmalert`, and `app/vmselect`'s federate
+  endpoint.

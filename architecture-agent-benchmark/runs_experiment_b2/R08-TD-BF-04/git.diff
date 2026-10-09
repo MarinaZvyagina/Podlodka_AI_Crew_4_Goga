@@ -1,0 +1,356 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+index f47eddb..5487a38 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+@@ -13,6 +13,7 @@ import androidx.annotation.VisibleForTesting;
+ import androidx.annotation.WorkerThread;
+ 
+ import org.signal.core.util.CursorUtil;
++import org.signal.core.util.LRUCache;
+ import org.signal.core.util.concurrent.SignalExecutors;
+ import org.signal.core.util.logging.Log;
+ import org.thoughtcrime.securesms.conversation.MessageStyler;
+@@ -50,6 +51,7 @@ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Set;
+ import java.util.concurrent.Executor;
++import java.util.concurrent.atomic.AtomicLong;
+ 
+ import static org.thoughtcrime.securesms.database.SearchTable.SNIPPET_WRAP;
+ 
+@@ -62,6 +64,17 @@ public class SearchRepository {
+ 
+   private static final int MAX_SNIPPET_SIZE = 100;
+ 
++  private static final int RESULT_CACHE_CAPACITY = 15;
++
++  /**
++   * Bumped by {@link #registerCacheInvalidationObserverOnce()} whenever conversations or messages
++   * change. A cache entry is only valid if it was produced while this counter held the same value
++   * it holds at lookup time, so an in-flight edit/delete/insert can never surface stale results --
++   * at worst it causes an unnecessary re-query.
++   */
++  private static final AtomicLong dataVersion = new AtomicLong(0);
++  private static volatile boolean cacheInvalidationObserverRegistered = false;
++
+   private final Context           context;
+   private final String            noteToSelfTitle;
+   private final SearchTable       searchDatabase;
+@@ -72,6 +85,12 @@ public class SearchRepository {
+ 
+   private final Executor serialExecutor;
+ 
++  private final Object                                  threadResultCacheLock = new Object();
++  private final Map<List<Object>, CacheEntry<ThreadSearchResult>>  threadResultCache = new LRUCache<>(RESULT_CACHE_CAPACITY);
++
++  private final Object                                   messageResultCacheLock = new Object();
++  private final Map<List<Object>, CacheEntry<MessageSearchResult>> messageResultCache = new LRUCache<>(RESULT_CACHE_CAPACITY);
++
+   public SearchRepository(@NonNull String noteToSelfTitle) {
+     this.context           = AppDependencies.getApplication().getApplicationContext();
+     this.noteToSelfTitle   = noteToSelfTitle;
+@@ -81,18 +100,70 @@ public class SearchRepository {
+     this.mentionTable      = SignalDatabase.mentions();
+     this.messageTable      = SignalDatabase.messages();
+     this.serialExecutor    = new SerialExecutor(SignalExecutors.BOUNDED);
++
++    registerCacheInvalidationObserverOnce();
++  }
++
++  /**
++   * Registers a single process-wide {@link org.thoughtcrime.securesms.database.DatabaseObserver}
++   * listener the first time a {@link SearchRepository} is constructed. Deliberately never
++   * unregistered -- callers construct short-lived {@link SearchRepository} instances all over the
++   * app, and per-instance registration would leak a listener per instance. Registering once and
++   * sharing {@link #dataVersion} across every instance avoids that while still invalidating every
++   * instance's cache on the next relevant write.
++   */
++  private static void registerCacheInvalidationObserverOnce() {
++    if (cacheInvalidationObserverRegistered) {
++      return;
++    }
++
++    synchronized (SearchRepository.class) {
++      if (cacheInvalidationObserverRegistered) {
++        return;
++      }
++      cacheInvalidationObserverRegistered = true;
++      AppDependencies.getDatabaseObserver().registerConversationListObserver(dataVersion::incrementAndGet);
++    }
++  }
++
++  /**
++   * Undoes {@link #registerCacheInvalidationObserverOnce}'s one-time guard so a test can verify
++   * registration happens and capture the listener against its own mocked
++   * {@link org.thoughtcrime.securesms.database.DatabaseObserver}. Production code never needs this.
++   */
++  @VisibleForTesting
++  static void resetCacheInvalidationStateForTesting() {
++    synchronized (SearchRepository.class) {
++      cacheInvalidationObserverRegistered = false;
++      dataVersion.set(0);
++    }
+   }
+ 
+   @WorkerThread
+   public @NonNull ThreadSearchResult queryThreadsSync(@NonNull String query, boolean unreadOnly) {
+     SignalTrace.beginSection("ConversationListSearch-Threads");
+     try {
++      List<Object> cacheKey = Arrays.asList(query, unreadOnly);
++      long         version  = dataVersion.get();
++
++      synchronized (threadResultCacheLock) {
++        CacheEntry<ThreadSearchResult> cached = threadResultCache.get(cacheKey);
++        if (cached != null && cached.version == version) {
++          return cached.result;
++        }
++      }
++
+       long                      start  = System.currentTimeMillis();
+       List<ThreadWithRecipient> result = queryConversations(query, unreadOnly);
++      ThreadSearchResult        searchResult = new ThreadSearchResult(result, query);
++
++      synchronized (threadResultCacheLock) {
++        threadResultCache.put(cacheKey, new CacheEntry<>(searchResult, version));
++      }
+ 
+       Log.d(TAG, "[threads] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new ThreadSearchResult(result, query);
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -102,16 +173,31 @@ public class SearchRepository {
+   public @NonNull MessageSearchResult queryMessagesSync(@NonNull String query, @NonNull SearchFilter filter) {
+     SignalTrace.beginSection("ConversationListSearch-Messages");
+     try {
++      List<Object> cacheKey = Arrays.asList(query, filter);
++      long         version  = dataVersion.get();
++
++      synchronized (messageResultCacheLock) {
++        CacheEntry<MessageSearchResult> cached = messageResultCache.get(cacheKey);
++        if (cached != null && cached.version == version) {
++          return cached.result;
++        }
++      }
++
+       long start = System.currentTimeMillis();
+ 
+       List<MessageResult> messages         = queryMessages(query, filter);
+       List<MessageResult> mentionMessages  = queryMentions(convertMentionsQueryToTokens(query));
+       List<MessageResult> filteredMentions = filterMentionResults(mentionMessages, filter);
+       List<MessageResult> combined         = mergeMessagesAndMentions(messages, filteredMentions);
++      MessageSearchResult searchResult     = new MessageSearchResult(combined, query);
++
++      synchronized (messageResultCacheLock) {
++        messageResultCache.put(cacheKey, new CacheEntry<>(searchResult, version));
++      }
+ 
+       Log.d(TAG, "[messages] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new MessageSearchResult(combined, query);
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -485,4 +571,14 @@ public class SearchRepository {
+   public interface ModelBuilder<T> {
+     T build(@NonNull Cursor cursor);
+   }
++
++  private static class CacheEntry<T> {
++    final T    result;
++    final long version;
++
++    CacheEntry(@NonNull T result, long version) {
++      this.result  = result;
++      this.version = version;
++    }
++  }
+ }
+diff --git a/app/src/test/java/org/thoughtcrime/securesms/search/SearchRepositoryCacheTest.kt b/app/src/test/java/org/thoughtcrime/securesms/search/SearchRepositoryCacheTest.kt
+new file mode 100644
+index 0000000..b6d0cbc
+--- /dev/null
++++ b/app/src/test/java/org/thoughtcrime/securesms/search/SearchRepositoryCacheTest.kt
+@@ -0,0 +1,179 @@
++/*
++ * Copyright 2026 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.search
++
++import android.app.Application
++import assertk.assertThat
++import assertk.assertions.isEqualTo
++import assertk.assertions.isFalse
++import assertk.assertions.isTrue
++import io.mockk.Runs
++import io.mockk.every
++import io.mockk.just
++import io.mockk.mockk
++import io.mockk.slot
++import org.junit.Before
++import org.junit.Rule
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import org.thoughtcrime.securesms.database.DatabaseObserver
++import org.thoughtcrime.securesms.database.MessageTable
++import org.thoughtcrime.securesms.database.MessageType
++import org.thoughtcrime.securesms.database.SignalDatabase
++import org.thoughtcrime.securesms.dependencies.AppDependencies
++import org.thoughtcrime.securesms.mms.IncomingMessage
++import org.thoughtcrime.securesms.recipients.RecipientId
++import org.thoughtcrime.securesms.testutil.RecipientTestRule
++
++/**
++ * Verifies [SearchRepository]'s result cache: a repeated identical search is served from cache,
++ * data changes stay invisible until the [DatabaseObserver] fires (matching how production code is
++ * only notified after a transaction commits), and distinct queries don't clobber each other's
++ * cache entries.
++ */
++@RunWith(RobolectricTestRunner::class)
++@Config(manifest = Config.NONE, application = Application::class)
++class SearchRepositoryCacheTest {
++
++  @get:Rule
++  val recipients = RecipientTestRule()
++
++  private val conversationListObserver = slot<DatabaseObserver.Observer>()
++
++  // RecipientTestRule blanket-mocks AppDependencies, leaving unstubbed DatabaseObserver methods
++  // (e.g. notifyRecipientChanged, fired by recipient setup below) with no answer. Stub the property
++  // to return our own relaxed mock so the rest of DatabaseObserver behaves like a no-op, while still
++  // letting us capture the listener registered by SearchRepository's cache invalidation wiring.
++  private val databaseObserver: DatabaseObserver = mockk(relaxed = true)
++
++  private lateinit var senderId: RecipientId
++  private lateinit var repository: SearchRepository
++
++  @Before
++  fun setUp() {
++    every { AppDependencies.databaseObserver } returns databaseObserver
++    every { databaseObserver.registerConversationListObserver(capture(conversationListObserver)) } just Runs
++
++    SearchRepository.resetCacheInvalidationStateForTesting()
++
++    senderId = recipients.createRecipient("Searchable Person")
++    repository = SearchRepository("Note to Self")
++  }
++
++  @Test
++  fun repeatedIdenticalSearchIsServedFromCache() {
++    insertIncomingMessage("hello there")
++
++    val first = repository.queryMessagesSync("hello", SearchFilter.EMPTY)
++    val second = repository.queryMessagesSync("hello", SearchFilter.EMPTY)
++
++    assertThat(first.results).isEqualTo(second.results)
++    assertThat(second === first).isTrue()
++  }
++
++  @Test
++  fun newlyMatchingMessageIsInvisibleUntilObserverFires() {
++    insertIncomingMessage("hello there", time = 1000)
++
++    val first = repository.queryMessagesSync("hello", SearchFilter.EMPTY)
++    assertThat(first.results.size).isEqualTo(1)
++
++    // A second matching message lands, but nothing has told the repository's cache about it yet --
++    // mirrors production, where invalidation only happens once the observer fires.
++    insertIncomingMessage("hello again", time = 1001)
++    val stillCached = repository.queryMessagesSync("hello", SearchFilter.EMPTY)
++    assertThat(stillCached === first).isTrue()
++    assertThat(stillCached.results.size).isEqualTo(1)
++
++    conversationListObserver.captured.onChanged()
++
++    val refreshed = repository.queryMessagesSync("hello", SearchFilter.EMPTY)
++    assertThat(refreshed === first).isFalse()
++    assertThat(refreshed.results.size).isEqualTo(2)
++  }
++
++  @Test
++  fun editedMessageNoLongerMatchesAfterObserverFires() {
++    val messageId = insertIncomingMessage("hello there")
++    assertThat(repository.queryMessagesSync("hello", SearchFilter.EMPTY).results.size).isEqualTo(1)
++
++    updateMessageBody(messageId, "goodbye there")
++    conversationListObserver.captured.onChanged()
++
++    assertThat(repository.queryMessagesSync("hello", SearchFilter.EMPTY).results.size).isEqualTo(0)
++    assertThat(repository.queryMessagesSync("goodbye", SearchFilter.EMPTY).results.size).isEqualTo(1)
++  }
++
++  @Test
++  fun differentQueriesAreCachedIndependently() {
++    insertIncomingMessage("alpha message")
++    insertIncomingMessage("beta message", time = 1001)
++
++    val alpha = repository.queryMessagesSync("alpha", SearchFilter.EMPTY)
++    val beta = repository.queryMessagesSync("beta", SearchFilter.EMPTY)
++
++    assertThat(alpha.results.size).isEqualTo(1)
++    assertThat(beta.results.size).isEqualTo(1)
++    assertThat(alpha.results.first().body.toString()).isEqualTo("alpha message")
++    assertThat(beta.results.first().body.toString()).isEqualTo("beta message")
++
++    // Re-querying "alpha" still hits its own cache entry rather than one clobbered by "beta".
++    assertThat(repository.queryMessagesSync("alpha", SearchFilter.EMPTY) === alpha).isTrue()
++  }
++
++  @Test
++  fun threadSearchIsCachedAndInvalidatedIndependentlyOfMessageSearch() {
++    createFindableThread("Findable Thread")
++
++    val first = repository.queryThreadsSync("Findable", false)
++    val second = repository.queryThreadsSync("Findable", false)
++    assertThat(second === first).isTrue()
++    assertThat(first.results.size).isEqualTo(1)
++
++    createFindableThread("Findable Second Thread")
++    val stillCached = repository.queryThreadsSync("Findable", false)
++    assertThat(stillCached === first).isTrue()
++
++    conversationListObserver.captured.onChanged()
++
++    val refreshed = repository.queryThreadsSync("Findable", false)
++    assertThat(refreshed === first).isFalse()
++    assertThat(refreshed.results.size).isEqualTo(2)
++  }
++
++  /**
++   * A thread with no messages is inactive and invisible to [org.thoughtcrime.securesms.database.ThreadTable.getFilteredConversationList],
++   * so give it one to make it show up in thread search.
++   */
++  private fun createFindableThread(profileName: String) {
++    val id = recipients.createRecipient(profileName)
++    recipients.insertOutgoingMessage(id)
++  }
++
++  private fun insertIncomingMessage(body: String, time: Long = 1000L): Long {
++    val threadId = SignalDatabase.threads.getOrCreateThreadIdFor(senderId, false)
++    val message = IncomingMessage(
++      type = MessageType.NORMAL,
++      from = senderId,
++      groupId = null,
++      body = body,
++      sentTimeMillis = time,
++      receivedTimeMillis = time,
++      serverTimeMillis = time,
++      isUnidentified = true
++    )
++    return SignalDatabase.messages.insertMessageInbox(message, threadId).get().messageId
++  }
++
++  private fun updateMessageBody(messageId: Long, body: String) {
++    SignalDatabase.writableDatabase.execSQL(
++      "UPDATE ${MessageTable.TABLE_NAME} SET ${MessageTable.BODY} = ? WHERE ${MessageTable.ID} = ?",
++      arrayOf(body, messageId)
++    )
++  }
++}

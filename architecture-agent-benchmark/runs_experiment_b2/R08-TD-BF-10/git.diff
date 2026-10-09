@@ -1,0 +1,142 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+index f47eddb..8ada438 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/search/SearchRepository.java
+@@ -13,11 +13,13 @@ import androidx.annotation.VisibleForTesting;
+ import androidx.annotation.WorkerThread;
+ 
+ import org.signal.core.util.CursorUtil;
++import org.signal.core.util.LRUCache;
+ import org.signal.core.util.concurrent.SignalExecutors;
+ import org.signal.core.util.logging.Log;
+ import org.thoughtcrime.securesms.conversation.MessageStyler;
+ import org.thoughtcrime.securesms.database.BodyAdjustment;
+ import org.thoughtcrime.securesms.database.BodyRangeUtil;
++import org.thoughtcrime.securesms.database.DatabaseObserver;
+ import org.thoughtcrime.securesms.database.GroupTable;
+ import org.thoughtcrime.securesms.database.MentionTable;
+ import org.thoughtcrime.securesms.database.MentionUtil;
+@@ -38,6 +40,7 @@ import org.thoughtcrime.securesms.util.SignalTrace;
+ import org.signal.core.util.Util;
+ import org.signal.core.util.concurrent.SerialExecutor;
+ 
++import java.util.AbstractMap.SimpleImmutableEntry;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
+@@ -50,6 +53,7 @@ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Set;
+ import java.util.concurrent.Executor;
++import java.util.concurrent.atomic.AtomicLong;
+ 
+ import static org.thoughtcrime.securesms.database.SearchTable.SNIPPET_WRAP;
+ 
+@@ -61,6 +65,7 @@ public class SearchRepository {
+   private static final String TAG = Log.tag(SearchRepository.class);
+ 
+   private static final int MAX_SNIPPET_SIZE = 100;
++  private static final int SEARCH_CACHE_SIZE = 20;
+ 
+   private final Context           context;
+   private final String            noteToSelfTitle;
+@@ -72,6 +77,9 @@ public class SearchRepository {
+ 
+   private final Executor serialExecutor;
+ 
++  private final Map<SimpleImmutableEntry<String, Boolean>, CacheEntry<ThreadSearchResult>>       threadSearchCache  = Collections.synchronizedMap(new LRUCache<>(SEARCH_CACHE_SIZE));
++  private final Map<SimpleImmutableEntry<String, SearchFilter>, CacheEntry<MessageSearchResult>>  messageSearchCache = Collections.synchronizedMap(new LRUCache<>(SEARCH_CACHE_SIZE));
++
+   public SearchRepository(@NonNull String noteToSelfTitle) {
+     this.context           = AppDependencies.getApplication().getApplicationContext();
+     this.noteToSelfTitle   = noteToSelfTitle;
+@@ -85,6 +93,15 @@ public class SearchRepository {
+ 
+   @WorkerThread
+   public @NonNull ThreadSearchResult queryThreadsSync(@NonNull String query, boolean unreadOnly) {
++    SimpleImmutableEntry<String, Boolean> cacheKey = new SimpleImmutableEntry<>(query, unreadOnly);
++    long                                   epoch    = SearchCacheEpoch.get();
++    CacheEntry<ThreadSearchResult>         cached   = threadSearchCache.get(cacheKey);
++
++    if (cached != null && cached.epoch == epoch) {
++      Log.d(TAG, "[threads] Search cache hit");
++      return cached.value;
++    }
++
+     SignalTrace.beginSection("ConversationListSearch-Threads");
+     try {
+       long                      start  = System.currentTimeMillis();
+@@ -92,7 +109,9 @@ public class SearchRepository {
+ 
+       Log.d(TAG, "[threads] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new ThreadSearchResult(result, query);
++      ThreadSearchResult searchResult = new ThreadSearchResult(result, query);
++      threadSearchCache.put(cacheKey, new CacheEntry<>(epoch, searchResult));
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -100,6 +119,15 @@ public class SearchRepository {
+ 
+   @WorkerThread
+   public @NonNull MessageSearchResult queryMessagesSync(@NonNull String query, @NonNull SearchFilter filter) {
++    SimpleImmutableEntry<String, SearchFilter> cacheKey = new SimpleImmutableEntry<>(query, filter);
++    long                                        epoch    = SearchCacheEpoch.get();
++    CacheEntry<MessageSearchResult>             cached   = messageSearchCache.get(cacheKey);
++
++    if (cached != null && cached.epoch == epoch) {
++      Log.d(TAG, "[messages] Search cache hit");
++      return cached.value;
++    }
++
+     SignalTrace.beginSection("ConversationListSearch-Messages");
+     try {
+       long start = System.currentTimeMillis();
+@@ -111,7 +139,9 @@ public class SearchRepository {
+ 
+       Log.d(TAG, "[messages] Search took " + (System.currentTimeMillis() - start) + " ms");
+ 
+-      return new MessageSearchResult(combined, query);
++      MessageSearchResult searchResult = new MessageSearchResult(combined, query);
++      messageSearchCache.put(cacheKey, new CacheEntry<>(epoch, searchResult));
++      return searchResult;
+     } finally {
+       SignalTrace.endSection();
+     }
+@@ -485,4 +515,35 @@ public class SearchRepository {
+   public interface ModelBuilder<T> {
+     T build(@NonNull Cursor cursor);
+   }
++
++  private static final class CacheEntry<T> {
++    final long epoch;
++    final T    value;
++
++    CacheEntry(long epoch, @NonNull T value) {
++      this.epoch = epoch;
++      this.value = value;
++    }
++  }
++
++  /**
++   * A process-wide counter bumped whenever the database changes in a way that could affect search
++   * results (new/edited/deleted messages, deleted conversations). Cached results are stamped with
++   * the epoch at the time they were computed; a mismatch on lookup means the underlying data may
++   * have changed since, so the entry is treated as a miss rather than actively evicting every cache
++   * on every write.
++   */
++  private static final class SearchCacheEpoch {
++    private static final AtomicLong CURRENT = new AtomicLong(0);
++
++    static {
++      DatabaseObserver observer = AppDependencies.getDatabaseObserver();
++      observer.registerConversationListObserver(CURRENT::incrementAndGet);
++      observer.registerMessageUpdateObserver(messageId -> CURRENT.incrementAndGet());
++    }
++
++    static long get() {
++      return CURRENT.get();
++    }
++  }
+ }

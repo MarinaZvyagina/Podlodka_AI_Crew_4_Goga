@@ -1,0 +1,398 @@
+diff --git a/integration/maintenance-mode/e2e/maintenance-mode-guard.unit.spec.ts b/integration/maintenance-mode/e2e/maintenance-mode-guard.unit.spec.ts
+new file mode 100644
+index 0000000..cb4cf8d
+--- /dev/null
++++ b/integration/maintenance-mode/e2e/maintenance-mode-guard.unit.spec.ts
+@@ -0,0 +1,77 @@
++import { ExecutionContext, ServiceUnavailableException } from '@nestjs/common';
++import { Reflector } from '@nestjs/core';
++import { MaintenanceModeGuard } from '../src/maintenance-mode.guard.js';
++import { MaintenanceModeService } from '../src/maintenance-mode.service.js';
++import { MaintenanceProtected } from '../src/maintenance-protected.decorator.js';
++
++/**
++ * Pure unit test: the guard is instantiated directly, with no HTTP server
++ * and no socket connection involved. Two mock `ExecutionContext` objects
++ * stand in for a protected and an unprotected handler.
++ */
++class ProtectedHandlerHost {
++  @MaintenanceProtected()
++  protectedHandler() {
++    return 'should-not-run';
++  }
++
++  unprotectedHandler() {
++    return 'should-run';
++  }
++}
++
++function createMockContext(handlerName: keyof ProtectedHandlerHost) {
++  const instance = new ProtectedHandlerHost();
++  return {
++    getHandler: () => instance[handlerName],
++    getClass: () => ProtectedHandlerHost,
++  } as unknown as ExecutionContext;
++}
++
++describe('MaintenanceModeGuard (unit, no server/socket)', () => {
++  let guard: MaintenanceModeGuard;
++  let maintenanceModeService: MaintenanceModeService;
++
++  beforeEach(() => {
++    maintenanceModeService = new MaintenanceModeService();
++    guard = new MaintenanceModeGuard(new Reflector(), maintenanceModeService);
++  });
++
++  it('allows an unmarked handler regardless of maintenance mode state', () => {
++    const context = createMockContext('unprotectedHandler');
++
++    maintenanceModeService.disable();
++    expect(guard.canActivate(context)).toBe(true);
++
++    maintenanceModeService.enable();
++    expect(guard.canActivate(context)).toBe(true);
++  });
++
++  it('allows a marked handler while maintenance mode is off', () => {
++    const context = createMockContext('protectedHandler');
++    maintenanceModeService.disable();
++
++    expect(guard.canActivate(context)).toBe(true);
++  });
++
++  it('blocks a marked handler while maintenance mode is on', () => {
++    const context = createMockContext('protectedHandler');
++    maintenanceModeService.enable();
++
++    expect(() => guard.canActivate(context)).toThrow(
++      ServiceUnavailableException,
++    );
++  });
++
++  it('restores normal behavior once maintenance mode is toggled off again', () => {
++    const context = createMockContext('protectedHandler');
++
++    maintenanceModeService.enable();
++    expect(() => guard.canActivate(context)).toThrow(
++      ServiceUnavailableException,
++    );
++
++    maintenanceModeService.disable();
++    expect(guard.canActivate(context)).toBe(true);
++  });
++});
+diff --git a/integration/maintenance-mode/e2e/maintenance-mode.spec.ts b/integration/maintenance-mode/e2e/maintenance-mode.spec.ts
+new file mode 100644
+index 0000000..68f7660
+--- /dev/null
++++ b/integration/maintenance-mode/e2e/maintenance-mode.spec.ts
+@@ -0,0 +1,104 @@
++import { INestApplication } from '@nestjs/common';
++import { Test } from '@nestjs/testing';
++import { io, type Socket } from 'socket.io-client';
++import request from 'supertest';
++import { AppModule } from '../src/app.module.js';
++import { callLog, resetCallLog } from '../src/call-log.js';
++import { MaintenanceModeService } from '../src/maintenance-mode.service.js';
++
++describe('Maintenance mode (e2e, real HTTP server + real WS gateway)', () => {
++  let app: INestApplication;
++  let maintenanceModeService: MaintenanceModeService;
++  let ws: Socket;
++
++  beforeAll(async () => {
++    const moduleRef = await Test.createTestingModule({
++      imports: [AppModule],
++    }).compile();
++
++    app = moduleRef.createNestApplication();
++    await app.listen(3211);
++    maintenanceModeService = app.get(MaintenanceModeService);
++
++    ws = io('http://localhost:8099');
++    await new Promise<void>(resolve => ws.on('connect', resolve));
++  });
++
++  afterAll(async () => {
++    ws.disconnect();
++    await app.close();
++  });
++
++  beforeEach(() => {
++    resetCallLog();
++    maintenanceModeService.disable();
++  });
++
++  describe('HTTP', () => {
++    it('allows the unprotected route while maintenance mode is on', async () => {
++      maintenanceModeService.enable();
++
++      await request(app.getHttpServer())
++        .get('/unprotected')
++        .expect(200)
++        .expect('unprotected-ok');
++
++      expect(callLog).toContain('unprotectedRoute');
++    });
++
++    it('rejects the protected route while maintenance mode is on, before the handler body runs', async () => {
++      maintenanceModeService.enable();
++
++      const res = await request(app.getHttpServer()).get('/protected');
++
++      expect(res.status).toBe(503);
++      expect(callLog).not.toContain('protectedRoute');
++    });
++
++    it('allows the protected route again once maintenance mode is toggled off (no restart)', async () => {
++      maintenanceModeService.enable();
++      await request(app.getHttpServer()).get('/protected').expect(503);
++      expect(callLog).not.toContain('protectedRoute');
++
++      maintenanceModeService.disable();
++      await request(app.getHttpServer())
++        .get('/protected')
++        .expect(200)
++        .expect('protected-ok');
++      expect(callLog).toContain('protectedRoute');
++    });
++  });
++
++  describe('WebSocket gateway', () => {
++    it('blocks a maintenance-protected message handler while an unprotected handler on the same gateway keeps working', async () => {
++      maintenanceModeService.enable();
++
++      const unprotectedReply = new Promise<void>(resolve =>
++        ws.once('unprotectedReply', () => resolve()),
++      );
++
++      ws.emit('protectedMessage', { hello: 'protected' });
++      ws.emit('unprotectedMessage', { hello: 'unprotected' });
++
++      // Proves the socket connection and the unrelated handler both keep
++      // working normally while maintenance mode is on.
++      await unprotectedReply;
++
++      expect(callLog).toContain('onUnprotectedMessage');
++      expect(callLog).not.toContain('onProtectedMessage');
++    });
++
++    it('allows the maintenance-protected message handler again once maintenance mode is toggled off (no restart)', async () => {
++      maintenanceModeService.disable();
++
++      const protectedReply = new Promise<void>(resolve =>
++        ws.once('protectedReply', () => resolve()),
++      );
++      ws.emit('protectedMessage', { hello: 'protected' });
++
++      await protectedReply;
++
++      expect(callLog).toContain('onProtectedMessage');
++    });
++  });
++});
+diff --git a/integration/maintenance-mode/src/app.controller.ts b/integration/maintenance-mode/src/app.controller.ts
+new file mode 100644
+index 0000000..5f450a6
+--- /dev/null
++++ b/integration/maintenance-mode/src/app.controller.ts
+@@ -0,0 +1,19 @@
++import { Controller, Get } from '@nestjs/common';
++import { callLog } from './call-log.js';
++import { MaintenanceProtected } from './maintenance-protected.decorator.js';
++
++@Controller()
++export class AppController {
++  @Get('protected')
++  @MaintenanceProtected()
++  protectedRoute(): string {
++    callLog.push('protectedRoute');
++    return 'protected-ok';
++  }
++
++  @Get('unprotected')
++  unprotectedRoute(): string {
++    callLog.push('unprotectedRoute');
++    return 'unprotected-ok';
++  }
++}
+diff --git a/integration/maintenance-mode/src/app.gateway.ts b/integration/maintenance-mode/src/app.gateway.ts
+new file mode 100644
+index 0000000..2b1a4b4
+--- /dev/null
++++ b/integration/maintenance-mode/src/app.gateway.ts
+@@ -0,0 +1,23 @@
++import {
++  MessageBody,
++  SubscribeMessage,
++  WebSocketGateway,
++} from '@nestjs/websockets';
++import { callLog } from './call-log.js';
++import { MaintenanceProtected } from './maintenance-protected.decorator.js';
++
++@WebSocketGateway(8099)
++export class AppGateway {
++  @SubscribeMessage('protectedMessage')
++  @MaintenanceProtected()
++  onProtectedMessage(@MessageBody() data: unknown) {
++    callLog.push('onProtectedMessage');
++    return { event: 'protectedReply', data };
++  }
++
++  @SubscribeMessage('unprotectedMessage')
++  onUnprotectedMessage(@MessageBody() data: unknown) {
++    callLog.push('onUnprotectedMessage');
++    return { event: 'unprotectedReply', data };
++  }
++}
+diff --git a/integration/maintenance-mode/src/app.module.ts b/integration/maintenance-mode/src/app.module.ts
+new file mode 100644
+index 0000000..931cbd3
+--- /dev/null
++++ b/integration/maintenance-mode/src/app.module.ts
+@@ -0,0 +1,20 @@
++import { Module } from '@nestjs/common';
++import { APP_GUARD } from '@nestjs/core';
++import { AppController } from './app.controller.js';
++import { AppGateway } from './app.gateway.js';
++import { MaintenanceModeGuard } from './maintenance-mode.guard.js';
++import { MaintenanceModeService } from './maintenance-mode.service.js';
++
++@Module({
++  controllers: [AppController],
++  providers: [
++    AppGateway,
++    MaintenanceModeService,
++    {
++      provide: APP_GUARD,
++      useClass: MaintenanceModeGuard,
++    },
++  ],
++  exports: [MaintenanceModeService],
++})
++export class AppModule {}
+diff --git a/integration/maintenance-mode/src/call-log.ts b/integration/maintenance-mode/src/call-log.ts
+new file mode 100644
+index 0000000..fcfad73
+--- /dev/null
++++ b/integration/maintenance-mode/src/call-log.ts
+@@ -0,0 +1,13 @@
++/**
++ * Test-only call tracker. Handler bodies push their name here so e2e tests
++ * can assert "handler body executed / did not execute" without spying on
++ * the controller/gateway prototype (which would strip the Reflect metadata
++ * that decorators like `@Get`/`@SubscribeMessage`/`@MaintenanceProtected`
++ * attach to the original function object, breaking route/pattern
++ * registration).
++ */
++export const callLog: string[] = [];
++
++export function resetCallLog(): void {
++  callLog.length = 0;
++}
+diff --git a/integration/maintenance-mode/src/maintenance-mode.guard.ts b/integration/maintenance-mode/src/maintenance-mode.guard.ts
+new file mode 100644
+index 0000000..5d70c93
+--- /dev/null
++++ b/integration/maintenance-mode/src/maintenance-mode.guard.ts
+@@ -0,0 +1,46 @@
++import {
++  CanActivate,
++  ExecutionContext,
++  Injectable,
++  ServiceUnavailableException,
++} from '@nestjs/common';
++import { Reflector } from '@nestjs/core';
++import { MAINTENANCE_PROTECTED_KEY } from './maintenance-protected.decorator.js';
++import { MaintenanceModeService } from './maintenance-mode.service.js';
++
++/**
++ * Reuses the framework's existing guard mechanism (the same
++ * `GuardsContextCreator`/`GuardsConsumer` pair used by both the HTTP router
++ * and the WebSocket gateway context creator) to reject calls to handlers
++ * marked with `@MaintenanceProtected()` while maintenance mode is on.
++ *
++ * Because it is a plain `CanActivate` registered globally (via `APP_GUARD`),
++ * it is invoked for every HTTP route AND every gateway message handler —
++ * there is nothing HTTP-adapter specific about it.
++ */
++@Injectable()
++export class MaintenanceModeGuard implements CanActivate {
++  constructor(
++    private readonly reflector: Reflector,
++    private readonly maintenanceModeService: MaintenanceModeService,
++  ) {}
++
++  canActivate(context: ExecutionContext): boolean {
++    const isProtected = this.reflector.getAllAndOverride<boolean>(
++      MAINTENANCE_PROTECTED_KEY,
++      [context.getHandler(), context.getClass()],
++    );
++
++    if (!isProtected) {
++      return true;
++    }
++
++    if (this.maintenanceModeService.isEnabled()) {
++      throw new ServiceUnavailableException(
++        'Service is currently under maintenance. Please try again later.',
++      );
++    }
++
++    return true;
++  }
++}
+diff --git a/integration/maintenance-mode/src/maintenance-mode.service.ts b/integration/maintenance-mode/src/maintenance-mode.service.ts
+new file mode 100644
+index 0000000..c3ef268
+--- /dev/null
++++ b/integration/maintenance-mode/src/maintenance-mode.service.ts
+@@ -0,0 +1,23 @@
++import { Injectable } from '@nestjs/common';
++
++/**
++ * Holds the current maintenance-mode flag. In a real application this could
++ * be backed by a feature-flag service, a database row, or an env var that is
++ * refreshed periodically — the guard only depends on `isEnabled()`.
++ */
++@Injectable()
++export class MaintenanceModeService {
++  private enabled = false;
++
++  enable(): void {
++    this.enabled = true;
++  }
++
++  disable(): void {
++    this.enabled = false;
++  }
++
++  isEnabled(): boolean {
++    return this.enabled;
++  }
++}
+diff --git a/integration/maintenance-mode/src/maintenance-protected.decorator.ts b/integration/maintenance-mode/src/maintenance-protected.decorator.ts
+new file mode 100644
+index 0000000..983e700
+--- /dev/null
++++ b/integration/maintenance-mode/src/maintenance-protected.decorator.ts
+@@ -0,0 +1,19 @@
++import { SetMetadata } from '@nestjs/common';
++
++/**
++ * Metadata key under which the "maintenance protected" flag is stored.
++ * Read back by `MaintenanceModeGuard` via `Reflector`.
++ */
++export const MAINTENANCE_PROTECTED_KEY = 'maintenance_protected';
++
++/**
++ * Marks an individual route handler (HTTP controller method or
++ * `@SubscribeMessage` gateway handler) or an entire controller/gateway
++ * class as affected by maintenance mode.
++ *
++ * When maintenance mode is enabled, calls to marked handlers are rejected
++ * by `MaintenanceModeGuard` before the handler body executes. Unmarked
++ * handlers are unaffected.
++ */
++export const MaintenanceProtected = () =>
++  SetMetadata(MAINTENANCE_PROTECTED_KEY, true);

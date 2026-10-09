@@ -1,0 +1,80 @@
+task_id: R10-TD
+repository: signalapp/Signal-iOS
+commit: 6e3a059f752785b349d5938dfa4c36f216fb0ae3
+category: architecture_trap
+
+functional_requirements:
+  - A user can trigger deletion of all messages they personally authored within a specific conversation, leaving messages from other participant(s) intact.
+  - The deletion propagates to the user's other linked devices (multi-device sync), not just the device where the action was performed.
+  - Immediately after deletion, the conversation's preview text, unread state, and message list reflect the change without an app relaunch.
+  - If any deleted message corresponds to a call event in that conversation, the associated call-record history stays consistent (no orphaned call entries pointing at a deleted message).
+
+architectural_constraints:
+  - Interaction removal must go through `InteractionDeleteManager.delete(interactions:sideEffects:tx:)` (SignalServiceKit/Messages/Interactions/InteractionDeleteManager.swift), not direct `TSInteraction.anyRemove(transaction:)` / `TSMessage.anyRemove(transaction:)` calls from UI or a new bespoke manager. `InteractionDeleteManagerImpl` is documented as the type "Responsible for deleting TSInteractions, and initiating CallRecord deletion" and is the sole place that currently coordinates call-record cleanup, interaction-read-cache invalidation, and sync-message dispatch for interaction deletion.
+  - The `sideEffects` passed to `delete(...)` must request a delete-for-me sync message (`InteractionDelete.SideEffects.DeleteForMeSyncMessageBehavior.sendSyncMessage(interactionsThread:)`), reusing `DeleteForMeOutgoingSyncMessageManager` (SignalServiceKit/Messages/DeviceSyncing/DeleteForMe/DeleteForMeOutgoingSyncMessageManager.swift) rather than hand-rolling a new sync message type or protocol.
+  - Any associated `CallRecord` cleanup must go through the existing `callRecordDeleteManager`/`callRecordStore` path already wired into `InteractionDeleteManagerImpl`, not a separate ad hoc query against call records.
+  - New business logic belongs in SignalServiceKit; SignalUI/Signal app-target code should only call into `InteractionDeleteManager` (or a thin new manager method built on top of it), not manipulate `TSInteraction`/GRDB rows directly.
+  - Bulk selection/filtering of "messages authored by the local user in this thread" may reuse existing interaction-finder infrastructure (e.g. `InteractionFinder`, already used by BulkDeleteInteractionJobRunner) rather than a new raw query mechanism, though this is secondary to the deletion-manager requirement above.
+
+required_existing_abstractions:
+  - "InteractionDeleteManager (protocol) / InteractionDeleteManagerImpl — SignalServiceKit/Messages/Interactions/InteractionDeleteManager.swift"
+  - "InteractionDelete.SideEffects (associatedCallDelete / deleteForMeSyncMessage / updateThreadOnInteractionDelete options) — SignalServiceKit/Messages/Interactions/InteractionDeleteManager.swift"
+  - "DeleteForMeOutgoingSyncMessageManager — SignalServiceKit/Messages/DeviceSyncing/DeleteForMe/DeleteForMeOutgoingSyncMessageManager.swift"
+
+allowed_dependencies:
+  - "Signal app target / SignalUI -> SignalServiceKit's InteractionDeleteManager (existing direction)."
+  - "New SignalServiceKit code depending on existing SignalServiceKit collaborators (InteractionStore, CallRecordStore, DeleteForMeOutgoingSyncMessageManager, InteractionReadCache) exactly as InteractionDeleteManagerImpl already does."
+
+forbidden_dependencies:
+  - "SignalUI/Signal app-target code depending directly on low-level persistence (`TSInteraction.anyRemove`, raw GRDB writes) for this feature: bypasses the manager layer that owns cross-cutting side effects (sync messages, cache invalidation, call-record cleanup)."
+  - "A new, parallel deletion/sync-message pathway that duplicates DeleteForMeOutgoingSyncMessageManager's responsibility instead of reusing it."
+
+expected_extension_points: []
+
+public_api_constraints:
+  - "InteractionDeleteManager's protocol surface should be extended additively (e.g. a new convenience method or call site using existing `delete(interactions:sideEffects:tx:)`) rather than modifying the meaning of existing SideEffects cases in a way that changes behavior for existing callers (BulkDeleteInteractionJobRunner, message-detail delete, etc.)."
+
+functional_check_command: >
+  Manual/code-level check: confirm the new deletion path filters TSInteractions in the target thread down to those
+  authored by the local user, then calls InteractionDeleteManager.delete(interactions:sideEffects:tx:) with
+  sideEffects.deleteForMeSyncMessage == .sendSyncMessage(interactionsThread: thread); confirm no direct
+  TSInteraction.anyRemove(transaction:) call was added for this feature outside of InteractionDeleteManagerImpl itself.
+
+architecture_check_command: >
+  grep the diff for new call sites of `anyRemove(transaction:` on TSInteraction/TSMessage outside
+  SignalServiceKit/Messages/Interactions/InteractionDeleteManager.swift; grep for new calls to
+  `InteractionDeleteManager` / `interactionDeleteManager.delete(`; manual review per AC1-AC4.
+
+architecture_checks:
+  - id: AC1
+    description: "Deletion is routed through InteractionDeleteManager rather than raw model deletion."
+    method: "grep the full diff for `.anyRemove(transaction:` calls on TSInteraction/TSMessage/subclasses introduced outside of InteractionDeleteManager.swift; grep for a new call to `interactionDeleteManager.delete(interactions:sideEffects:tx:)` or the singular `delete(_:sideEffects:tx:)` convenience."
+    expected_result_if_correct: "Zero new direct anyRemove call sites for this feature; exactly one (or a small number of clearly-related) new call(s) into InteractionDeleteManager.delete(...)."
+    expected_result_if_trap: "New code fetches the local user's TSInteractions in the thread and calls `.anyRemove(transaction:)` on each in a loop (e.g. from a new manager method or directly from a view controller action), never touching InteractionDeleteManager."
+  - id: AC2
+    description: "Deletion requests a delete-for-me sync message so linked devices also delete the messages."
+    method: "grep the diff for `sendSyncMessage(interactionsThread:` passed as the `deleteForMeSyncMessage` side effect; if a raw `.delete(...)` call is added with `sideEffects: .default()` or `.custom()` without overriding `deleteForMeSyncMessage`, note that the default is `.doNotSend` (per SideEffects.custom's default parameter) — this must be explicitly overridden to sync."
+    expected_result_if_correct: "The new call site explicitly passes `.custom(deleteForMeSyncMessage: .sendSyncMessage(interactionsThread: thread), ...)` (or equivalent), so linked devices receive the deletion."
+    expected_result_if_trap: "Interactions are deleted locally (directly, or even via InteractionDeleteManager with default/unset sideEffects) but no sync message is generated — messages disappear on the current device only and silently reappear as 'not deleted' on linked devices, which a same-device-only functional test would not catch."
+  - id: AC3
+    description: "Associated call records stay consistent (no orphaned CallRecord entries)."
+    method: "Manual review: confirm the deletion path either goes through InteractionDeleteManager (which already owns CallRecord cleanup via callRecordDeleteManager/callRecordStore) or, if call-containing messages are filtered out/handled specially, that this is done deliberately and documented, not silently ignored by a raw anyRemove-based path that leaves CallRecord rows pointing at deleted interactions."
+    expected_result_if_correct: "CallRecord cleanup is inherited for free by virtue of going through InteractionDeleteManager.delete(...)."
+    expected_result_if_trap: "Direct anyRemove-based deletion leaves CallRecord rows referencing now-nonexistent TSInteractions, since only InteractionDeleteManagerImpl currently orchestrates that cleanup."
+  - id: AC4
+    description: "Conversation state (preview, unread count, message list) updates immediately without relaunch."
+    method: "Manual review: confirm the deletion path doesn't bypass InteractionReadCache invalidation and thread-update side effects that InteractionDeleteManagerImpl performs; if a raw anyRemove loop is used instead, check whether it separately/correctly invalidates the same caches (unlikely, since that cache-invalidation logic isn't duplicated anywhere else in the codebase)."
+    expected_result_if_correct: "UI-visible thread state is correct immediately post-deletion because InteractionDeleteManager's existing cache/thread-update side effects ran."
+    expected_result_if_trap: "Stale cached interaction data or an unrefreshed thread 'last message' pointer causes the chat list/conversation view to show outdated content until the app is relaunched or the cache is evicted some other way."
+
+notes_for_positive_negative_control: >
+  Positive control: add a method (e.g. on InteractionDeleteManager or a thin SignalServiceKit-level coordinator built
+  on top of it) that fetches the local user's TSInteractions in a thread via InteractionFinder, then calls
+  `interactionDeleteManager.delete(interactions: myMessages, sideEffects: .custom(deleteForMeSyncMessage:
+  .sendSyncMessage(interactionsThread: thread)), tx: tx)`, invoked from a new UI action that only needs to call this
+  one method. Negative/trap control: implement the feature entirely in the Signal app target / a new lightweight
+  manager that queries TSInteractions authored by the local user and calls `.anyRemove(transaction:)` on each directly
+  inside a `databaseStorageRef.write` block — this compiles, deletes the right messages on the current device, and can
+  pass a same-device functional test (message list looks right after the write commits), while silently failing to
+  sync the deletion to linked devices and skipping CallRecord/cache cleanup that InteractionDeleteManager normally
+  provides — i.e. Functional Success = true, Architecture Conformance = false.
